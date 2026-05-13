@@ -3,7 +3,8 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    response::{Html, IntoResponse, Json},
+    http::{header, HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Json, Response},
     routing::get,
     Router,
 };
@@ -54,9 +55,29 @@ async fn health_handler() -> impl IntoResponse {
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(state): State<AppState>,
-) -> impl IntoResponse {
+) -> Response {
+    // Reject connections that carry a non-localhost Origin header to prevent
+    // cross-site WebSocket hijacking of local trace data.  Requests without an
+    // Origin header (e.g. from CLI tools) are allowed through.
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        if let Ok(origin_str) = origin.to_str() {
+            let allowed = origin_str.starts_with("http://127.0.0.1")
+                || origin_str.starts_with("http://localhost")
+                || origin_str.starts_with("https://127.0.0.1")
+                || origin_str.starts_with("https://localhost");
+            if !allowed {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "Forbidden: connections from non-local origins are not permitted",
+                )
+                    .into_response();
+            }
+        }
+    }
     ws.on_upgrade(move |socket| handle_ws(socket, state))
+        .into_response()
 }
 
 async fn handle_ws(mut socket: WebSocket, state: AppState) {

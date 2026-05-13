@@ -33,7 +33,9 @@ impl SessionWatcher {
     }
 
     /// Seed existing JSONL files to their current EOF so that historical lines
-    /// are not replayed on startup.
+    /// are not replayed on startup. The `line_count` is initialised to the
+    /// actual number of non-empty lines already in the file so that the first
+    /// newly appended event receives the correct `line_index`.
     fn seed_existing(
         watch_root: &Path,
         states: &mut HashMap<PathBuf, FileState>,
@@ -46,9 +48,10 @@ impl SessionWatcher {
                         Self::seed_existing(&path, states);
                     } else if is_jsonl(&path) {
                         if let Ok(meta) = std::fs::metadata(&path) {
+                            let line_count = count_nonempty_lines(&path);
                             states.insert(path, FileState {
                                 offset: meta.len(),
-                                line_count: 0,
+                                line_count,
                             });
                         }
                     }
@@ -129,6 +132,22 @@ pub fn process_file(
         }
     };
 
+    // Detect file truncation or replacement: if the current size is smaller
+    // than the stored offset, the file was replaced or truncated.  Reset state
+    // so we start from the beginning and don't miss newly written lines.
+    if let Ok(meta) = file.metadata() {
+        if meta.len() < state.offset {
+            warn!(
+                "File {} was truncated or replaced (was {} bytes, now {}); resetting state",
+                path.display(),
+                state.offset,
+                meta.len()
+            );
+            state.offset = 0;
+            state.line_count = 0;
+        }
+    }
+
     if let Err(e) = file.seek(SeekFrom::Start(state.offset)) {
         warn!("Could not seek in {}: {e}", path.display());
         return;
@@ -139,9 +158,25 @@ pub fn process_file(
 
     loop {
         line.clear();
+        // Capture the byte position *before* this read so we can backtrack if
+        // we hit an unterminated (partial) line.
+        let line_start = match reader.stream_position() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("stream_position error in {}: {e}", path.display());
+                return;
+            }
+        };
         match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF
+            Ok(0) => break, // Clean EOF
             Ok(_) => {
+                // A line without a trailing newline is a partial write in
+                // progress.  Back off the offset to before this incomplete
+                // record so it is re-read on the next filesystem notification.
+                if !line.ends_with('\n') {
+                    state.offset = line_start;
+                    return;
+                }
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -171,7 +206,8 @@ pub fn process_file(
     }
 
     // Update the byte offset to the current position so the next event only
-    // reads newly appended content.
+    // reads newly appended content.  Use `reader.stream_position()` so the
+    // BufReader's lookahead buffer is accounted for correctly.
     match reader.stream_position() {
         Ok(pos) => state.offset = pos,
         Err(e) => warn!("Could not get file position for {}: {e}", path.display()),
@@ -180,6 +216,20 @@ pub fn process_file(
 
 fn is_jsonl(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+}
+
+/// Count the non-empty lines in a JSONL file without broadcasting any events.
+/// Used during startup to seed `line_count` so that the first newly appended
+/// event receives the correct `line_index`.
+fn count_nonempty_lines(path: &Path) -> usize {
+    let Ok(f) = std::fs::File::open(path) else {
+        return 0;
+    };
+    BufReader::new(f)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .count()
 }
 
 #[cfg(test)]
@@ -288,5 +338,92 @@ mod tests {
         assert!(!is_jsonl(Path::new("session.json")));
         assert!(!is_jsonl(Path::new("session.txt")));
         assert!(!is_jsonl(Path::new("noext")));
+    }
+
+    #[test]
+    fn test_process_file_resets_on_truncation() {
+        let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        let path = file.path().to_owned();
+        let tx = make_tx();
+        let mut states: HashMap<PathBuf, FileState> = HashMap::new();
+        let mut rx = tx.subscribe();
+
+        // Write and process two lines.
+        writeln!(file, r#"{{"type":"user","content":"a"}}"#).unwrap();
+        writeln!(file, r#"{{"type":"user","content":"b"}}"#).unwrap();
+        file.flush().unwrap();
+        process_file(&path, &mut states, &tx);
+        rx.try_recv().unwrap();
+        rx.try_recv().unwrap();
+        assert!(rx.try_recv().is_err());
+
+        // Simulate a file replacement by re-creating the temp file with shorter content.
+        {
+            use std::io::Write as _;
+            let mut fresh = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            writeln!(fresh, r#"{{"type":"user","content":"new"}}"#).unwrap();
+            fresh.flush().unwrap();
+        }
+
+        process_file(&path, &mut states, &tx);
+        // The state should have been reset and the new line re-emitted from index 0.
+        let ev = rx.try_recv().expect("should have emitted the new line after reset");
+        assert_eq!(ev.line_index, 0, "line_index should restart from 0 after truncation reset");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_process_file_partial_line_not_consumed() {
+        use std::io::Write as _;
+        let file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        let path = file.path().to_owned();
+        let tx = make_tx();
+        let mut states: HashMap<PathBuf, FileState> = HashMap::new();
+        let mut rx = tx.subscribe();
+
+        // Write a complete line followed by a partial line (no trailing newline).
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            // Write a complete JSONL line (with newline)
+            f.write_all(b"{\"type\":\"user\",\"content\":\"complete\"}\n").unwrap();
+            // Write a partial line without a trailing newline
+            f.write_all(b"{\"type\":\"user\"").unwrap();
+            f.flush().unwrap();
+        }
+
+        process_file(&path, &mut states, &tx);
+
+        // Only the complete line should have been emitted.
+        let ev = rx.try_recv().expect("complete line should be emitted");
+        assert_eq!(ev.line_index, 0);
+        assert!(rx.try_recv().is_err(), "partial line must not be emitted");
+
+        // Now complete the partial line by appending the rest with a newline.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b",\"content\":\"rest\"}\n").unwrap();
+            f.flush().unwrap();
+        }
+
+        process_file(&path, &mut states, &tx);
+        // The completed line should now be processed without crashing.
+        // It is valid JSON so it will produce an event.
+        let ev2 = rx.try_recv().expect("completed line should be emitted");
+        assert_eq!(ev2.line_index, 1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_count_nonempty_lines() {
+        let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        writeln!(file, r#"{{"type":"user"}}"#).unwrap();
+        writeln!(file, "").unwrap();
+        writeln!(file, r#"{{"type":"assistant"}}"#).unwrap();
+        file.flush().unwrap();
+        assert_eq!(count_nonempty_lines(file.path()), 2);
     }
 }

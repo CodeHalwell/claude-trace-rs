@@ -41,13 +41,25 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Validate broadcast channel capacity before use — broadcast::channel panics on 0.
+    anyhow::ensure!(
+        cli.channel_capacity > 0,
+        "--channel-capacity must be at least 1"
+    );
+
     // Expand `~` in the watch root path.
     let raw_root = cli.watch_root.clone();
     let watch_root: PathBuf = if raw_root.starts_with("~/") || raw_root == "~" {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| ".".to_owned());
-        PathBuf::from(home).join(raw_root.trim_start_matches("~/"))
+        // strip_prefix returns "" for bare "~", which join() ignores correctly.
+        let rest = raw_root.strip_prefix("~/").unwrap_or("");
+        if rest.is_empty() {
+            PathBuf::from(home)
+        } else {
+            PathBuf::from(home).join(rest)
+        }
     } else {
         PathBuf::from(&raw_root)
     };

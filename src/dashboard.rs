@@ -123,7 +123,7 @@ pub fn dashboard_html(port: u16) -> String {
   let activeSession = null;
   let activeType = 'all';
   let searchQuery = '';
-  let selectedIdx = null;
+  let selectedId = null;
   let stats = {{ total: 0, user: 0, asst: 0, tools: 0, cost: 0, tokIn: 0, tokOut: 0 }};
 
   function connect() {{
@@ -146,6 +146,7 @@ pub fn dashboard_html(port: u16) -> String {
   }}
 
   function handleEvent(ev) {{
+    ev._idx = allEvents.length;
     allEvents.push(ev);
     stats.total++;
 
@@ -191,8 +192,8 @@ pub fn dashboard_html(port: u16) -> String {
       const s = sessions[id];
       const active = id === activeSession ? ' active' : '';
       const short = id.length > 20 ? id.slice(0, 8) + '…' + id.slice(-6) : id;
-      return `<div class="session-item${{active}}" data-id="${{id}}">
-        <div class="sid" title="${{id}}">${{short}}</div>
+      return `<div class="session-item${{active}}" data-id="${{escHtml(id)}}">
+        <div class="sid" title="${{escHtml(id)}}">${{escHtml(short)}}</div>
         <div class="meta">${{s.count}} events · $${{s.cost.toFixed(4)}}</div>
       </div>`;
     }}).join('');
@@ -225,23 +226,23 @@ pub fn dashboard_html(port: u16) -> String {
     }}
     const scrollLock = document.getElementById('scroll-lock').checked;
     const wasAtBottom = feed.scrollHeight - feed.scrollTop <= feed.clientHeight + 40;
-    feed.innerHTML = visible.map((ev, i) => {{
+    feed.innerHTML = visible.map((ev) => {{
       const etype = ev.entry && ev.entry.type ? ev.entry.type : 'unknown';
+      const safeEtype = etype.replace(/[^a-z0-9_]/gi, '');
       const ts = ev.observed_at ? ev.observed_at.slice(11, 19) : '';
-      const selected = ev === allEvents[selectedIdx] ? ' selected' : '';
-      const globalIdx = allEvents.indexOf(ev);
-      return `<div class="event-row${{selected}}" data-idx="${{globalIdx}}">
+      const selected = ev._idx === selectedId ? ' selected' : '';
+      return `<div class="event-row${{selected}}" data-idx="${{ev._idx}}">
         <span class="idx">${{ev.line_index}}</span>
-        <span class="badge badge-${{etype}}">${{etype}}</span>
+        <span class="badge badge-${{safeEtype}}">${{escHtml(etype)}}</span>
         <span class="summary">${{escHtml(ev.summary)}}</span>
         <span class="ts">${{ts}}</span>
       </div>`;
     }}).join('');
     feed.querySelectorAll('.event-row').forEach(el => {{
       el.addEventListener('click', () => {{
-        selectedIdx = parseInt(el.dataset.idx, 10);
+        selectedId = parseInt(el.dataset.idx, 10);
         renderFeed();
-        showDetail(allEvents[selectedIdx]);
+        showDetail(allEvents[selectedId]);
       }});
     }});
     if (scrollLock && wasAtBottom) feed.scrollTop = feed.scrollHeight;
