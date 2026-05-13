@@ -134,7 +134,7 @@ pub fn process_file(
         return;
     }
 
-    let mut reader = BufReader::new(&file);
+    let mut reader = BufReader::new(file);
     let mut line = String::new();
 
     loop {
@@ -172,7 +172,7 @@ pub fn process_file(
 
     // Update the byte offset to the current position so the next event only
     // reads newly appended content.
-    match file.stream_position() {
+    match reader.stream_position() {
         Ok(pos) => state.offset = pos,
         Err(e) => warn!("Could not get file position for {}: {e}", path.display()),
     }
