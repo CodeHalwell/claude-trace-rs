@@ -1,4 +1,5 @@
 use axum::{
+    body::{Body, Bytes},
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
@@ -9,9 +10,10 @@ use axum::{
     routing::get,
     Router,
 };
+use futures_util::stream;
 use serde::Deserialize;
 use serde_json::json;
-use std::net::SocketAddr;
+use std::{convert::Infallible, net::SocketAddr};
 use tokio::sync::broadcast;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, info, warn};
@@ -149,13 +151,8 @@ async fn api_session_export(
         return (StatusCode::NOT_FOUND, "Unknown session").into_response();
     };
     let events = state.store.session_events(&id);
-    let exp = SessionExport {
-        stats: &stats,
-        events: events.as_slice(),
-    };
-    let body = export::render_session(&exp, q.format);
     let filename = format!("{}.{}", short_filename(&id), q.format.extension());
-    download_response(body, q.format.mime(), &filename)
+    stream_response(vec![(stats, events)], q.format, q.format.mime(), &filename)
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,31 +190,59 @@ async fn api_export_many(
     }
 
     let pairs: Vec<_> = stats_filtered
-        .iter()
-        .map(|s| (s.clone(), state.store.session_events(&s.id)))
-        .collect();
-    let exports: Vec<SessionExport<'_>> = pairs
-        .iter()
-        .map(|(s, e)| SessionExport {
-            stats: s,
-            events: e.as_slice(),
+        .into_iter()
+        .map(|s| {
+            let evs = state.store.session_events(&s.id);
+            (s, evs)
         })
         .collect();
-    let body = export::render_many(&exports, q.format);
-    let filename = format!("claude-trace-{}.{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"), q.format.extension());
-    download_response(body, q.format.mime(), &filename)
+    let filename = format!(
+        "claude-trace-{}.{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S"),
+        q.format.extension()
+    );
+    stream_response(pairs, q.format, q.format.mime(), &filename)
 }
 
-fn download_response(body: String, mime: &'static str, filename: &str) -> Response {
+/// Build a streaming download response. We pre-clone each (stats, events) pair
+/// out of the locked store so we never hold a mutex across await points, but
+/// we keep peak memory bounded to one session at a time by lazily rendering
+/// chunks from a `Stream` rather than concatenating the whole export into a
+/// single `String` first.
+fn stream_response(
+    pairs: Vec<(crate::state::SessionStats, Vec<TraceEvent>)>,
+    format: ExportFormat,
+    mime: &'static str,
+    filename: &str,
+) -> Response {
     use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
-    (
-        [
-            (CONTENT_TYPE, mime.to_owned()),
-            (CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename)),
-        ],
-        body,
-    )
-        .into_response()
+
+    let total = pairs.len();
+    let is_markdown = matches!(format, ExportFormat::Markdown);
+    let chunks = pairs.into_iter().enumerate().flat_map(move |(i, (stats, events))| {
+        let exp = SessionExport {
+            stats: &stats,
+            events: events.as_slice(),
+        };
+        let body = export::render_session(&exp, format);
+        let mut out: Vec<Result<Bytes, Infallible>> = Vec::with_capacity(2);
+        out.push(Ok(Bytes::from(body)));
+        if is_markdown && i + 1 < total {
+            out.push(Ok(Bytes::from_static(b"\n\n---\n\n")));
+        }
+        out
+    });
+
+    let body = Body::from_stream(stream::iter(chunks));
+    let headers = [
+        (CONTENT_TYPE, HeaderValue::from_static(mime)),
+        (
+            CONTENT_DISPOSITION,
+            HeaderValue::from_str(&format!("attachment; filename=\"{}\"", filename))
+                .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+        ),
+    ];
+    (headers, body).into_response()
 }
 
 fn short_filename(id: &str) -> String {

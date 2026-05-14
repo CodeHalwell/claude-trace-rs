@@ -1042,7 +1042,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <!-- Help modal -->
 <div class="modal-backdrop" id="help-modal">
   <div class="modal">
-    <header><h3>Keyboard shortcuts</h3><button class="btn icon" data-close="help-modal">✕</button></header>
+    <header><h3>Keyboard shortcuts &amp; tips</h3><button class="btn icon" data-close="help-modal">✕</button></header>
     <div class="body">
       <div class="kbd-grid">
         <div><span class="kbd">/</span></div><div class="desc">Focus event search</div>
@@ -1056,6 +1056,16 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <div><span class="kbd">Ctrl</span>/<span class="kbd">⌘</span>+<span class="kbd">B</span></div><div class="desc">Toggle sidebar</div>
         <div><span class="kbd">Space</span></div><div class="desc">Pause / resume live updates</div>
         <div><span class="kbd">?</span></div><div class="desc">Show this help</div>
+      </div>
+      <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-muted);margin-bottom:8px">Mouse tips</div>
+        <div class="kbd-grid">
+          <div class="desc"><b>Sidebar star</b></div><div class="desc">Click to bookmark / unbookmark a session</div>
+          <div class="desc"><b>Tag input</b></div><div class="desc">Type a tag, comma-separated for multiple, press <span class="kbd">Enter</span></div>
+          <div class="desc"><b>Tag</b></div><div class="desc">Double-click an existing tag to remove it</div>
+          <div class="desc"><b>Session chip in feed</b></div><div class="desc">Click to filter the feed to that session (click again to clear)</div>
+          <div class="desc"><b>Pane edges</b></div><div class="desc">Drag the thin vertical bars to resize the sidebar / detail pane</div>
+        </div>
       </div>
     </div>
   </div>
@@ -1126,7 +1136,8 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   function escHtml(s) {
     return String(s ?? '')
       .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
   function shortId(id) {
     if (!id) return '';
@@ -1929,18 +1940,58 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     const r = $('input[name="export-format"]:checked');
     return r ? r.value : 'messages';
   }
+  // Cancel any preview fetch that's still in flight when a new one starts —
+  // otherwise switching formats rapidly can stack downloads of (potentially
+  // large) full exports in flight.
+  let previewAbort = null;
+  const PREVIEW_LIMIT = 2000;
+
   async function refreshExportPreview() {
     const fmt = currentExportFormat();
     const scope = $('#export-modal')._scope;
     const url = exportUrl(scope, fmt);
     const pre = $('#export-preview');
     pre.textContent = `GET ${url}\n\n(loading preview…)`;
+    if (previewAbort) { try { previewAbort.abort(); } catch (e) {} }
+    previewAbort = new AbortController();
+    const ctrl = previewAbort;
     try {
-      const res = await fetch(url, { headers: { 'Accept': 'application/x-ndjson' } });
+      const res = await fetch(url, {
+        headers: { 'Accept': 'application/x-ndjson' },
+        signal: ctrl.signal,
+      });
       if (!res.ok) throw new Error('HTTP ' + res.status);
-      const text = await res.text();
-      pre.textContent = text.slice(0, 2000) + (text.length > 2000 ? '\n…' : '');
+      // Stream the response body and stop reading once we've buffered enough
+      // for the preview. For large exports this means we never pull more than
+      // a few KB across the network, and we never allocate the full payload
+      // in JS memory.
+      if (!res.body || !res.body.getReader) {
+        const text = await res.text();
+        if (ctrl.signal.aborted) return;
+        pre.textContent = text.slice(0, PREVIEW_LIMIT) + (text.length > PREVIEW_LIMIT ? '\n…' : '');
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8', { fatal: false });
+      let acc = '';
+      let truncated = false;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        acc += decoder.decode(value, { stream: true });
+        if (acc.length >= PREVIEW_LIMIT) {
+          truncated = true;
+          acc = acc.slice(0, PREVIEW_LIMIT);
+          try { await reader.cancel(); } catch (e) {}
+          ctrl.abort();
+          break;
+        }
+      }
+      acc += decoder.decode();
+      if (ctrl.signal.aborted && !truncated) return;
+      pre.textContent = acc + (truncated ? '\n…' : '');
     } catch (e) {
+      if (e.name === 'AbortError') return; // superseded by a newer preview
       pre.textContent = 'Preview failed: ' + e.message;
     }
   }

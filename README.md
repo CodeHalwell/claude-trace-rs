@@ -92,8 +92,12 @@ claude-trace-rs export -f messages --min-events 10 -o decent.jsonl
 Load a HuggingFace export:
 
 ```python
+import os
 from datasets import load_dataset
-ds = load_dataset("json", data_files={"train": "~/datasets/my-claude-runs/train.jsonl"})
+# datasets does not expand `~`, so do it ourselves.
+ds = load_dataset("json", data_files={
+    "train": os.path.expanduser("~/datasets/my-claude-runs/train.jsonl")
+})
 print(ds["train"][0]["messages"][:3])
 ```
 
