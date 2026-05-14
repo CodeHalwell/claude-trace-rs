@@ -3,7 +3,8 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    middleware::{from_fn, Next},
     response::{Html, IntoResponse, Json, Response},
     routing::get,
     Router,
@@ -12,7 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::net::SocketAddr;
 use tokio::sync::broadcast;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, info, warn};
 
 use crate::{dashboard::dashboard_html, event::TraceEvent, state::SessionStore};
@@ -29,7 +30,11 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], state.port));
     let port = state.port;
 
-    let cors = CorsLayer::new().allow_origin(Any);
+    // Restrict CORS to localhost origins.  The whole purpose of this dashboard
+    // is to serve a same-origin local UI; without this gate, any third-party
+    // page a user happens to be browsing could XHR/fetch from
+    // http://127.0.0.1:<port>/api/* and exfiltrate trace data.
+    let cors = CorsLayer::new().allow_origin(AllowOrigin::predicate(is_local_origin));
 
     let app = Router::new()
         .route("/", get(index_handler))
@@ -40,6 +45,7 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
         .route("/api/sessions/:id/events", get(api_session_events))
         .route("/api/snapshot", get(api_snapshot))
         .layer(cors)
+        .layer(from_fn(reject_cross_origin_api))
         .with_state(state);
 
     info!("Dashboard: http://127.0.0.1:{port}/");
@@ -157,7 +163,13 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
         return;
     }
 
-    // 2) Send an initial snapshot so the dashboard renders sessions and recent
+    // 2) Subscribe BEFORE taking the snapshot to close the race window where
+    //    events could be ingested between snapshot creation and subscription
+    //    and silently dropped. The client de-duplicates events that appear in
+    //    both the snapshot and the live stream by (session_id, line_index).
+    let mut rx = state.tx.subscribe();
+
+    // 3) Send an initial snapshot so the dashboard renders sessions and recent
     //    events immediately, even if no new events are flowing.
     let snapshot = state.store.snapshot(500);
     let snapshot_msg = json!({
@@ -174,8 +186,7 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
         return;
     }
 
-    // 3) Stream live events.
-    let mut rx = state.tx.subscribe();
+    // 4) Stream live events.
     loop {
         match rx.recv().await {
             Ok(event) => match serde_json::to_string(&event) {
@@ -193,4 +204,46 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+/// CORS predicate: accept Origin headers from any localhost port over http(s).
+fn is_local_origin(origin: &HeaderValue, _req_headers: &axum::http::request::Parts) -> bool {
+    let Ok(s) = origin.to_str() else { return false };
+    s.starts_with("http://127.0.0.1")
+        || s.starts_with("http://localhost")
+        || s.starts_with("https://127.0.0.1")
+        || s.starts_with("https://localhost")
+        || s.starts_with("http://[::1]")
+        || s.starts_with("https://[::1]")
+}
+
+/// Middleware: for /api/* requests that carry an Origin header, reject if the
+/// origin isn't local. Requests without an Origin header (curl, server-to-server)
+/// pass through. The same-origin dashboard never sends Origin on its own fetch
+/// calls, so this only kicks in when a third-party page tries to read.
+async fn reject_cross_origin_api(
+    req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    if path.starts_with("/api/") {
+        if let Some(origin) = req.headers().get(header::ORIGIN) {
+            if let Ok(s) = origin.to_str() {
+                let local = s.starts_with("http://127.0.0.1")
+                    || s.starts_with("http://localhost")
+                    || s.starts_with("https://127.0.0.1")
+                    || s.starts_with("https://localhost")
+                    || s.starts_with("http://[::1]")
+                    || s.starts_with("https://[::1]");
+                if !local {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "Forbidden: API access from non-local origins is not permitted",
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+    next.run(req).await
 }

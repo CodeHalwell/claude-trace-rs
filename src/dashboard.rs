@@ -723,7 +723,11 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   /** Map<sessionId, SessionInfo> — authoritative aggregates from server. */
   const sessions = new Map();
   /** All events received so far, capped. */
-  const allEvents = [];
+  let allEvents = [];
+  /** Per-session events index keyed on session_id (kept in sync with allEvents). */
+  const sessionEvents = new Map();
+  /** Dedupe key set: `${session_id}:${line_index}` for every ingested event. */
+  const seenKeys = new Set();
   const EVENT_CAP = 50000;
 
   let activeSession = null;
@@ -809,16 +813,43 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   }
 
   function handleSnapshot(snap) {
+    // Snapshots are authoritative — drop any state we may have built up from
+    // a previous connection so reconnects don't accumulate duplicate events.
     sessions.clear();
+    allEvents = [];
+    sessionEvents.clear();
+    seenKeys.clear();
+    selectedIdx = null;
     (snap.sessions || []).forEach(s => sessions.set(s.id, s));
     (snap.events || []).forEach(e => {
+      const k = eventKey(e);
+      if (seenKeys.has(k)) return;
+      seenKeys.add(k);
       e._idx = allEvents.length;
       allEvents.push(e);
+      pushSessionEvent(e);
     });
     rerenderAll();
   }
 
+  function eventKey(ev) {
+    return ev.session_id + ':' + ev.line_index;
+  }
+
+  function pushSessionEvent(ev) {
+    let arr = sessionEvents.get(ev.session_id);
+    if (!arr) { arr = []; sessionEvents.set(ev.session_id, arr); }
+    arr.push(ev);
+  }
+
   function handleEvent(ev) {
+    // Dedupe events that appear in both the connection-time snapshot and the
+    // live stream (the server subscribes before snapshotting to avoid races,
+    // which can produce a brief overlap).
+    const key = eventKey(ev);
+    if (seenKeys.has(key)) return;
+    seenKeys.add(key);
+
     if (paused) {
       pendingBuffer.push(ev);
       $('#pause-btn').textContent = `▶ Resume (${pendingBuffer.length})`;
@@ -831,13 +862,26 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   function ingestEvent(ev) {
     ev._idx = allEvents.length;
     allEvents.push(ev);
+    pushSessionEvent(ev);
     if (allEvents.length > EVENT_CAP) {
       // Drop oldest 10% to keep memory bounded.
       const drop = Math.floor(EVENT_CAP / 10);
-      allEvents.splice(0, drop);
-      // Reindex
+      const dropped = allEvents.splice(0, drop);
+      // Reindex remaining events.
       for (let i = 0; i < allEvents.length; i++) allEvents[i]._idx = i;
-      if (selectedIdx !== null) selectedIdx -= drop;
+      // Clear dedupe keys for dropped events so the set doesn't grow unbounded.
+      dropped.forEach(d => seenKeys.delete(eventKey(d)));
+      // Rebuild the per-session index from the surviving events.
+      sessionEvents.clear();
+      for (const e of allEvents) pushSessionEvent(e);
+      // Clamp / clear the selection so we never click an invalid index.
+      if (selectedIdx !== null) {
+        selectedIdx -= drop;
+        if (selectedIdx < 0) selectedIdx = null;
+      }
+      // The DOM still references old data-idx values — re-render the feed so
+      // every row is in sync with the new indices.
+      if (activeTab === 'feed') renderFeed();
     }
     // Update / create session aggregate.
     let s = sessions.get(ev.session_id);
@@ -964,8 +1008,8 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
   function eventBucketsFor(sessionId, buckets = 24) {
     const bucketArr = new Array(buckets).fill(0);
-    const sessEvents = allEvents.filter(e => e.session_id === sessionId);
-    if (!sessEvents.length) return bucketArr;
+    const sessEvents = sessionEvents.get(sessionId);
+    if (!sessEvents || !sessEvents.length) return bucketArr;
     const first = new Date(sessEvents[0].observed_at).getTime();
     const last = new Date(sessEvents[sessEvents.length - 1].observed_at).getTime();
     const span = Math.max(last - first, 1);
@@ -1189,7 +1233,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       root.innerHTML = '<div id="conversation-empty">Select a session to view the conversation.<div class="hint">Conversation view renders user / assistant / tool messages threaded chronologically.</div></div>';
       return;
     }
-    const evs = allEvents.filter(e => e.session_id === activeSession);
+    const evs = sessionEvents.get(activeSession) || [];
     if (!evs.length) {
       root.innerHTML = '<div id="conversation-empty">No events yet for this session.</div>';
       return;
@@ -1352,7 +1396,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     const windowMs = 60 * 60 * 1000;
     const buckets = new Array(60).fill(0);
     const events = activeSession
-      ? allEvents.filter(e => e.session_id === activeSession)
+      ? (sessionEvents.get(activeSession) || [])
       : allEvents;
     events.forEach(e => {
       const t = new Date(e.observed_at).getTime();

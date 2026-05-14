@@ -35,7 +35,6 @@ pub struct SessionStats {
     pub tool_use_count: usize,
     pub tool_result_count: usize,
     pub system_count: usize,
-    pub thinking_count: usize,
 
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -83,13 +82,19 @@ impl SessionStats {
         match ev.event_type.as_str() {
             "user" => self.user_count += 1,
             "assistant" => self.assistant_count += 1,
-            "tool_use" => self.tool_use_count += 1,
+            "tool_use" => {
+                self.tool_use_count += 1;
+                // Top-level tool_use entries carry the name at the root.
+                if let Some(name) = ev.entry.get("name").and_then(|v| v.as_str()) {
+                    *self.tool_counts.entry(name.to_owned()).or_insert(0) += 1;
+                }
+            }
             "tool_result" => self.tool_result_count += 1,
             "system" => self.system_count += 1,
             _ => {}
         }
 
-        // Tool uses can be top-level (rare) or embedded in assistant content.
+        // Tool uses embedded in assistant content blocks.
         for name in &ev.tool_uses {
             self.tool_use_count += 1;
             *self.tool_counts.entry(name.clone()).or_insert(0) += 1;
@@ -187,17 +192,8 @@ impl SessionStore {
         // Sort by last_seen descending (most recently active first).
         sessions.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
 
-        let n = recent_events.min(g.global_events.len());
-        let events: Vec<TraceEvent> = g
-            .global_events
-            .iter()
-            .rev()
-            .take(n)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+        let skip = g.global_events.len().saturating_sub(recent_events);
+        let events: Vec<TraceEvent> = g.global_events.iter().skip(skip).cloned().collect();
         Snapshot {
             sessions,
             events,
@@ -303,6 +299,24 @@ mod tests {
         assert_eq!(s.tool_counts.get("Read"), Some(&2));
         assert_eq!(s.tool_counts.get("Bash"), Some(&1));
         assert_eq!(s.tool_use_count, 3);
+    }
+
+    #[test]
+    fn store_counts_top_level_tool_use_names() {
+        let store = SessionStore::new();
+        store.ingest(&ev(
+            "a",
+            "tool_use",
+            json!({ "name": "WebFetch" }),
+        ));
+        store.ingest(&ev(
+            "a",
+            "tool_use",
+            json!({ "name": "WebFetch" }),
+        ));
+        let s = store.session("a").unwrap();
+        assert_eq!(s.tool_counts.get("WebFetch"), Some(&2));
+        assert_eq!(s.tool_use_count, 2);
     }
 
     #[test]
