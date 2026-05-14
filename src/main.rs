@@ -1,10 +1,12 @@
 mod dashboard;
 mod event;
+mod export;
+mod loader;
 mod server;
 mod state;
 mod watcher;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
@@ -12,20 +14,38 @@ use tracing::{info, warn};
 /// Claude Trace — local-first real-time observability for Claude Code sessions.
 ///
 /// Watches one or more directories of Claude Code JSONL session logs, parses
-/// new events as they appear, and surfaces per-session insights through a
-/// built-in dashboard at http://127.0.0.1:<port>/.
+/// new events as they appear, and either serves a built-in browser dashboard
+/// (`serve`, the default) or dumps them to disk in a training-friendly format
+/// (`export`).
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(version, about, long_about = None, arg_required_else_help = false)]
 struct Cli {
-    /// Root directory to watch for Claude Code JSONL session files.
+    /// Root directory to watch / read Claude Code JSONL session files from.
     #[arg(
         short = 'w',
         long,
         env = "CLAUDE_TRACE_WATCH_ROOT",
-        default_value = "~/.claude/projects"
+        default_value = "~/.claude/projects",
+        global = true
     )]
     watch_root: String,
 
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Run the live dashboard server (default if no subcommand is given).
+    Serve(ServeArgs),
+    /// Export one or more sessions to disk in a training-friendly format.
+    Export(ExportArgs),
+    /// Print every session discovered on disk as JSON to stdout.
+    List,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServeArgs {
     /// TCP port to bind the HTTP and WebSocket server to.
     #[arg(short, long, env = "CLAUDE_TRACE_PORT", default_value_t = 7779)]
     port: u16,
@@ -45,6 +65,37 @@ struct Cli {
     open: bool,
 }
 
+impl Default for ServeArgs {
+    fn default() -> Self {
+        Self {
+            port: 7779,
+            channel_capacity: 1024,
+            backfill: false,
+            open: false,
+        }
+    }
+}
+
+#[derive(clap::Args, Debug)]
+struct ExportArgs {
+    /// Output format.
+    #[arg(short = 'f', long, default_value = "messages")]
+    format: export::ExportFormat,
+
+    /// Output file path. Use `-` for stdout. For `--format huggingface` this
+    /// is treated as a directory (created if missing).
+    #[arg(short = 'o', long)]
+    out: Option<String>,
+
+    /// Optional list of session IDs to include. Omit to export every session.
+    #[arg(long, value_delimiter = ',')]
+    session: Vec<String>,
+
+    /// Skip sessions whose event count is below this threshold.
+    #[arg(long, default_value_t = 1)]
+    min_events: usize,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -55,13 +106,20 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let watch_root = expand_tilde(&cli.watch_root);
 
+    match cli.cmd.unwrap_or(Cmd::Serve(ServeArgs::default())) {
+        Cmd::Serve(args) => run_serve(watch_root, args).await,
+        Cmd::Export(args) => run_export(&watch_root, args),
+        Cmd::List => run_list(&watch_root),
+    }
+}
+
+async fn run_serve(watch_root: PathBuf, args: ServeArgs) -> anyhow::Result<()> {
     anyhow::ensure!(
-        cli.channel_capacity > 0,
+        args.channel_capacity > 0,
         "--channel-capacity must be at least 1"
     );
-
-    let watch_root = expand_tilde(&cli.watch_root);
 
     if !watch_root.exists() {
         info!(
@@ -71,23 +129,21 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(&watch_root)?;
     }
 
-    let (tx, _) = broadcast::channel::<event::TraceEvent>(cli.channel_capacity);
+    let (tx, _) = broadcast::channel::<event::TraceEvent>(args.channel_capacity);
     let store = state::SessionStore::new();
 
     let server_state = server::AppState {
         tx: tx.clone(),
         watch_root: watch_root.to_string_lossy().to_string(),
-        port: cli.port,
+        port: args.port,
         store: store.clone(),
     };
 
-    // Spawn the session watcher on a dedicated blocking thread because notify
-    // uses a synchronous callback internally.
     let watcher_tx = tx.clone();
     let watcher_root = watch_root.clone();
     let watcher_store = store.clone();
     let opts = watcher::WatcherOptions {
-        backfill: cli.backfill,
+        backfill: args.backfill,
     };
     std::thread::spawn(move || {
         let watcher =
@@ -97,10 +153,8 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Optionally fire up a browser tab once the server is bound.  We do this
-    // on a tiny delay so the listener has time to start accepting connections.
-    if cli.open {
-        let url = format!("http://127.0.0.1:{}/", cli.port);
+    if args.open {
+        let url = format!("http://127.0.0.1:{}/", args.port);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             if let Err(e) = open_in_browser(&url) {
@@ -110,6 +164,82 @@ async fn main() -> anyhow::Result<()> {
     }
 
     server::serve(server_state).await?;
+    Ok(())
+}
+
+fn run_export(watch_root: &std::path::Path, args: ExportArgs) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let store = state::SessionStore::new();
+    let n = loader::ingest_directory(watch_root, &store)?;
+    info!("Loaded {} events across {} sessions", n, store.sessions().len());
+
+    let want: std::collections::HashSet<String> = args.session.into_iter().collect();
+    let sessions: Vec<_> = store
+        .sessions()
+        .into_iter()
+        .filter(|s| s.event_count >= args.min_events)
+        .filter(|s| want.is_empty() || want.contains(&s.id))
+        .collect();
+
+    anyhow::ensure!(!sessions.is_empty(), "No sessions matched the filter");
+
+    // Build SessionExport vec — we need the events to outlive the borrow.
+    let session_events: Vec<(state::SessionStats, Vec<event::TraceEvent>)> = sessions
+        .into_iter()
+        .map(|s| {
+            let evs = store.session_events(&s.id);
+            (s, evs)
+        })
+        .collect();
+    let exports: Vec<export::SessionExport<'_>> = session_events
+        .iter()
+        .map(|(s, e)| export::SessionExport {
+            stats: s,
+            events: e.as_slice(),
+        })
+        .collect();
+
+    if matches!(args.format, export::ExportFormat::Huggingface) {
+        let out = args
+            .out
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--out <dir> is required for the huggingface format"))?;
+        let dir = expand_tilde(out);
+        export::write_huggingface_dir(&dir, &exports)?;
+        println!("Wrote HuggingFace dataset to {}", dir.display());
+        return Ok(());
+    }
+
+    let body = export::render_many(&exports, args.format);
+    match args.out.as_deref() {
+        None | Some("-") => {
+            std::io::stdout().write_all(body.as_bytes())?;
+        }
+        Some(path) => {
+            let path = expand_tilde(path);
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            std::fs::write(&path, body)?;
+            println!(
+                "Wrote {} session(s) to {}",
+                exports.len(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_list(watch_root: &std::path::Path) -> anyhow::Result<()> {
+    let store = state::SessionStore::new();
+    loader::ingest_directory(watch_root, &store)?;
+    let sessions = store.sessions();
+    let out = serde_json::to_string_pretty(&sessions)?;
+    println!("{out}");
     Ok(())
 }
 
