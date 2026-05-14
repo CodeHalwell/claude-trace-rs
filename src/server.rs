@@ -16,7 +16,12 @@ use tokio::sync::broadcast;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, info, warn};
 
-use crate::{dashboard::dashboard_html, event::TraceEvent, state::SessionStore};
+use crate::{
+    dashboard::dashboard_html,
+    event::TraceEvent,
+    export::{self, ExportFormat, SessionExport},
+    state::SessionStore,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -43,6 +48,8 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/:id", get(api_session_detail))
         .route("/api/sessions/:id/events", get(api_session_events))
+        .route("/api/sessions/:id/export", get(api_session_export))
+        .route("/api/export", get(api_export_many))
         .route("/api/snapshot", get(api_snapshot))
         .layer(cors)
         .layer(from_fn(reject_cross_origin_api))
@@ -120,6 +127,101 @@ async fn api_snapshot(
 ) -> impl IntoResponse {
     let n = q.events.unwrap_or(500);
     Json(state.store.snapshot(n))
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportQuery {
+    /// One of: messages | openai | sharegpt | jsonl | markdown | huggingface.
+    #[serde(default = "default_export_format")]
+    format: ExportFormat,
+}
+
+fn default_export_format() -> ExportFormat {
+    ExportFormat::Messages
+}
+
+async fn api_session_export(
+    Path(id): Path<String>,
+    Query(q): Query<ExportQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let Some(stats) = state.store.session(&id) else {
+        return (StatusCode::NOT_FOUND, "Unknown session").into_response();
+    };
+    let events = state.store.session_events(&id);
+    let exp = SessionExport {
+        stats: &stats,
+        events: events.as_slice(),
+    };
+    let body = export::render_session(&exp, q.format);
+    let filename = format!("{}.{}", short_filename(&id), q.format.extension());
+    download_response(body, q.format.mime(), &filename)
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportManyQuery {
+    #[serde(default = "default_export_format")]
+    format: ExportFormat,
+    /// Comma-separated list of session IDs to include. If omitted, every session
+    /// in the store is exported.
+    sessions: Option<String>,
+}
+
+async fn api_export_many(
+    Query(q): Query<ExportManyQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let want: Option<std::collections::HashSet<String>> = q.sessions.as_ref().map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_owned())
+            .collect()
+    });
+
+    let sessions = state.store.sessions();
+    let stats_filtered: Vec<_> = sessions
+        .into_iter()
+        .filter(|s| match &want {
+            Some(w) => w.contains(&s.id),
+            None => true,
+        })
+        .collect();
+
+    if stats_filtered.is_empty() {
+        return (StatusCode::NOT_FOUND, "No matching sessions").into_response();
+    }
+
+    let pairs: Vec<_> = stats_filtered
+        .iter()
+        .map(|s| (s.clone(), state.store.session_events(&s.id)))
+        .collect();
+    let exports: Vec<SessionExport<'_>> = pairs
+        .iter()
+        .map(|(s, e)| SessionExport {
+            stats: s,
+            events: e.as_slice(),
+        })
+        .collect();
+    let body = export::render_many(&exports, q.format);
+    let filename = format!("claude-trace-{}.{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"), q.format.extension());
+    download_response(body, q.format.mime(), &filename)
+}
+
+fn download_response(body: String, mime: &'static str, filename: &str) -> Response {
+    use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+    (
+        [
+            (CONTENT_TYPE, mime.to_owned()),
+            (CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename)),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn short_filename(id: &str) -> String {
+    id.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "-")
 }
 
 async fn ws_handler(
