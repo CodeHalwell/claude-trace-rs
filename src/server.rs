@@ -281,7 +281,9 @@ async fn db_sessions(Query(q): Query<DbSessionsQuery>, State(state): State<AppSt
         project: q.project.filter(|s| !s.is_empty()),
         bookmarked_only: q.bookmarked,
         sort: q.sort,
-        limit: q.limit,
+        // Clamp to a sane maximum so a caller can't request an unbounded result
+        // set and spike memory.
+        limit: Some(q.limit.unwrap_or(2000).min(5000)),
     };
     match state.db.query_sessions(&filter) {
         Ok(sessions) => Json(json!({ "sessions": sessions })).into_response(),
@@ -383,7 +385,12 @@ async fn db_set_meta(
         .db
         .set_meta(&id, body.bookmarked, &body.tags, &body.notes)
     {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Ok(()) => {
+            // Keep the in-memory store in sync so live snapshots and
+            // /api/sessions don't serve stale bookmark/tag data.
+            state.store.update_meta(&id, body.bookmarked, body.tags);
+            Json(json!({ "ok": true })).into_response()
+        }
         Err(e) => db_error(e),
     }
 }

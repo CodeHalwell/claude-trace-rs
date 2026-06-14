@@ -145,26 +145,32 @@ impl TraceEvent {
     }
 }
 
-/// Recursively gather human-readable text from a Claude Code entry: `text`,
-/// `thinking`, and string `content`/`input` fields.
+/// Recursively gather human-readable text from a Claude Code entry. Indexes
+/// every string value (so tool inputs like `path`/`command`/`pattern` are
+/// searchable) except for a blacklist of noisy metadata keys.
 fn collect_text(val: &serde_json::Value, out: &mut String) {
     match val {
         serde_json::Value::Object(map) => {
             for (k, v) in map {
-                match k.as_str() {
-                    "text" | "thinking" | "content" | "summary" | "aiTitle" => {
-                        if let Some(s) = v.as_str() {
-                            out.push(' ');
-                            out.push_str(s);
-                            continue;
-                        }
-                    }
-                    // Skip noisy/non-text fields entirely.
-                    "uuid" | "parentUuid" | "id" | "tool_use_id" | "sessionId" | "signature"
-                    | "timestamp" => continue,
-                    _ => {}
+                // Skip identifier/metadata fields that only add noise.
+                if matches!(
+                    k.as_str(),
+                    "uuid"
+                        | "parentUuid"
+                        | "id"
+                        | "tool_use_id"
+                        | "sessionId"
+                        | "signature"
+                        | "timestamp"
+                ) {
+                    continue;
                 }
-                collect_text(v, out);
+                if let Some(s) = v.as_str() {
+                    out.push(' ');
+                    out.push_str(s);
+                } else {
+                    collect_text(v, out);
+                }
             }
         }
         serde_json::Value::Array(arr) => {

@@ -388,7 +388,8 @@ impl Db {
         {
             let mut stmt = conn.prepare("SELECT tool_counts FROM sessions")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            for r in rows.flatten() {
+            for r in rows {
+                let r = r?;
                 if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, i64>>(&r)
                 {
                     for (k, v) in map {
@@ -407,16 +408,19 @@ impl Db {
         // Daily activity timeline (last 30 days) keyed on the entry timestamp.
         let timeline = {
             let mut stmt = conn.prepare(
-                "SELECT substr(COALESCE(timestamp, observed_at),1,10) AS day, COUNT(*), SUM(cost_usd)
+                "SELECT substr(COALESCE(timestamp, observed_at),1,10) AS day, COUNT(*), COALESCE(SUM(cost_usd),0.0)
                  FROM events GROUP BY day ORDER BY day DESC LIMIT 30")?;
             let rows = stmt.query_map([], |r| {
                 Ok(json!({
                     "day": r.get::<_,String>(0)?,
                     "events": r.get::<_,i64>(1)?,
-                    "cost_usd": r.get::<_,f64>(2).unwrap_or(0.0),
+                    "cost_usd": r.get::<_,f64>(2)?,
                 }))
             })?;
-            let mut v = rows.filter_map(Result::ok).collect::<Vec<_>>();
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
             v.reverse();
             v
         };

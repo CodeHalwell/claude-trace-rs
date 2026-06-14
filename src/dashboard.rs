@@ -505,9 +505,9 @@ function renderSessions(){
 
 async function toggleBookmark(id){
   const s=state.sessions.find(x=>x.id===id); if(!s) return;
-  const meta = (id===state.selected) ? state.selectedMeta : await api('/api/db/sessions/'+id+'/meta');
+  const meta = (id===state.selected) ? state.selectedMeta : await api('/api/db/sessions/'+encodeURIComponent(id)+'/meta');
   meta.bookmarked = !s.bookmarked;
-  await api('/api/db/sessions/'+id+'/meta', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(meta)});
+  await api('/api/db/sessions/'+encodeURIComponent(id)+'/meta', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(meta)});
   if(id===state.selected){ state.selectedMeta=meta; renderHead(); }
   loadSessions();
 }
@@ -516,7 +516,7 @@ async function toggleBookmark(id){
 async function selectSession(id){
   state.selected=id;
   renderSessions();
-  try{ state.selectedMeta=await api('/api/db/sessions/'+id+'/meta'); }catch(e){ state.selectedMeta={bookmarked:false,tags:[],notes:''}; }
+  try{ state.selectedMeta=await api('/api/db/sessions/'+encodeURIComponent(id)+'/meta'); }catch(e){ state.selectedMeta={bookmarked:false,tags:[],notes:''}; }
   renderHead();
   if(state.tab==='conversation') loadConversation(true);
   if(state.tab==='live') renderFeed();
@@ -562,7 +562,7 @@ function renderHead(){
   $$('[data-rmtag]').forEach(el=> el.addEventListener('click', ()=> removeTag(el.dataset.rmtag)));
   let nt; $('#notesArea').addEventListener('input', (e)=>{ clearTimeout(nt); nt=setTimeout(()=>saveNotes(e.target.value), 600); });
 }
-async function saveMeta(){ await api('/api/db/sessions/'+state.selected+'/meta', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(state.selectedMeta)}); }
+async function saveMeta(){ await api('/api/db/sessions/'+encodeURIComponent(state.selected)+'/meta', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(state.selectedMeta)}); }
 async function addTag(t){ if(!state.selectedMeta.tags.includes(t)){ state.selectedMeta.tags.push(t); await saveMeta(); renderHead(); } }
 async function removeTag(t){ state.selectedMeta.tags=state.selectedMeta.tags.filter(x=>x!==t); await saveMeta(); renderHead(); }
 async function saveNotes(v){ state.selectedMeta.notes=v; await saveMeta(); toast('Notes saved'); }
@@ -613,7 +613,7 @@ async function loadConversation(reset){
   const t=$('#convType').value; if(t!=='all') params.set('type', t);
   const q=$('#convSearch').value.trim(); if(q) params.set('search', q);
   try{
-    const d=await api('/api/db/sessions/'+state.selected+'/events?'+params.toString());
+    const d=await api('/api/db/sessions/'+encodeURIComponent(state.selected)+'/events?'+params.toString());
     state.conv.total=d.total; state.conv.offset+=d.events.length;
     state.conv.events=state.conv.events.concat(d.events);
     renderConversation();

@@ -176,45 +176,68 @@ impl SessionStore {
     pub fn seed_sessions(&self, sessions: Vec<SessionStats>) {
         let mut g = self.inner.write().expect("session store poisoned");
         for s in sessions {
+            // Keep the global event total consistent with the seeded per-session
+            // counts so /health and WebSocket snapshots report sane numbers
+            // before any new events arrive.
+            g.total_events += s.event_count;
             g.sessions.insert(s.id.clone(), s);
+        }
+    }
+
+    /// Update a session's persisted annotations (bookmark / tags) in the
+    /// in-memory store so live snapshots and `/api/sessions` don't go stale
+    /// after a metadata write.
+    pub fn update_meta(&self, id: &str, bookmarked: bool, tags: Vec<String>) {
+        let mut g = self.inner.write().expect("session store poisoned");
+        if let Some(stats) = g.sessions.get_mut(id) {
+            stats.bookmarked = bookmarked;
+            stats.tags = tags;
         }
     }
 
     /// Record an event in the store, updating aggregates and ring buffers, and
     /// persisting to the database when one is attached.
+    ///
+    /// When a database is attached it is the authority for de-duplication: an
+    /// event whose `(session_id, line_index)` is already stored is skipped
+    /// entirely, so re-ingestion (e.g. `--backfill` over already-persisted data)
+    /// never double-counts the in-memory aggregates. All writes happen while the
+    /// in-memory lock is held, so the persisted aggregates can never be
+    /// clobbered by an out-of-order snapshot.
     pub fn ingest(&self, ev: &TraceEvent) {
-        let stats_snapshot = {
-            let mut g = self.inner.write().expect("session store poisoned");
-            g.total_events += 1;
+        let mut g = self.inner.write().expect("session store poisoned");
 
-            let stats = g.sessions.entry(ev.session_id.clone()).or_default();
-            stats.ingest(ev);
-            let snapshot = self.db.as_ref().map(|_| stats.clone());
-
-            let per = g
-                .per_session_events
-                .entry(ev.session_id.clone())
-                .or_default();
-            per.push_back(ev.clone());
-            while per.len() > PER_SESSION_RECENT_CAP {
-                per.pop_front();
+        if let Some(db) = &self.db {
+            match db.insert_event(ev) {
+                // Already persisted — it has already been counted; skip it.
+                Ok(false) => return,
+                Ok(true) => {}
+                Err(e) => warn!("Failed to persist event to database: {e}"),
             }
+        }
 
-            g.global_events.push_back(ev.clone());
-            while g.global_events.len() > GLOBAL_RECENT_CAP {
-                g.global_events.pop_front();
-            }
-            snapshot
-        };
+        g.total_events += 1;
 
-        // Persist outside the in-memory lock to keep write latency off readers.
-        if let (Some(db), Some(stats)) = (&self.db, stats_snapshot) {
-            if let Err(e) = db.insert_event(ev) {
-                warn!("Failed to persist event to database: {e}");
-            }
-            if let Err(e) = db.upsert_session(&stats) {
+        let stats = g.sessions.entry(ev.session_id.clone()).or_default();
+        stats.ingest(ev);
+        if let Some(db) = &self.db {
+            if let Err(e) = db.upsert_session(stats) {
                 warn!("Failed to persist session aggregates: {e}");
             }
+        }
+
+        let per = g
+            .per_session_events
+            .entry(ev.session_id.clone())
+            .or_default();
+        per.push_back(ev.clone());
+        while per.len() > PER_SESSION_RECENT_CAP {
+            per.pop_front();
+        }
+
+        g.global_events.push_back(ev.clone());
+        while g.global_events.len() > GLOBAL_RECENT_CAP {
+            g.global_events.pop_front();
         }
     }
 
