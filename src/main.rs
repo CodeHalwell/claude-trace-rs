@@ -1,11 +1,14 @@
 mod dashboard;
+mod db;
 mod event;
 mod export;
 mod loader;
 mod server;
+mod service;
 mod state;
 mod watcher;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tokio::sync::broadcast;
@@ -42,6 +45,39 @@ enum Cmd {
     Export(ExportArgs),
     /// Print every session discovered on disk as JSON to stdout.
     List,
+    /// Install/manage a background service so the dashboard starts with your OS.
+    Service(ServiceArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ServiceArgs {
+    #[command(subcommand)]
+    action: ServiceAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceAction {
+    /// Install and start the background service (auto-starts at login).
+    Install(ServiceInstallArgs),
+    /// Stop and remove the background service.
+    Uninstall,
+    /// Show whether the background service is installed/running.
+    Status,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServiceInstallArgs {
+    /// Port the background dashboard should listen on.
+    #[arg(short, long, default_value_t = 7779)]
+    port: u16,
+
+    /// Path to the SQLite database file (defaults to the platform data dir).
+    #[arg(long)]
+    db: Option<String>,
+
+    /// Open the dashboard in a browser each time the service starts.
+    #[arg(long)]
+    open: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -63,6 +99,11 @@ struct ServeArgs {
     /// Open the dashboard URL in the default browser once the server is up.
     #[arg(long, env = "CLAUDE_TRACE_OPEN")]
     open: bool,
+
+    /// Path to the SQLite database file. Defaults to the platform data dir
+    /// (e.g. `~/.local/share/claude-trace-rs/trace.db`).
+    #[arg(long, env = "CLAUDE_TRACE_DB")]
+    db: Option<String>,
 }
 
 impl Default for ServeArgs {
@@ -72,6 +113,7 @@ impl Default for ServeArgs {
             channel_capacity: 1024,
             backfill: false,
             open: false,
+            db: None,
         }
     }
 }
@@ -109,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
     let watch_root = expand_tilde(&cli.watch_root);
 
     match cli.cmd.unwrap_or(Cmd::Serve(ServeArgs::default())) {
+        Cmd::Service(args) => run_service(&cli.watch_root, args),
         Cmd::Serve(args) => run_serve(watch_root, args).await,
         Cmd::Export(args) => run_export(&watch_root, args),
         Cmd::List => run_list(&watch_root),
@@ -129,14 +172,32 @@ async fn run_serve(watch_root: PathBuf, args: ServeArgs) -> anyhow::Result<()> {
         std::fs::create_dir_all(&watch_root)?;
     }
 
+    // Open the persistent trace database and seed the in-memory store with the
+    // historical session aggregates so the dashboard is populated immediately.
+    let db_path = args
+        .db
+        .as_deref()
+        .map(expand_tilde)
+        .unwrap_or_else(db::default_db_path);
+    let database = db::Db::open(&db_path)?;
+    info!("Trace database: {}", database.path().display());
+    let store = state::SessionStore::with_db(database.clone());
+    match database.load_sessions() {
+        Ok(sessions) => {
+            info!("Loaded {} session(s) from the database", sessions.len());
+            store.seed_sessions(sessions);
+        }
+        Err(e) => warn!("Could not load sessions from the database: {e}"),
+    }
+
     let (tx, _) = broadcast::channel::<event::TraceEvent>(args.channel_capacity);
-    let store = state::SessionStore::new();
 
     let server_state = server::AppState {
         tx: tx.clone(),
         watch_root: watch_root.to_string_lossy().to_string(),
         port: args.port,
         store: store.clone(),
+        db: database,
     };
 
     let watcher_tx = tx.clone();
@@ -146,8 +207,7 @@ async fn run_serve(watch_root: PathBuf, args: ServeArgs) -> anyhow::Result<()> {
         backfill: args.backfill,
     };
     std::thread::spawn(move || {
-        let watcher =
-            watcher::SessionWatcher::new(watcher_root, watcher_tx, watcher_store, opts);
+        let watcher = watcher::SessionWatcher::new(watcher_root, watcher_tx, watcher_store, opts);
         if let Err(e) = watcher.run() {
             tracing::error!("SessionWatcher exited with error: {e}");
         }
@@ -172,7 +232,11 @@ fn run_export(watch_root: &std::path::Path, args: ExportArgs) -> anyhow::Result<
 
     let store = state::SessionStore::new();
     let n = loader::ingest_directory(watch_root, &store)?;
-    info!("Loaded {} events across {} sessions", n, store.sessions().len());
+    info!(
+        "Loaded {} events across {} sessions",
+        n,
+        store.sessions().len()
+    );
 
     let want: std::collections::HashSet<String> = args.session.into_iter().collect();
     let sessions: Vec<_> = store
@@ -224,14 +288,38 @@ fn run_export(watch_root: &std::path::Path, args: ExportArgs) -> anyhow::Result<
                 }
             }
             std::fs::write(&path, body)?;
-            println!(
-                "Wrote {} session(s) to {}",
-                exports.len(),
-                path.display()
-            );
+            println!("Wrote {} session(s) to {}", exports.len(), path.display());
         }
     }
     Ok(())
+}
+
+fn run_service(watch_root_raw: &str, args: ServiceArgs) -> anyhow::Result<()> {
+    match args.action {
+        ServiceAction::Install(opts) => {
+            let exe = std::env::current_exe()
+                .context("could not determine the path to the running executable")?;
+            // Persist the watch root as an absolute path so the service is
+            // independent of the directory it was installed from.
+            let watch_root = expand_tilde(watch_root_raw)
+                .canonicalize()
+                .unwrap_or_else(|_| expand_tilde(watch_root_raw))
+                .to_string_lossy()
+                .to_string();
+            let cfg = service::ServiceConfig {
+                exe,
+                port: opts.port,
+                watch_root,
+                db: opts
+                    .db
+                    .map(|d| expand_tilde(&d).to_string_lossy().to_string()),
+                open: opts.open,
+            };
+            service::install(&cfg)
+        }
+        ServiceAction::Uninstall => service::uninstall(),
+        ServiceAction::Status => service::status(),
+    }
 }
 
 fn run_list(watch_root: &std::path::Path) -> anyhow::Result<()> {

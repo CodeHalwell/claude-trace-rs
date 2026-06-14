@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Trace
+GenericName=Claude Code Observability
+Comment=Real-time dashboard and trace database for Claude Code sessions
+Exec=claude-trace-rs serve --open
+Terminal=false
+Categories=Development;Utility;
+Keywords=claude;observability;dashboard;tracing;llm;
