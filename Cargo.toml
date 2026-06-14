@@ -1,6 +1,6 @@
 [package]
 name = "claude-trace-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Local-first real-time observability dashboard for Claude Code sessions."
 license = "MIT"
@@ -29,6 +29,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 futures-util = "0.3"
+# Embedded, zero-dependency SQLite (compiled from source via `bundled`) — gives
+# us a real persistent store for traces without asking users to install SQLite.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Cross-platform data/config directories for the on-disk database location.
+directories = "5"
 
 [dev-dependencies]
 tempfile = "3"
@@ -39,3 +44,19 @@ tokio-test = "0.4"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Debian/Ubuntu package metadata (used by `cargo deb`).
+[package.metadata.deb]
+maintainer = "CodeHalwell"
+copyright = "2026 CodeHalwell"
+license-file = ["LICENSE", "0"]
+extended-description = """
+Local-first real-time observability dashboard and training-dataset exporter \
+for Claude Code sessions, with a built-in SQLite trace database."""
+section = "devel"
+priority = "optional"
+assets = [
+    ["target/release/claude-trace-rs", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/claude-trace-rs/README.md", "644"],
+    ["assets/claude-trace-rs.desktop", "usr/share/applications/claude-trace-rs.desktop", "644"],
+]

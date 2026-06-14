@@ -2,21 +2,20 @@
 //!
 //! Six output shapes are supported:
 //!
-//! * `messages`     — Anthropic Messages API (one JSON object per line, the
-//!                    `messages` field holds the role/content turns with all
-//!                    content blocks preserved).
-//! * `openai`       — OpenAI chat-completion shape with `tool_calls` /
-//!                    `tool_call_id` translated from Claude's tool_use /
-//!                    tool_result blocks.
-//! * `sharegpt`     — `{conversations: [{from, value}]}` (HF / Axolotl /
-//!                    Unsloth standard).
-//! * `jsonl`        — Raw Claude Code JSONL passthrough. Full fidelity; one
-//!                    line per original entry.
-//! * `markdown`     — Human-readable transcript (`# User` / `# Assistant` /
-//!                    fenced `tool_use` blocks). For review, not training.
-//! * `huggingface`  — A directory containing `train.jsonl` + `dataset_info.json`
-//!                    + `README.md` so the result is directly usable with
-//!                    `datasets.load_dataset("json", data_dir=...)`.
+//! - `messages` — Anthropic Messages API (one JSON object per line, the
+//!   `messages` field holds the role/content turns with all content blocks
+//!   preserved).
+//! - `openai` — OpenAI chat-completion shape with `tool_calls` / `tool_call_id`
+//!   translated from Claude's tool_use / tool_result blocks.
+//! - `sharegpt` — `{conversations: [{from, value}]}` (HF / Axolotl / Unsloth
+//!   standard).
+//! - `jsonl` — Raw Claude Code JSONL passthrough. Full fidelity; one line per
+//!   original entry.
+//! - `markdown` — Human-readable transcript (`# User` / `# Assistant` / fenced
+//!   `tool_use` blocks). For review, not training.
+//! - `huggingface` — A directory containing `train.jsonl`, `dataset_info.json`
+//!   and a `README.md` so the result is directly usable with
+//!   `datasets.load_dataset("json", data_dir=...)`.
 
 use std::{collections::HashMap, fmt::Write, path::Path};
 
@@ -327,7 +326,7 @@ fn render_markdown(sess: &SessionExport<'_>) -> String {
         .clone()
         .unwrap_or_else(|| format!("Session {}", sess.stats.id));
     let _ = writeln!(out, "# {}", title);
-    let _ = writeln!(out, "");
+    let _ = writeln!(out);
     let _ = writeln!(out, "- **ID:** `{}`", sess.stats.id);
     if let Some(m) = &sess.stats.model {
         let _ = writeln!(out, "- **Model:** {}", m);
@@ -343,29 +342,34 @@ fn render_markdown(sess: &SessionExport<'_>) -> String {
         "- **Events:** {} · **Cost (est.):** ${:.4} · **Tokens out:** {}",
         sess.stats.event_count, sess.stats.cost_usd, sess.stats.output_tokens
     );
-    let _ = writeln!(out, "");
+    let _ = writeln!(out);
 
     for ev in sess.events {
         match ev.event_type.as_str() {
             "user" => {
                 let _ = writeln!(out, "## 👤 User");
-                let _ = writeln!(out, "");
-                write_content_md(&mut out, ev.entry.pointer("/message/content").or_else(|| ev.entry.get("content")));
-                let _ = writeln!(out, "");
+                let _ = writeln!(out);
+                write_content_md(
+                    &mut out,
+                    ev.entry
+                        .pointer("/message/content")
+                        .or_else(|| ev.entry.get("content")),
+                );
+                let _ = writeln!(out);
             }
             "assistant" => {
                 let _ = writeln!(out, "## 🤖 Assistant");
                 if let Some(t) = &ev.timestamp {
                     let _ = writeln!(out, "*{}*", t);
                 }
-                let _ = writeln!(out, "");
+                let _ = writeln!(out);
                 write_content_md(&mut out, ev.entry.pointer("/message/content"));
-                let _ = writeln!(out, "");
+                let _ = writeln!(out);
             }
             "summary" => {
                 if let Some(s) = ev.entry.get("summary").and_then(|v| v.as_str()) {
                     let _ = writeln!(out, "> **Summary:** {}", s);
-                    let _ = writeln!(out, "");
+                    let _ = writeln!(out);
                 }
             }
             _ => {}
@@ -397,12 +401,17 @@ fn write_content_md(out: &mut String, content: Option<&Value>) {
                         .or_else(|| b.get("text"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let _ = writeln!(out, "<details><summary>💭 Thinking</summary>\n\n```\n{}\n```\n\n</details>", t);
+                    let _ = writeln!(
+                        out,
+                        "<details><summary>💭 Thinking</summary>\n\n```\n{}\n```\n\n</details>",
+                        t
+                    );
                 }
                 "tool_use" => {
                     let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                    let input = serde_json::to_string_pretty(b.get("input").unwrap_or(&Value::Null))
-                        .unwrap_or_default();
+                    let input =
+                        serde_json::to_string_pretty(b.get("input").unwrap_or(&Value::Null))
+                            .unwrap_or_default();
                     let _ = writeln!(out, "**🔧 Tool: `{}`**\n\n```json\n{}\n```\n", name, input);
                 }
                 "tool_result" => {
@@ -460,9 +469,7 @@ fn extract_tool_uses_text(entry: &Value) -> Option<String> {
         if b.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
             let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let input = b.get("input").cloned().unwrap_or(Value::Null);
-            out.push(
-                json!({ "name": name, "arguments": input }).to_string(),
-            );
+            out.push(json!({ "name": name, "arguments": input }).to_string());
         }
     }
     Some(out.join("\n"))
@@ -518,17 +525,16 @@ pub fn write_huggingface_dir(
     let body = render_many(sessions, ExportFormat::Messages);
     std::fs::write(&train_path, body)?;
 
-    let totals = sessions.iter().fold(
-        HashMap::<&'static str, f64>::new(),
-        |mut acc, s| {
+    let totals = sessions
+        .iter()
+        .fold(HashMap::<&'static str, f64>::new(), |mut acc, s| {
             *acc.entry("sessions").or_insert(0.0) += 1.0;
             *acc.entry("events").or_insert(0.0) += s.stats.event_count as f64;
             *acc.entry("cost_usd").or_insert(0.0) += s.stats.cost_usd;
             *acc.entry("input_tokens").or_insert(0.0) += s.stats.input_tokens as f64;
             *acc.entry("output_tokens").or_insert(0.0) += s.stats.output_tokens as f64;
             acc
-        },
-    );
+        });
 
     // We deliberately omit a `features` block: each record's `content` field
     // can be either a string OR a heterogeneous array of `text` / `thinking` /
@@ -550,7 +556,10 @@ pub fn write_huggingface_dir(
             "train": { "name": "train", "num_examples": totals.get("sessions").copied().unwrap_or(0.0) as u64 }
         }
     });
-    std::fs::write(out_dir.join("dataset_info.json"), serde_json::to_vec_pretty(&info)?)?;
+    std::fs::write(
+        out_dir.join("dataset_info.json"),
+        serde_json::to_vec_pretty(&info)?,
+    )?;
 
     let card = format!(
         "---\nlicense: other\ntask_categories:\n  - conversational\n  - text-generation\nlanguage:\n  - en\nsize_categories:\n  - n<1K\npretty_name: \"Claude Code Sessions\"\n---\n\n# Claude Code session dataset\n\nGenerated by [`claude-trace-rs`](https://github.com/CodeHalwell/claude-trace-rs).\n\n- Sessions: **{sessions}**\n- Total events: **{events}**\n- Aggregate input tokens: **{tin}**\n- Aggregate output tokens: **{tout}**\n- Estimated cost: **${cost:.2}**\n\n## Schema\n\nEach line of `train.jsonl` is one Claude Code session. Top-level fields:\n\n| Field         | Type   | Notes |\n| ------------- | ------ | ----- |\n| `session_id`  | string | Stable Claude Code session UUID |\n| `model`       | string\\|null | e.g. `claude-opus-4-7` |\n| `cwd`         | string\\|null | Working directory the run started in |\n| `git_branch`  | string\\|null | Git branch when known |\n| `version`     | string\\|null | Claude Code CLI version |\n| `title`       | string\\|null | AI-assigned title if present |\n| `messages`    | array  | Anthropic-shape messages — see below |\n| `metadata`    | object | Aggregates: `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cost_usd`, `first_seen`, `last_seen`, `event_count`, `tool_counts` |\n\n`messages[*].content` is either a string (plain user text) **or** a heterogeneous\narray of content blocks. Each block has a `type` field; possible values:\n\n- `text` — `text: string`\n- `thinking` — `thinking: string` (extended-thinking output)\n- `tool_use` — `id`, `name`, `input`\n- `tool_result` — `tool_use_id`, `content` (string or array)\n- `image` — `source`\n\nExample:\n\n```json\n{{\n  \"session_id\": \"…\",\n  \"model\": \"claude-opus-4-7\",\n  \"messages\": [\n    {{\"role\": \"user\", \"content\": \"…\"}},\n    {{\"role\": \"assistant\", \"content\": [\n      {{\"type\":\"text\",\"text\":\"…\"}},\n      {{\"type\":\"tool_use\",\"id\":\"toolu_…\",\"name\":\"Read\",\"input\":{{}}}}\n    ]}},\n    {{\"role\": \"user\", \"content\": [\n      {{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_…\",\"content\":\"…\"}}\n    ]}}\n  ],\n  \"metadata\": {{ \"cost_usd\": 0.42, \"input_tokens\": 1234, \"output_tokens\": 567 }}\n}}\n```\n\n## Load\n\n```python\nimport os\nfrom datasets import load_dataset\nds = load_dataset(\"json\", data_files={{\n    \"train\": os.path.expanduser(\"train.jsonl\")\n}})\nprint(ds[\"train\"][0][\"messages\"][:3])\n```\n",
@@ -589,7 +598,11 @@ mod tests {
     }
 
     fn ev(t: &str, raw: serde_json::Value) -> TraceEvent {
-        TraceEvent::from_raw("sid", 0, json!({ "type": t, "sessionId": "sid", "message": raw }))
+        TraceEvent::from_raw(
+            "sid",
+            0,
+            json!({ "type": t, "sessionId": "sid", "message": raw }),
+        )
     }
 
     #[test]
@@ -597,18 +610,30 @@ mod tests {
         let s = stats();
         let events = vec![
             ev("user", json!({ "content": "hello" })),
-            ev("assistant", json!({
-                "model": "claude-opus-4-7",
-                "content": [
-                    { "type": "text", "text": "hi" },
-                    { "type": "tool_use", "id": "t1", "name": "Read", "input": { "path": "/x" } }
-                ]
-            })),
-            ev("user", json!({
-                "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "file body" }]
-            })),
+            ev(
+                "assistant",
+                json!({
+                    "model": "claude-opus-4-7",
+                    "content": [
+                        { "type": "text", "text": "hi" },
+                        { "type": "tool_use", "id": "t1", "name": "Read", "input": { "path": "/x" } }
+                    ]
+                }),
+            ),
+            ev(
+                "user",
+                json!({
+                    "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "file body" }]
+                }),
+            ),
         ];
-        let out = render_session(&SessionExport { stats: &s, events: &events }, ExportFormat::Messages);
+        let out = render_session(
+            &SessionExport {
+                stats: &s,
+                events: &events,
+            },
+            ExportFormat::Messages,
+        );
         let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(parsed["session_id"], "sid");
         let msgs = parsed["messages"].as_array().unwrap();
@@ -627,18 +652,30 @@ mod tests {
         let s = stats();
         let events = vec![
             ev("user", json!({ "content": "hello" })),
-            ev("assistant", json!({
-                "model": "claude-opus-4-7",
-                "content": [
-                    { "type": "text", "text": "calling tool" },
-                    { "type": "tool_use", "id": "t1", "name": "Read", "input": { "path": "/x" } }
-                ]
-            })),
-            ev("user", json!({
-                "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }]
-            })),
+            ev(
+                "assistant",
+                json!({
+                    "model": "claude-opus-4-7",
+                    "content": [
+                        { "type": "text", "text": "calling tool" },
+                        { "type": "tool_use", "id": "t1", "name": "Read", "input": { "path": "/x" } }
+                    ]
+                }),
+            ),
+            ev(
+                "user",
+                json!({
+                    "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }]
+                }),
+            ),
         ];
-        let out = render_session(&SessionExport { stats: &s, events: &events }, ExportFormat::Openai);
+        let out = render_session(
+            &SessionExport {
+                stats: &s,
+                events: &events,
+            },
+            ExportFormat::Openai,
+        );
         let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         let msgs = parsed["messages"].as_array().unwrap();
         // user, assistant (with tool_calls), tool result
@@ -656,11 +693,20 @@ mod tests {
         let s = stats();
         let events = vec![
             ev("user", json!({ "content": "hi" })),
-            ev("assistant", json!({
-                "content": [{ "type": "text", "text": "hello back" }]
-            })),
+            ev(
+                "assistant",
+                json!({
+                    "content": [{ "type": "text", "text": "hello back" }]
+                }),
+            ),
         ];
-        let out = render_session(&SessionExport { stats: &s, events: &events }, ExportFormat::Sharegpt);
+        let out = render_session(
+            &SessionExport {
+                stats: &s,
+                events: &events,
+            },
+            ExportFormat::Sharegpt,
+        );
         let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         let conv = parsed["conversations"].as_array().unwrap();
         assert_eq!(conv.len(), 2);
@@ -673,11 +719,20 @@ mod tests {
         let s = stats();
         let events = vec![
             ev("user", json!({ "content": "hi" })),
-            ev("assistant", json!({
-                "content": [{ "type": "text", "text": "back" }]
-            })),
+            ev(
+                "assistant",
+                json!({
+                    "content": [{ "type": "text", "text": "back" }]
+                }),
+            ),
         ];
-        let out = render_session(&SessionExport { stats: &s, events: &events }, ExportFormat::Markdown);
+        let out = render_session(
+            &SessionExport {
+                stats: &s,
+                events: &events,
+            },
+            ExportFormat::Markdown,
+        );
         assert!(out.contains("# Test session"));
         assert!(out.contains("## 👤 User"));
         assert!(out.contains("## 🤖 Assistant"));
@@ -687,7 +742,13 @@ mod tests {
     fn raw_jsonl_preserves_full_entries() {
         let s = stats();
         let events = vec![ev("user", json!({ "content": "hi" }))];
-        let out = render_session(&SessionExport { stats: &s, events: &events }, ExportFormat::Jsonl);
+        let out = render_session(
+            &SessionExport {
+                stats: &s,
+                events: &events,
+            },
+            ExportFormat::Jsonl,
+        );
         assert!(out.contains("\"sessionId\":\"sid\""));
         assert!(out.contains("\"type\":\"user\""));
     }
@@ -700,8 +761,14 @@ mod tests {
         let e1 = vec![ev("user", json!({ "content": "a" }))];
         let e2 = vec![ev("user", json!({ "content": "b" }))];
         let sessions = vec![
-            SessionExport { stats: &s1, events: &e1 },
-            SessionExport { stats: &s2, events: &e2 },
+            SessionExport {
+                stats: &s1,
+                events: &e1,
+            },
+            SessionExport {
+                stats: &s2,
+                events: &e2,
+            },
         ];
         let out = render_many(&sessions, ExportFormat::Messages);
         assert_eq!(out.lines().count(), 2);

@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     dashboard::dashboard_html,
+    db::{Db, SessionFilter},
     event::TraceEvent,
     export::{self, ExportFormat, SessionExport},
     state::SessionStore,
@@ -31,6 +32,7 @@ pub struct AppState {
     pub watch_root: String,
     pub port: u16,
     pub store: SessionStore,
+    pub db: Db,
 }
 
 pub async fn serve(state: AppState) -> anyhow::Result<()> {
@@ -53,6 +55,16 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
         .route("/api/sessions/:id/export", get(api_session_export))
         .route("/api/export", get(api_export_many))
         .route("/api/snapshot", get(api_snapshot))
+        // Database-backed history & analytics (persists across restarts).
+        .route("/api/db/sessions", get(db_sessions))
+        .route("/api/db/projects", get(db_projects))
+        .route("/api/db/sessions/:id/events", get(db_session_events))
+        .route(
+            "/api/db/sessions/:id/meta",
+            get(db_get_meta).post(db_set_meta),
+        )
+        .route("/api/db/search", get(db_search))
+        .route("/api/db/stats", get(db_stats))
         .layer(cors)
         .layer(from_fn(reject_cross_origin_api))
         .with_state(state);
@@ -86,10 +98,7 @@ async fn api_sessions(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-async fn api_session_detail(
-    Path(id): Path<String>,
-    State(state): State<AppState>,
-) -> Response {
+async fn api_session_detail(Path(id): Path<String>, State(state): State<AppState>) -> Response {
     match state.store.session(&id) {
         Some(s) => Json(s).into_response(),
         None => (StatusCode::NOT_FOUND, "Unknown session").into_response(),
@@ -219,19 +228,22 @@ fn stream_response(
 
     let total = pairs.len();
     let is_markdown = matches!(format, ExportFormat::Markdown);
-    let chunks = pairs.into_iter().enumerate().flat_map(move |(i, (stats, events))| {
-        let exp = SessionExport {
-            stats: &stats,
-            events: events.as_slice(),
-        };
-        let body = export::render_session(&exp, format);
-        let mut out: Vec<Result<Bytes, Infallible>> = Vec::with_capacity(2);
-        out.push(Ok(Bytes::from(body)));
-        if is_markdown && i + 1 < total {
-            out.push(Ok(Bytes::from_static(b"\n\n---\n\n")));
-        }
-        out
-    });
+    let chunks = pairs
+        .into_iter()
+        .enumerate()
+        .flat_map(move |(i, (stats, events))| {
+            let exp = SessionExport {
+                stats: &stats,
+                events: events.as_slice(),
+            };
+            let body = export::render_session(&exp, format);
+            let mut out: Vec<Result<Bytes, Infallible>> = Vec::with_capacity(2);
+            out.push(Ok(Bytes::from(body)));
+            if is_markdown && i + 1 < total {
+                out.push(Ok(Bytes::from_static(b"\n\n---\n\n")));
+            }
+            out
+        });
 
     let body = Body::from_stream(stream::iter(chunks));
     let headers = [
@@ -247,6 +259,142 @@ fn stream_response(
 
 fn short_filename(id: &str) -> String {
     id.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "-")
+}
+
+// ---------------------------------------------------------------------------
+// Database-backed history & analytics endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct DbSessionsQuery {
+    search: Option<String>,
+    project: Option<String>,
+    #[serde(default)]
+    bookmarked: bool,
+    sort: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn db_sessions(Query(q): Query<DbSessionsQuery>, State(state): State<AppState>) -> Response {
+    let filter = SessionFilter {
+        search: q.search.filter(|s| !s.is_empty()),
+        project: q.project.filter(|s| !s.is_empty()),
+        bookmarked_only: q.bookmarked,
+        sort: q.sort,
+        limit: q.limit,
+    };
+    match state.db.query_sessions(&filter) {
+        Ok(sessions) => Json(json!({ "sessions": sessions })).into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+async fn db_projects(State(state): State<AppState>) -> Response {
+    match state.db.projects() {
+        Ok(projects) => Json(json!({ "projects": projects })).into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DbEventsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(rename = "type")]
+    type_filter: Option<String>,
+    search: Option<String>,
+}
+
+async fn db_session_events(
+    Path(id): Path<String>,
+    Query(q): Query<DbEventsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let limit = q.limit.unwrap_or(200).min(2000);
+    let offset = q.offset.unwrap_or(0);
+    match state.db.session_events(
+        &id,
+        q.type_filter.as_deref(),
+        q.search.as_deref(),
+        limit,
+        offset,
+    ) {
+        Ok(page) => Json(json!({
+            "session_id": id,
+            "events": page.events,
+            "total": page.total,
+            "limit": limit,
+            "offset": offset,
+        }))
+        .into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: String,
+    limit: Option<usize>,
+}
+
+async fn db_search(Query(q): Query<SearchQuery>, State(state): State<AppState>) -> Response {
+    let limit = q.limit.unwrap_or(100).min(1000);
+    if q.q.trim().is_empty() {
+        return Json(json!({ "events": [] })).into_response();
+    }
+    match state.db.search_events(q.q.trim(), limit) {
+        Ok(events) => Json(json!({ "query": q.q, "events": events })).into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+async fn db_stats(State(state): State<AppState>) -> Response {
+    match state.db.global_stats() {
+        Ok(stats) => Json(stats).into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+async fn db_get_meta(Path(id): Path<String>, State(state): State<AppState>) -> Response {
+    match state.db.get_meta(&id) {
+        Ok(meta) => Json(meta).into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MetaBody {
+    #[serde(default)]
+    bookmarked: bool,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    notes: String,
+}
+
+async fn db_set_meta(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(body): Json<MetaBody>,
+) -> Response {
+    match state
+        .db
+        .set_meta(&id, body.bookmarked, &body.tags, &body.notes)
+    {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+fn db_error(e: anyhow::Error) -> Response {
+    warn!("Database error: {e}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": e.to_string() })),
+    )
+        .into_response()
 }
 
 async fn ws_handler(

@@ -74,10 +74,7 @@ impl TraceEvent {
             .and_then(|v| v.as_str())
             .map(str::to_owned);
 
-        let cwd = raw
-            .get("cwd")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
+        let cwd = raw.get("cwd").and_then(|v| v.as_str()).map(str::to_owned);
 
         let git_branch = raw
             .get("gitBranch")
@@ -98,14 +95,14 @@ impl TraceEvent {
         let (tool_uses, tool_results) = extract_content_kinds(&raw);
         let usage = extract_usage(&raw);
 
-        let (cost_usd, cost_estimated) = if let Some(c) = raw.get("costUSD").and_then(|v| v.as_f64())
-        {
-            (c, false)
-        } else if let Some(u) = &usage {
-            (estimate_cost(model.as_deref(), u), true)
-        } else {
-            (0.0, true)
-        };
+        let (cost_usd, cost_estimated) =
+            if let Some(c) = raw.get("costUSD").and_then(|v| v.as_f64()) {
+                (c, false)
+            } else if let Some(u) = &usage {
+                (estimate_cost(model.as_deref(), u), true)
+            } else {
+                (0.0, true)
+            };
 
         Self {
             session_id,
@@ -128,16 +125,64 @@ impl TraceEvent {
     }
 }
 
+impl TraceEvent {
+    /// Concatenated, plain-text representation of this event's textual content,
+    /// used to populate the database's searchable column. Includes the summary
+    /// plus any `text`/`thinking` blocks and string content found in the entry.
+    pub fn search_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&self.summary);
+        collect_text(&self.entry, &mut out);
+        // Keep the indexed text bounded so giant tool payloads don't bloat the DB.
+        if out.len() > 16_384 {
+            let mut end = 16_384;
+            while !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
+        }
+        out
+    }
+}
+
+/// Recursively gather human-readable text from a Claude Code entry: `text`,
+/// `thinking`, and string `content`/`input` fields.
+fn collect_text(val: &serde_json::Value, out: &mut String) {
+    match val {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                match k.as_str() {
+                    "text" | "thinking" | "content" | "summary" | "aiTitle" => {
+                        if let Some(s) = v.as_str() {
+                            out.push(' ');
+                            out.push_str(s);
+                            continue;
+                        }
+                    }
+                    // Skip noisy/non-text fields entirely.
+                    "uuid" | "parentUuid" | "id" | "tool_use_id" | "sessionId" | "signature"
+                    | "timestamp" => continue,
+                    _ => {}
+                }
+                collect_text(v, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                collect_text(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Walk an entry's content blocks (top-level `content`, or `message.content`)
 /// and pull out the names of tool_use blocks and IDs of tool_result blocks.
 fn extract_content_kinds(val: &serde_json::Value) -> (Vec<String>, Vec<String>) {
     let mut tool_uses = Vec::new();
     let mut tool_results = Vec::new();
 
-    let candidates = [
-        val.get("content"),
-        val.pointer("/message/content"),
-    ];
+    let candidates = [val.get("content"), val.pointer("/message/content")];
 
     for content in candidates.into_iter().flatten() {
         if let Some(arr) = content.as_array() {
@@ -164,11 +209,12 @@ fn extract_content_kinds(val: &serde_json::Value) -> (Vec<String>, Vec<String>) 
 
 /// Extract token usage from common locations in a Claude Code JSONL entry.
 fn extract_usage(val: &serde_json::Value) -> Option<TokenUsage> {
-    let usage = val
-        .pointer("/message/usage")
-        .or_else(|| val.get("usage"))?;
+    let usage = val.pointer("/message/usage").or_else(|| val.get("usage"))?;
 
-    let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let input = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let output = usage
         .get("output_tokens")
         .and_then(|v| v.as_u64())
@@ -284,7 +330,10 @@ pub fn summarise(val: &serde_json::Value, tool_uses: &[String]) -> String {
             } else {
                 let n_thinking = count_blocks_of_kind(val, "thinking");
                 if n_thinking > 0 {
-                    format!("💭 Thinking ({n_thinking} block{})", if n_thinking > 1 { "s" } else { "" })
+                    format!(
+                        "💭 Thinking ({n_thinking} block{})",
+                        if n_thinking > 1 { "s" } else { "" }
+                    )
                 } else {
                     "🤖 Assistant".to_owned()
                 }
@@ -510,7 +559,11 @@ mod tests {
         let long = "a".repeat(500);
         let val = json!({ "type": "user", "content": long });
         let s = summarise(&val, &[]);
-        assert!(s.chars().count() < 250, "summary too long: {}", s.chars().count());
+        assert!(
+            s.chars().count() < 250,
+            "summary too long: {}",
+            s.chars().count()
+        );
     }
 
     #[test]

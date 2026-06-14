@@ -1,18 +1,26 @@
 # claude-trace-rs
 
-> Local-first real-time observability dashboard **and training-dataset exporter** for Claude Code sessions.
+> Local-first real-time observability dashboard, **persistent trace database**, and training-dataset exporter for Claude Code sessions.
 
-`claude-trace-rs` is a single Rust binary that tails every JSONL session log Claude Code writes to disk, parses the events as they arrive, surfaces what every concurrent session is doing in a rich browser dashboard, and can dump the lot to disk in any of six training-friendly formats.
+`claude-trace-rs` is a single, cross-platform Rust binary that tails every JSONL session log Claude Code writes to disk, parses the events as they arrive, **persists them to a built-in SQLite database**, surfaces what every session is doing in a clean browser dashboard, and can dump the lot to disk in any of six training-friendly formats.
 
-It is designed for the case where you have **multiple Claude Code instances running in parallel** (different projects, different worktrees, multiple windows). Each session's events are clearly separated: grouped by project, threaded into a conversation view, broken down into per-session token, cost and tool-usage metrics — and exportable as a clean dataset.
+It is designed for the case where you have **multiple Claude Code instances running in parallel** (different projects, different worktrees, multiple windows). Each session's events are clearly separated: grouped by project, threaded into a conversation view, broken down into per-session token, cost and tool-usage metrics — stored forever in a local database and exportable as a clean dataset.
 
 ## Highlights
 
-### Real-time dashboard
-- **Multi-session sidebar.** Every concurrent Claude Code window is its own entry, grouped by project (cwd), with a live-activity dot, a per-session sparkline of event rate, the last-seen time, and per-session bookmarks + freeform tags persisted in `localStorage`.
-- **Live event feed.** Stream of newly observed events with badges per event type, session tag, token/cost columns, type and free-text filters, pause/resume, JSON inspector, and saved filter views.
-- **Conversation view.** Threaded transcript of user / assistant / tool messages for the selected session — text, `thinking` blocks, `tool_use` invocations with inputs, `tool_result` payloads, **latency badge** (`⚡ 2.4s`) on each assistant turn relative to the preceding user message.
-- **Metrics tab.** Tokens, cache-hit rate, estimated cost (uses public Claude pricing), top tool calls, cost / tokens leaderboards, 60-minute event-rate timeline, p50/p95 latency.
+### Built-in trace database
+- **Everything is persisted** to an embedded SQLite database (compiled into the binary via `rusqlite` — nothing to install). Traces survive restarts, machine reboots, and far exceed the in-memory ring buffers.
+- **Full history retrieval.** Scroll a session's entire transcript (not just the last few thousand events), paginated straight from the database.
+- **Fast search** across every event ever recorded, plus per-session filtering by type and text.
+- **Cross-session analytics** computed in SQL: totals, cost-by-model, token breakdown, top tools, a 30-day activity timeline.
+- **Server-side annotations.** Bookmarks, tags, and notes are stored in the database, so they follow your data instead of a single browser's `localStorage`.
+
+### Real-time dashboard (redesigned)
+- **Clean, uncluttered UI** with a calm light/dark theme, a single global search, a project-grouped session navigator, and three focused tabs (Live · Conversation · Analytics).
+- **Multi-session sidebar.** Sessions grouped by project (cwd), with a live-activity dot, event/cost summary, last-seen time, and one-click bookmarking.
+- **Live event feed.** Real-time stream over WebSocket with type/text filters, pause/resume, and a slide-in JSON inspector.
+- **Conversation view.** Threaded transcript of user / assistant / tool messages — text, `thinking` blocks, `tool_use` invocations with inputs, `tool_result` payloads, and a **latency badge** (`⚡ 2.4s`) on each assistant turn.
+- **Analytics tab.** Tokens, cache usage, estimated cost (public Claude pricing), top tool calls, cost-by-model, and an activity timeline.
 
 ### Training-dataset export
 
@@ -40,7 +48,33 @@ Six output formats with full content-block fidelity:
 
 ## Install
 
-### From source
+`claude-trace-rs` ships as a self-contained binary for **Windows, macOS, and Linux** — no runtime, no system SQLite, nothing else to install.
+
+### One-line installer (macOS / Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CodeHalwell/claude-trace-rs/main/scripts/install.sh | sh
+```
+
+### One-line installer (Windows, PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/CodeHalwell/claude-trace-rs/main/scripts/install.ps1 | iex
+```
+
+### Download a release
+
+Grab a prebuilt archive (`.tar.gz` / `.zip`) or the Linux `.deb` from the
+[Releases page](https://github.com/CodeHalwell/claude-trace-rs/releases), unpack, and put the binary on your `PATH`. Every asset ships with a `.sha256` checksum.
+
+```bash
+# Debian / Ubuntu
+sudo dpkg -i claude-trace-rs_*_amd64.deb
+```
+
+Tagging a release (`git tag v0.3.0 && git push origin v0.3.0`) builds and publishes all of these automatically via the GitHub Actions release workflow.
+
+### From source (any platform with Rust)
 
 ```bash
 git clone https://github.com/CodeHalwell/claude-trace-rs
@@ -53,7 +87,7 @@ Installs `claude-trace-rs` into `~/.cargo/bin` (make sure that's on `$PATH`).
 ### Run without installing
 
 ```bash
-cargo run --release -- --open
+cargo run --release -- serve --open
 ```
 
 ## Use it
@@ -132,6 +166,8 @@ serve:
       --channel-capacity <N>   Per-subscriber broadcast buffer [default: 1024]
       --backfill               Replay every event already on disk
       --open                   Open the dashboard URL in a browser
+      --db <PATH>              SQLite database file [env: CLAUDE_TRACE_DB,
+                               default: platform data dir, see below]
 
 export:
   -f, --format <FMT>        messages | openai | sharegpt | jsonl | markdown | huggingface
@@ -148,13 +184,21 @@ All endpoints are localhost-only. Cross-origin requests are rejected with `403`.
 | Endpoint                                       | Description                                |
 | ---------------------------------------------- | ------------------------------------------ |
 | `GET /health`                                  | Liveness + counts                          |
-| `GET /api/sessions`                            | Every known session with aggregates        |
+| `GET /api/sessions`                            | Every in-memory session with aggregates    |
 | `GET /api/sessions/:id`                        | One session's aggregates                   |
 | `GET /api/sessions/:id/events?limit`           | Buffered recent events                     |
 | `GET /api/sessions/:id/export?format=…`        | Download one session (any of the 6 formats)|
 | `GET /api/export?format=…&sessions=id1,id2`    | Bulk export (omit `sessions` for all)      |
 | `GET /api/snapshot?events=N`                   | Sessions + last N global events            |
 | `WS /ws`                                       | Live snapshot + event stream               |
+| **Database-backed (persistent across restarts):** | |
+| `GET /api/db/sessions?search&project&bookmarked&sort&limit` | All persisted sessions, filtered/sorted |
+| `GET /api/db/projects`                         | Distinct projects with session counts      |
+| `GET /api/db/sessions/:id/events?type&search&limit&offset` | Paginated full session history  |
+| `GET /api/db/search?q=…&limit`                 | Full-text-ish search across all events     |
+| `GET /api/db/stats`                            | Cross-session analytics rollups            |
+| `GET /api/db/sessions/:id/meta`                | Read bookmark / tags / notes               |
+| `POST /api/db/sessions/:id/meta`               | Persist bookmark / tags / notes            |
 
 ```bash
 curl -OJ "http://127.0.0.1:7779/api/sessions/$SID/export?format=huggingface"
@@ -171,14 +215,28 @@ curl -OJ "http://127.0.0.1:7779/api/sessions/$SID/export?format=huggingface"
                                                 ▼
                                   parser + enricher (event.rs)
                                                 │
-                          ┌─────────────────────┼─────────────────────┐
-                          ▼                     ▼                     ▼
-                broadcast::channel       SessionStore        export module
-                          │             (state.rs)             (export.rs)
-                          ▼                     ▼                     ▼
-              WebSocket subscribers      REST snapshot            CLI / HTTP
-                                                                  download
+              ┌─────────────────────────────────┼───────────────────────────┐
+              ▼                     ▼            ▼                  ▼
+    broadcast::channel       SessionStore   SQLite database    export module
+              │             (in-memory       (db.rs, on disk)    (export.rs)
+              ▼              live feed)            │                  ▼
+   WebSocket subscribers          │       history / search /     CLI / HTTP
+        (Live tab)                ▼       analytics / pagination   download
+                          REST snapshot   (Conversation, Analytics,
+                                           global search tabs)
 ```
+
+### Where data is stored
+
+The database lives in your platform's data directory (override with `--db` or `CLAUDE_TRACE_DB`):
+
+| OS      | Default path                                                   |
+| ------- | ------------------------------------------------------------- |
+| Linux   | `~/.local/share/claude-trace-rs/trace.db`                     |
+| macOS   | `~/Library/Application Support/claude-trace-rs/trace.db`      |
+| Windows | `%APPDATA%\claude-trace-rs\data\trace.db`                     |
+
+Events are de-duplicated by `(session_id, line_index)`, so restarting the watcher or running with `--backfill` never double-counts. Nothing ever leaves your machine.
 
 - Each parsed line is enriched with `session_id` taken from the entry's `sessionId` field — so two concurrent Claude Code processes that happen to write to the same path stay cleanly separated.
 - Tool names are extracted from embedded `tool_use` content blocks; tokens from input/output/cache fields; cost estimated per-model where Claude Code doesn't include `costUSD`.
@@ -204,15 +262,18 @@ Project layout:
 
 ```
 src/
-  main.rs        CLI subcommands (serve/export/list), tilde expansion, browser launch
-  event.rs       TraceEvent + enrichment (model, tools, usage, cost)
-  state.rs       SessionStore — aggregates + ring buffers
+  main.rs        CLI subcommands (serve/export/list), DB bootstrap, browser launch
+  event.rs       TraceEvent + enrichment (model, tools, usage, cost, search text)
+  state.rs       SessionStore — in-memory aggregates + ring buffers, DB write-through
+  db.rs          embedded SQLite store: events, sessions, annotations, analytics
   watcher.rs     filesystem tail; partial-write + truncation safety
   loader.rs      one-shot directory ingestion for offline CLI export
   export.rs      Anthropic / OpenAI / ShareGPT / Raw / Markdown / HuggingFace
-  server.rs      axum router, REST + export endpoints, WebSocket handler
-  dashboard.rs   built-in single-page HTML + JS UI
+  server.rs      axum router, REST + DB + export endpoints, WebSocket handler
+  dashboard.rs   built-in single-page HTML + JS UI (Live / Conversation / Analytics)
 ```
+
+See [`ROADMAP.md`](ROADMAP.md) for planned improvements and ideas.
 
 ## License
 

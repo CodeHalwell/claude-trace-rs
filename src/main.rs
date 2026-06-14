@@ -1,4 +1,5 @@
 mod dashboard;
+mod db;
 mod event;
 mod export;
 mod loader;
@@ -63,6 +64,11 @@ struct ServeArgs {
     /// Open the dashboard URL in the default browser once the server is up.
     #[arg(long, env = "CLAUDE_TRACE_OPEN")]
     open: bool,
+
+    /// Path to the SQLite database file. Defaults to the platform data dir
+    /// (e.g. `~/.local/share/claude-trace-rs/trace.db`).
+    #[arg(long, env = "CLAUDE_TRACE_DB")]
+    db: Option<String>,
 }
 
 impl Default for ServeArgs {
@@ -72,6 +78,7 @@ impl Default for ServeArgs {
             channel_capacity: 1024,
             backfill: false,
             open: false,
+            db: None,
         }
     }
 }
@@ -129,14 +136,32 @@ async fn run_serve(watch_root: PathBuf, args: ServeArgs) -> anyhow::Result<()> {
         std::fs::create_dir_all(&watch_root)?;
     }
 
+    // Open the persistent trace database and seed the in-memory store with the
+    // historical session aggregates so the dashboard is populated immediately.
+    let db_path = args
+        .db
+        .as_deref()
+        .map(expand_tilde)
+        .unwrap_or_else(db::default_db_path);
+    let database = db::Db::open(&db_path)?;
+    info!("Trace database: {}", database.path().display());
+    let store = state::SessionStore::with_db(database.clone());
+    match database.load_sessions() {
+        Ok(sessions) => {
+            info!("Loaded {} session(s) from the database", sessions.len());
+            store.seed_sessions(sessions);
+        }
+        Err(e) => warn!("Could not load sessions from the database: {e}"),
+    }
+
     let (tx, _) = broadcast::channel::<event::TraceEvent>(args.channel_capacity);
-    let store = state::SessionStore::new();
 
     let server_state = server::AppState {
         tx: tx.clone(),
         watch_root: watch_root.to_string_lossy().to_string(),
         port: args.port,
         store: store.clone(),
+        db: database,
     };
 
     let watcher_tx = tx.clone();
@@ -146,8 +171,7 @@ async fn run_serve(watch_root: PathBuf, args: ServeArgs) -> anyhow::Result<()> {
         backfill: args.backfill,
     };
     std::thread::spawn(move || {
-        let watcher =
-            watcher::SessionWatcher::new(watcher_root, watcher_tx, watcher_store, opts);
+        let watcher = watcher::SessionWatcher::new(watcher_root, watcher_tx, watcher_store, opts);
         if let Err(e) = watcher.run() {
             tracing::error!("SessionWatcher exited with error: {e}");
         }
@@ -172,7 +196,11 @@ fn run_export(watch_root: &std::path::Path, args: ExportArgs) -> anyhow::Result<
 
     let store = state::SessionStore::new();
     let n = loader::ingest_directory(watch_root, &store)?;
-    info!("Loaded {} events across {} sessions", n, store.sessions().len());
+    info!(
+        "Loaded {} events across {} sessions",
+        n,
+        store.sessions().len()
+    );
 
     let want: std::collections::HashSet<String> = args.session.into_iter().collect();
     let sessions: Vec<_> = store
@@ -224,11 +252,7 @@ fn run_export(watch_root: &std::path::Path, args: ExportArgs) -> anyhow::Result<
                 }
             }
             std::fs::write(&path, body)?;
-            println!(
-                "Wrote {} session(s) to {}",
-                exports.len(),
-                path.display()
-            );
+            println!("Wrote {} session(s) to {}", exports.len(), path.display());
         }
     }
     Ok(())

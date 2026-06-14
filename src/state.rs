@@ -4,8 +4,9 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
-use crate::event::TraceEvent;
+use crate::{db::Db, event::TraceEvent};
 
 /// Cap on how many events we retain per session in memory for client backfill.
 pub const PER_SESSION_RECENT_CAP: usize = 5_000;
@@ -47,6 +48,13 @@ pub struct SessionStats {
 
     /// AI-generated title from `ai-title` events, when present.
     pub title: Option<String>,
+
+    /// Whether the user has bookmarked this session (persisted in the database).
+    #[serde(default)]
+    pub bookmarked: bool,
+    /// Freeform user tags for this session (persisted in the database).
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 impl SessionStats {
@@ -127,7 +135,7 @@ pub struct Snapshot {
     pub total_events: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Inner {
     sessions: HashMap<String, SessionStats>,
     /// Per-session ring buffer of recent events.
@@ -137,21 +145,16 @@ struct Inner {
     total_events: usize,
 }
 
-impl Default for Inner {
-    fn default() -> Self {
-        Self {
-            sessions: HashMap::new(),
-            per_session_events: HashMap::new(),
-            global_events: VecDeque::new(),
-            total_events: 0,
-        }
-    }
-}
-
 /// Shared, thread-safe session store. Cheap to clone.
+///
+/// Holds the bounded in-memory state that powers the live WebSocket feed. When
+/// constructed with [`SessionStore::with_db`], every ingested event is also
+/// persisted to the on-disk SQLite database so the full history survives
+/// restarts and can be queried beyond the in-memory ring buffers.
 #[derive(Debug, Clone, Default)]
 pub struct SessionStore {
     inner: Arc<RwLock<Inner>>,
+    db: Option<Db>,
 }
 
 impl SessionStore {
@@ -159,29 +162,59 @@ impl SessionStore {
         Self::default()
     }
 
-    /// Record an event in the store, updating aggregates and ring buffers.
-    pub fn ingest(&self, ev: &TraceEvent) {
-        let mut g = self.inner.write().expect("session store poisoned");
-        g.total_events += 1;
-
-        let stats = g
-            .sessions
-            .entry(ev.session_id.clone())
-            .or_insert_with(SessionStats::default);
-        stats.ingest(ev);
-
-        let per = g
-            .per_session_events
-            .entry(ev.session_id.clone())
-            .or_default();
-        per.push_back(ev.clone());
-        while per.len() > PER_SESSION_RECENT_CAP {
-            per.pop_front();
+    /// Create a store that also persists every event to the given database.
+    pub fn with_db(db: Db) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Inner::default())),
+            db: Some(db),
         }
+    }
 
-        g.global_events.push_back(ev.clone());
-        while g.global_events.len() > GLOBAL_RECENT_CAP {
-            g.global_events.pop_front();
+    /// Seed in-memory aggregates from a previously persisted set of sessions,
+    /// without re-counting or re-persisting them. Used at startup so historical
+    /// sessions appear in the dashboard immediately.
+    pub fn seed_sessions(&self, sessions: Vec<SessionStats>) {
+        let mut g = self.inner.write().expect("session store poisoned");
+        for s in sessions {
+            g.sessions.insert(s.id.clone(), s);
+        }
+    }
+
+    /// Record an event in the store, updating aggregates and ring buffers, and
+    /// persisting to the database when one is attached.
+    pub fn ingest(&self, ev: &TraceEvent) {
+        let stats_snapshot = {
+            let mut g = self.inner.write().expect("session store poisoned");
+            g.total_events += 1;
+
+            let stats = g.sessions.entry(ev.session_id.clone()).or_default();
+            stats.ingest(ev);
+            let snapshot = self.db.as_ref().map(|_| stats.clone());
+
+            let per = g
+                .per_session_events
+                .entry(ev.session_id.clone())
+                .or_default();
+            per.push_back(ev.clone());
+            while per.len() > PER_SESSION_RECENT_CAP {
+                per.pop_front();
+            }
+
+            g.global_events.push_back(ev.clone());
+            while g.global_events.len() > GLOBAL_RECENT_CAP {
+                g.global_events.pop_front();
+            }
+            snapshot
+        };
+
+        // Persist outside the in-memory lock to keep write latency off readers.
+        if let (Some(db), Some(stats)) = (&self.db, stats_snapshot) {
+            if let Err(e) = db.insert_event(ev) {
+                warn!("Failed to persist event to database: {e}");
+            }
+            if let Err(e) = db.upsert_session(&stats) {
+                warn!("Failed to persist session aggregates: {e}");
+            }
         }
     }
 
@@ -225,7 +258,10 @@ impl SessionStore {
     }
 
     pub fn total_events(&self) -> usize {
-        self.inner.read().expect("session store poisoned").total_events
+        self.inner
+            .read()
+            .expect("session store poisoned")
+            .total_events
     }
 }
 
@@ -304,16 +340,8 @@ mod tests {
     #[test]
     fn store_counts_top_level_tool_use_names() {
         let store = SessionStore::new();
-        store.ingest(&ev(
-            "a",
-            "tool_use",
-            json!({ "name": "WebFetch" }),
-        ));
-        store.ingest(&ev(
-            "a",
-            "tool_use",
-            json!({ "name": "WebFetch" }),
-        ));
+        store.ingest(&ev("a", "tool_use", json!({ "name": "WebFetch" })));
+        store.ingest(&ev("a", "tool_use", json!({ "name": "WebFetch" })));
         let s = store.session("a").unwrap();
         assert_eq!(s.tool_counts.get("WebFetch"), Some(&2));
         assert_eq!(s.tool_use_count, 2);

@@ -58,7 +58,13 @@ impl SessionWatcher {
     /// is true, process them from byte 0 so historical events populate the
     /// store. Otherwise seed offsets to current EOF so only new lines stream.
     fn seed_existing(&self, states: &mut HashMap<PathBuf, FileState>) {
-        seed_dir(&self.watch_root, states, &self.store, &self.tx, self.options.backfill);
+        seed_dir(
+            &self.watch_root,
+            states,
+            &self.store,
+            &self.tx,
+            self.options.backfill,
+        );
     }
 
     /// Start the watcher on a blocking thread (notify requires a sync context).
@@ -210,8 +216,7 @@ pub fn process_file(
                 }
                 match serde_json::from_str::<serde_json::Value>(trimmed) {
                     Ok(val) => {
-                        let event =
-                            TraceEvent::from_raw(&session_fallback, state.line_count, val);
+                        let event = TraceEvent::from_raw(&session_fallback, state.line_count, val);
                         store.ingest(&event);
                         if let Err(e) = tx.send(event) {
                             debug!("No active subscribers (send error): {e}");
@@ -338,7 +343,7 @@ mod tests {
         let mut rx = tx.subscribe();
 
         writeln!(file, r#"{{"type":"user","content":"a"}}"#).unwrap();
-        writeln!(file, "").unwrap();
+        writeln!(file).unwrap();
         writeln!(file, r#"{{"type":"user","content":"b"}}"#).unwrap();
         file.flush().unwrap();
 
@@ -387,7 +392,9 @@ mod tests {
         }
 
         process_file(&path, &mut states, &tx, &store);
-        let ev = rx.try_recv().expect("should have emitted the new line after reset");
+        let ev = rx
+            .try_recv()
+            .expect("should have emitted the new line after reset");
         assert_eq!(ev.line_index, 0);
         assert!(rx.try_recv().is_err());
     }
@@ -402,8 +409,12 @@ mod tests {
         let mut rx = tx.subscribe();
 
         {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-            f.write_all(b"{\"type\":\"user\",\"content\":\"complete\"}\n").unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"{\"type\":\"user\",\"content\":\"complete\"}\n")
+                .unwrap();
             f.write_all(b"{\"type\":\"user\"").unwrap();
             f.flush().unwrap();
         }
@@ -414,7 +425,10 @@ mod tests {
         assert!(rx.try_recv().is_err());
 
         {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(b",\"content\":\"rest\"}\n").unwrap();
             f.flush().unwrap();
         }
@@ -429,7 +443,7 @@ mod tests {
     fn test_count_nonempty_lines() {
         let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
         writeln!(file, r#"{{"type":"user"}}"#).unwrap();
-        writeln!(file, "").unwrap();
+        writeln!(file).unwrap();
         writeln!(file, r#"{{"type":"assistant"}}"#).unwrap();
         file.flush().unwrap();
         assert_eq!(count_nonempty_lines(file.path()), 2);
