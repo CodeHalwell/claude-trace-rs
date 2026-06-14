@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 /// Stable identifiers reused across platforms.
+#[allow(dead_code)] // used on Linux/Windows only (and in path helpers)
 pub const SERVICE_NAME: &str = "claude-trace-rs";
 #[allow(dead_code)] // used on macOS only (and in tests)
 pub const LAUNCH_LABEL: &str = "rs.claude-trace.claude-trace-rs";
