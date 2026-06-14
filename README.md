@@ -74,6 +74,12 @@ sudo dpkg -i claude-trace-rs_*_amd64.deb
 
 Tagging a release (`git tag v0.3.0 && git push origin v0.3.0`) builds and publishes all of these automatically via the GitHub Actions release workflow.
 
+### From crates.io
+
+```bash
+cargo install claude-trace-rs
+```
+
 ### From source (any platform with Rust)
 
 ```bash
@@ -83,6 +89,39 @@ cargo install --path .
 ```
 
 Installs `claude-trace-rs` into `~/.cargo/bin` (make sure that's on `$PATH`).
+
+## Run it as a background app (no terminal required)
+
+Install it as a per-user background service that starts automatically when you
+log in and keeps running with no shell open — using each OS's native mechanism
+(systemd user unit on Linux, a LaunchAgent on macOS, a hidden Startup launcher
+on Windows). No admin rights needed.
+
+```bash
+claude-trace-rs service install            # start now + auto-start at login
+claude-trace-rs service install --port 8080 --open
+claude-trace-rs service status             # is it installed / running?
+claude-trace-rs service uninstall          # stop + remove
+```
+
+Then just open <http://127.0.0.1:7779> whenever you want it. On Linux, run
+`loginctl enable-linger $USER` once if you want it to keep running while you're
+logged out.
+
+## Docker
+
+A multi-arch image is published to the GitHub Container Registry:
+
+```bash
+docker run --rm --network host \
+  -v "$HOME/.claude/projects:/data/projects" \
+  -v claude-trace-data:/data \
+  ghcr.io/codehalwell/claude-trace-rs:latest
+```
+
+The server binds `127.0.0.1` by design, so `--network host` (Linux) is the
+simplest way to reach the dashboard from your browser. The image is also handy
+for the offline `export` / `list` subcommands in CI.
 
 ### Run without installing
 
@@ -153,9 +192,10 @@ claude-trace-rs list | jq '.[] | {id, cwd, event_count, cost_usd}'
 Usage: claude-trace-rs [OPTIONS] [COMMAND]
 
 Commands:
-  serve   Run the live dashboard server (default)
-  export  Export one or more sessions to disk in a training-friendly format
-  list    Print every session discovered on disk as JSON
+  serve    Run the live dashboard server (default)
+  export   Export one or more sessions to disk in a training-friendly format
+  list     Print every session discovered on disk as JSON
+  service  Install/manage a background service (install | uninstall | status)
 
 Global options:
   -w, --watch-root <DIR>   Where to read JSONL session files from
