@@ -11,6 +11,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to release (for example: v0.3.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -46,6 +51,8 @@ jobs:
             archive: zip
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -54,6 +61,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+
+      - name: Resolve release version
+        shell: bash
+        run: |
+          TAG="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
+          if [ -z "$TAG" ]; then
+            echo "::error::A release tag is required"
+            exit 1
+          fi
+          case "$TAG" in
+            v*) ;;
+            *)
+              echo "::error::Release tag must start with 'v' (got: $TAG)"
+              exit 1
+              ;;
+          esac
+          VERSION="${TAG#v}"
+          CRATE="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$VERSION" != "$CRATE" ]; then
+            echo "::error::Tag $TAG does not match Cargo.toml version $CRATE"
+            exit 1
+          fi
+          echo "RELEASE_VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Install cross linker (aarch64 linux)
         if: matrix.cross
@@ -69,8 +100,7 @@ jobs:
         if: matrix.os != 'windows-latest'
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          NAME="${BIN}-${VERSION}-${{ matrix.target }}"
+          NAME="${BIN}-${RELEASE_VERSION}-${{ matrix.target }}"
           mkdir -p "dist/$NAME"
           cp "target/${{ matrix.target }}/release/${BIN}" "dist/$NAME/"
           cp README.md LICENSE "dist/$NAME/" 2>/dev/null || true
@@ -81,8 +111,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME -replace '^v',''
-          $name = "$env:BIN-$version-${{ matrix.target }}"
+          $name = "$env:BIN-$env:RELEASE_VERSION-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/$env:BIN.exe" "dist/$name/"
           Copy-Item README.md,LICENSE "dist/$name/" -ErrorAction SilentlyContinue
@@ -120,6 +149,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
           files: release/*
           generate_release_notes: true
           fail_on_unmatched_files: false
