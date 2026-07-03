@@ -81,7 +81,7 @@ jobs:
           CRATE="$(cargo metadata --no-deps --format-version 1 \
             | python3 -c 'import sys,json;print(json.load(sys.stdin)["packages"][0]["version"])')"
           if [ "$VERSION" != "$CRATE" ]; then
-            echo "::error::Tag $TAG does not match Cargo.toml version $CRATE"
+            echo "::error::Tag version $VERSION does not match Cargo.toml version $CRATE"
             exit 1
           fi
           echo "RELEASE_VERSION=$VERSION" >> "$GITHUB_ENV"
