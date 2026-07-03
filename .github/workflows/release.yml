@@ -1,21 +1,21 @@
 name: Release
 
-# Tag a release to build installable artifacts for Windows, macOS and Linux:
+# Fully autonomous tag + build + release workflow.
 #
-#   git tag v0.3.0 && git push origin v0.3.0
+# Trigger options:
+#   1. Push a tag:        git tag v0.3.0 && git push origin v0.3.0
+#   2. Manual dispatch:   run from Actions UI (reads version from Cargo.toml on main)
 #
-# Produces per-platform archives, a Linux .deb, and SHA-256 checksums, and
-# attaches them all to a GitHub Release.
+# When triggered via workflow_dispatch the workflow will:
+#   - Read the version from Cargo.toml
+#   - Create and push the git tag if it doesn't already exist
+#   - Build cross-platform binaries
+#   - Publish a GitHub Release with all artifacts
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing version tag to release (for example: v0.3.0)"
-        required: true
-        type: string
 
 permissions:
   contents: write
@@ -30,22 +30,42 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
-      checkout_ref: ${{ steps.resolve.outputs.checkout_ref }}
+      version: ${{ steps.resolve.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - id: resolve
         shell: bash
         run: |
-          RAW_TAG="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
-          if [ -z "$RAW_TAG" ]; then
-            echo "::error::A release tag is required"
-            exit 1
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Read version directly from Cargo.toml
+            VERSION="$(cargo metadata --no-deps --format-version 1 \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["packages"][0]["version"])')"
+            TAG="v${VERSION}"
+          else
+            # Triggered by tag push — use the pushed tag
+            TAG="${{ github.ref_name }}"
+            VERSION="${TAG#v}"
           fi
-          case "$RAW_TAG" in
-            v*) TAG="$RAW_TAG" ;;
-            *) TAG="v$RAW_TAG" ;;
-          esac
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "checkout_ref=refs/tags/$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved: tag=$TAG version=$VERSION"
+
+      - name: Create tag if missing
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          TAG="${{ steps.resolve.outputs.tag }}"
+          if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists — skipping creation"
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "Created and pushed tag $TAG"
+          fi
 
   build:
     name: Build ${{ matrix.target }}
@@ -75,7 +95,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && needs.resolve-tag.outputs.checkout_ref || github.ref }}
+          ref: ${{ needs.resolve-tag.outputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -85,18 +105,10 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Resolve release version
+      - name: Verify tag version matches Cargo.toml
         shell: bash
         run: |
-          TAG="${{ needs.resolve-tag.outputs.tag }}"
-          case "$TAG" in
-            v*) ;;
-            *)
-              echo "::error::Release tag must start with 'v' (got: $TAG)"
-              exit 1
-              ;;
-          esac
-          VERSION="${TAG#v}"
+          VERSION="${{ needs.resolve-tag.outputs.version }}"
           CRATE="$(cargo metadata --no-deps --format-version 1 \
             | python3 -c 'import sys,json;print(json.load(sys.stdin)["packages"][0]["version"])')"
           if [ "$VERSION" != "$CRATE" ]; then
