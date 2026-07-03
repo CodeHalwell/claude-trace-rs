@@ -25,8 +25,31 @@ env:
   BIN: claude-trace-rs
 
 jobs:
+  resolve-tag:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      checkout_ref: ${{ steps.resolve.outputs.checkout_ref }}
+    steps:
+      - id: resolve
+        shell: bash
+        run: |
+          RAW_TAG="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
+          if [ -z "$RAW_TAG" ]; then
+            echo "::error::A release tag is required"
+            exit 1
+          fi
+          case "$RAW_TAG" in
+            v*) TAG="$RAW_TAG" ;;
+            *) TAG="v$RAW_TAG" ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=refs/tags/$TAG" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: resolve-tag
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -52,7 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && needs.resolve-tag.outputs.checkout_ref || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -65,11 +88,7 @@ jobs:
       - name: Resolve release version
         shell: bash
         run: |
-          TAG="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
-          if [ -z "$TAG" ]; then
-            echo "::error::A release tag is required"
-            exit 1
-          fi
+          TAG="${{ needs.resolve-tag.outputs.tag }}"
           case "$TAG" in
             v*) ;;
             *)
@@ -135,7 +154,9 @@ jobs:
 
   release:
     name: Publish release
-    needs: build
+    needs:
+      - resolve-tag
+      - build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -149,7 +170,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ needs.resolve-tag.outputs.tag }}
           files: release/*
           generate_release_notes: true
           fail_on_unmatched_files: false
