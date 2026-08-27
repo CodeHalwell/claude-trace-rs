@@ -13,7 +13,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Claude Trace</title>
+<title>Agent Trace</title>
 <style>
   :root[data-theme="dark"]{
     --bg:#0b0e14; --surface:#11151c; --surface-2:#161b24; --surface-3:#1d2430;
@@ -121,6 +121,18 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   .session .pill{padding:1px 6px;border-radius:6px;background:var(--surface-3);color:var(--muted);font-size:10.5px}
   .session .meta-right{margin-left:auto;display:flex;align-items:center;gap:6px}
   .empty{padding:30px 16px;text-align:center;color:var(--dim);font-size:12.5px}
+  /* ---------- Agent source badges ---------- */
+  .src{display:inline-flex;align-items:center;gap:4px;padding:1px 7px;border-radius:10px;
+    font-size:10px;font-weight:700;letter-spacing:.2px;border:1px solid transparent;white-space:nowrap}
+  .src::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+  .src-claude-code{background:var(--accent-soft);color:var(--accent)}
+  .src-codex{background:var(--green-soft);color:var(--green)}
+  .src-copilot{background:var(--surface-3);color:var(--purple)}
+  .src-kimi{background:var(--amber-soft);color:var(--amber)}
+  .src-cline{background:var(--surface-3);color:var(--pink)}
+  .src-cursor{background:var(--surface-3);color:var(--cyan)}
+  .src-unknown{background:var(--surface-3);color:var(--dim)}
+  .src-chips{display:flex;flex-wrap:wrap;gap:5px}
 
   /* ---------- Main ---------- */
   .main{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg)}
@@ -248,7 +260,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <div class="app">
   <!-- Top bar -->
   <div class="topbar">
-    <div class="brand"><span class="logo">◆</span><span>Claude&nbsp;Trace</span></div>
+    <div class="brand"><span class="logo">◆</span><span>Agent&nbsp;Trace</span></div>
     <button class="icon-btn" id="sidebarToggle" title="Toggle sidebar (Ctrl/⌘B)">☰</button>
     <div class="search">
       <span class="icon">⌕</span>
@@ -276,6 +288,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           </select>
           <label class="toggle"><input type="checkbox" id="bmOnly">★ only</label>
         </div>
+        <div class="src-chips" id="srcChips"></div>
       </div>
       <div class="list" id="sessionList"><div class="empty">Loading sessions…</div></div>
     </aside>
@@ -404,7 +417,12 @@ const state = {
   paused: false,
   connected: false,
   conv: {events:[], total:0, offset:0, loading:false},
+  sources: [],             // [{source, sessions, events, cost_usd}]
+  sourceFilter: '',        // '' = all sources
 };
+const SOURCE_LABELS = {'claude-code':'Claude','codex':'Codex','copilot':'Copilot','kimi':'Kimi','cline':'Cline','cursor':'Cursor','unknown':'Unknown'};
+function srcLabel(s){ return SOURCE_LABELS[s] || (s?s.charAt(0).toUpperCase()+s.slice(1):'Unknown'); }
+function srcBadge(s){ const k=escHtml(s||'unknown'); return `<span class="src src-${k}">${escHtml(srcLabel(s))}</span>`; }
 const FEED_CAP = 600;
 
 // ---------- Helpers ----------
@@ -466,15 +484,38 @@ async function loadSessions(){
   const q=$('#sessSearch').value.trim(); if(q) params.set('search', q);
   params.set('sort', $('#sortSel').value);
   if($('#bmOnly').checked) params.set('bookmarked','true');
+  if(state.sourceFilter) params.set('source', state.sourceFilter);
   try{
     const d=await api('/api/db/sessions?'+params.toString());
     state.sessions=d.sessions||[];
     renderSessions();
   }catch(e){ /* keep prior */ }
 }
+async function loadSources(){
+  try{
+    const d=await api('/api/db/sources');
+    state.sources=(d.sources||[]).filter(x=>x.sessions>0);
+    renderSourceChips();
+  }catch(e){}
+}
+function renderSourceChips(){
+  const wrap=$('#srcChips');
+  if(state.sources.length<2){ wrap.innerHTML=''; return; }
+  const all=state.sources.reduce((a,x)=>a+x.sessions,0);
+  let html=`<button class="btn" data-src="" style="padding:3px 9px;font-size:11px;${state.sourceFilter===''?'border-color:var(--accent);color:var(--accent)':''}">All · ${all}</button>`;
+  for(const s of state.sources){
+    const sel=state.sourceFilter===s.source;
+    html+=`<button class="btn" data-src="${escHtml(s.source)}" style="padding:3px 9px;font-size:11px;${sel?'border-color:var(--accent);color:var(--accent)':''}">${escHtml(srcLabel(s.source))} · ${s.sessions}</button>`;
+  }
+  wrap.innerHTML=html;
+  $$('button',wrap).forEach(b=> b.addEventListener('click', ()=>{
+    state.sourceFilter = state.sourceFilter===b.dataset.src ? '' : b.dataset.src;
+    renderSourceChips(); loadSessions();
+  }));
+}
 function renderSessions(){
   const list=$('#sessionList');
-  if(!state.sessions.length){ list.innerHTML='<div class="empty">No sessions yet.<br>Start a Claude Code session and it will appear here.</div>'; return; }
+  if(!state.sessions.length){ list.innerHTML='<div class="empty">No sessions yet.<br>Start a coding-agent session and it will appear here.</div>'; return; }
   // Group by project.
   const groups=new Map();
   for(const s of state.sessions){ const p=s.cwd||''; if(!groups.has(p)) groups.set(p,[]); groups.get(p).push(s); }
@@ -491,6 +532,7 @@ function renderSessions(){
           <span class="star ${s.bookmarked?'on':''}" data-star="${escHtml(s.id)}">${s.bookmarked?'★':'☆'}</span>
         </div>
         <div class="line2">
+          ${srcBadge(s.source)}
           ${s.git_branch?`<span class="pill">⎇ ${escHtml(s.git_branch)}</span>`:''}
           <span>${fmtNum(s.event_count)} ev</span>
           <span class="meta-right">${fmtCost(s.cost_usd)} · ${relTime(s.last_seen)}</span>
@@ -537,6 +579,7 @@ function renderHead(){
       <button class="btn" id="exportThis">⤓ Export</button>
     </div>
     <div class="sub">
+      ${srcBadge(s.source)}
       <span class="mono">${escHtml(s.id)}</span>
       ${s.cwd?`<span>📁 ${escHtml(s.cwd)}</span>`:''}
       ${s.git_branch?`<span>⎇ ${escHtml(s.git_branch)}</span>`:''}
@@ -581,7 +624,7 @@ function eventRow(ev){
   return `<div class="event" data-key="${escHtml(ev.session_id+':'+ev.line_index)}">
     <span class="time">${timeOf(ev)}</span>
     <span class="badge-type t-${escHtml(ev.event_type)}">${escHtml(ev.event_type)}</span>
-    <span class="summary">${escHtml(ev.summary||'')}</span>
+    <span class="summary">${srcBadge(ev.source)} ${escHtml(ev.summary||'')}</span>
     <span class="nums">${nums}</span>
   </div>`;
 }
@@ -643,14 +686,37 @@ function renderContent(content){
 }
 function convMessage(ev, lat){
   const e=ev.entry||{};
-  const content = e.message?.content ?? e.content ?? '';
-  const body=renderContent(content);
+  let content = e.message?.content ?? e.content ?? '';
+  let body=renderContent(content);
+  // Non-Claude shapes: derive a body from the record itself.
+  if(!body){
+    // Codex response_item message: payload.content [{type:*_text, text}]
+    if(e.payload?.type==='message' && Array.isArray(e.payload.content)){
+      body=renderContent(e.payload.content.map(b=>({type:'text',text:b.text||''})));
+    }
+    // Codex function_call → tool card
+    else if(e.payload?.type==='function_call'){
+      body=`<div class="toolcard"><div class="h">🔧 ${escHtml(e.payload.name||'tool')}</div><pre>${escHtml(e.payload.arguments||'')}</pre></div>`;
+    }
+    // Codex function_call_output → tool result card
+    else if(e.payload?.type==='function_call_output'){
+      body=`<div class="toolcard"><div class="h">📦 Tool result</div><pre>${escHtml(typeof e.payload.output==='string'?e.payload.output:JSON.stringify(e.payload.output,null,2))}</pre></div>`;
+    }
+    // Cline ui_messages: say/ask with text
+    else if((e.say||e.ask) && e.text){
+      body=`<pre>${escHtml(e.text)}</pre>`;
+    }
+    // Cline api history plain text content
+    else if(typeof e.content==='string'){
+      body=`<pre>${escHtml(e.content)}</pre>`;
+    }
+  }
   if(!body) return '';
   const role=ev.event_type;
   const roleColor = role==='user'?'var(--accent)':role==='assistant'?'var(--green)':'var(--muted)';
   const latTxt = lat ? `<span class="lat">⚡ ${(lat/1000).toFixed(1)}s</span>` : '';
   return `<div class="msg ${role}">
-    <div class="who"><span class="role" style="background:var(--surface-3);color:${roleColor}">${escHtml(role)}</span>
+    <div class="who"><span class="role" style="background:var(--surface-3);color:${roleColor}">${escHtml(role)}</span>${srcBadge(ev.source)}
       <span style="color:var(--dim);font-weight:400">${timeOf(ev)}</span>${latTxt}</div>
     <div class="bubble">${body}</div>
   </div>`;
@@ -702,6 +768,8 @@ function renderAnalytics(d){
     <div class="grid2">
       <div class="block"><h3>Top tools</h3>${barList(d.top_tools||[],'count')}</div>
       <div class="block"><h3>Cost by model</h3>${barList((d.cost_by_model||[]),'cost_usd', x=>fmtCost(x.cost_usd))}</div>
+      <div class="block"><h3>Cost by agent</h3>${barList((d.cost_by_source||[]).map(x=>({name:srcLabel(x.source),cost_usd:x.cost_usd})),'cost_usd', x=>fmtCost(x.cost_usd))}</div>
+      <div class="block"><h3>Events by agent</h3>${barList((d.by_source||[]).map(x=>({name:srcLabel(x.key),count:x.count})),'count')}</div>
       <div class="block"><h3>Events by type</h3>${barList((d.by_type||[]).map(x=>({name:x.key,count:x.count})),'count')}</div>
       <div class="block"><h3>Events by model</h3>${barList((d.by_model||[]).map(x=>({name:x.key,count:x.count})),'count')}</div>
     </div>`;
@@ -819,8 +887,10 @@ function init(){
   document.addEventListener('keydown', onKey);
 
   connect();
+  loadSources();
   loadSessions();
   setInterval(loadSessions, 5000);
+  setInterval(loadSources, 10000);
 }
 function toggleTheme(){ const cur=document.documentElement.dataset.theme==='light'?'dark':'light'; document.documentElement.dataset.theme=cur; localStorage.setItem('ct_theme',cur); }
 function togglePause(){ state.paused=!state.paused; $('#pauseBtn').textContent=state.paused?'▶ Resume':'⏸ Pause'; if(!state.paused) renderFeed(); }

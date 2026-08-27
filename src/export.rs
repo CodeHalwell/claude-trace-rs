@@ -127,6 +127,7 @@ fn render_messages_line(sess: &SessionExport<'_>) -> String {
 
     let record = json!({
         "session_id": sess.stats.id,
+        "source": sess.stats.source,
         "model": sess.stats.model,
         "cwd": sess.stats.cwd,
         "git_branch": sess.stats.git_branch,
@@ -155,6 +156,7 @@ fn render_openai_line(sess: &SessionExport<'_>) -> String {
 
     let record = json!({
         "session_id": sess.stats.id,
+        "source": sess.stats.source,
         "model": sess.stats.model,
         "messages": messages,
         "metadata": metadata_object(sess.stats),
@@ -293,6 +295,7 @@ fn render_sharegpt_line(sess: &SessionExport<'_>) -> String {
     }
     let record = json!({
         "id": sess.stats.id,
+        "source": sess.stats.source,
         "title": sess.stats.title,
         "model": sess.stats.model,
         "conversations": conversations,
@@ -308,7 +311,20 @@ fn render_sharegpt_line(sess: &SessionExport<'_>) -> String {
 fn render_raw_jsonl(sess: &SessionExport<'_>) -> String {
     let mut out = String::with_capacity(sess.events.len() * 256);
     for ev in sess.events {
-        if let Ok(s) = serde_json::to_string(&ev.entry) {
+        // Attach the source so mixed-agent datasets stay attributable even
+        // when the raw record itself has no agent-identifying field. Prefer
+        // the session's attributed source; fall back to the event's own.
+        let mut entry = ev.entry.clone();
+        let src = if ev.source.is_empty() || ev.source == "unknown" {
+            sess.stats.source.as_str()
+        } else {
+            ev.source.as_str()
+        };
+        if let Some(obj) = entry.as_object_mut() {
+            obj.entry("source".to_owned())
+                .or_insert_with(|| Value::String(src.to_owned()));
+        }
+        if let Ok(s) = serde_json::to_string(&entry) {
             out.push_str(&s);
             out.push('\n');
         }
@@ -496,6 +512,7 @@ fn extract_tool_results_text(entry: &Value) -> Option<String> {
 
 fn metadata_object(s: &SessionStats) -> Value {
     json!({
+        "source": s.source,
         "input_tokens": s.input_tokens,
         "output_tokens": s.output_tokens,
         "cache_read_tokens": s.cache_read_tokens,
@@ -751,6 +768,39 @@ mod tests {
         );
         assert!(out.contains("\"sessionId\":\"sid\""));
         assert!(out.contains("\"type\":\"user\""));
+    }
+
+    #[test]
+    fn raw_jsonl_tags_source_for_mixed_agents() {
+        let s = stats();
+        let events = vec![ev("user", json!({ "content": "hi" }))];
+        let out = render_session(
+            &SessionExport {
+                stats: &s,
+                events: &events,
+            },
+            ExportFormat::Jsonl,
+        );
+        // The raw record gains a top-level "source" for attribution.
+        let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(line["source"], "claude-code");
+    }
+
+    #[test]
+    fn messages_record_carries_source() {
+        let mut s = stats();
+        s.source = "codex".to_owned();
+        let events = vec![ev("user", json!({ "content": "hi" }))];
+        let out = render_session(
+            &SessionExport {
+                stats: &s,
+                events: &events,
+            },
+            ExportFormat::Messages,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(parsed["source"], "codex");
+        assert_eq!(parsed["metadata"]["source"], "codex");
     }
 
     #[test]

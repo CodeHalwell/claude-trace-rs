@@ -785,4 +785,75 @@ mod tests {
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].id, "a");
     }
+
+    #[test]
+    fn source_column_defaults_to_claude_code_and_filters() {
+        // Simulate a pre-multi-agent database: a schema without `source`,
+        // then run the migration and confirm old rows read as claude-code.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (
+                session_id TEXT NOT NULL, line_index INTEGER NOT NULL,
+                event_type TEXT NOT NULL, observed_at TEXT NOT NULL,
+                timestamp TEXT, model TEXT, cost_usd REAL NOT NULL DEFAULT 0,
+                cost_estimated INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                summary TEXT NOT NULL DEFAULT '', search_text TEXT NOT NULL DEFAULT '',
+                tool_uses TEXT NOT NULL DEFAULT '[]', event_json TEXT NOT NULL,
+                PRIMARY KEY (session_id, line_index));
+             CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, cwd TEXT, git_branch TEXT, version TEXT,
+                model TEXT, title TEXT, first_seen TEXT, last_seen TEXT,
+                last_entry_timestamp TEXT, event_count INTEGER NOT NULL DEFAULT 0,
+                user_count INTEGER NOT NULL DEFAULT 0,
+                assistant_count INTEGER NOT NULL DEFAULT 0,
+                tool_use_count INTEGER NOT NULL DEFAULT 0,
+                tool_result_count INTEGER NOT NULL DEFAULT 0,
+                system_count INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0,
+                tool_counts TEXT NOT NULL DEFAULT '{}');
+             CREATE TABLE session_meta (
+                id TEXT PRIMARY KEY, bookmarked INTEGER NOT NULL DEFAULT 0,
+                tags TEXT NOT NULL DEFAULT '[]', notes TEXT NOT NULL DEFAULT '');
+             INSERT INTO sessions (id, event_count) VALUES ('old', 3);",
+        )
+        .unwrap();
+
+        let db = Db {
+            conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
+            path: PathBuf::from(":memory:"),
+        };
+        db.migrate().unwrap();
+
+        let sessions = db.load_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].source, "claude-code");
+
+        // New multi-source sessions upsert and filter correctly.
+        let mut s = SessionStats {
+            id: "cx".into(),
+            event_count: 1,
+            ..Default::default()
+        };
+        s.source = "codex".into();
+        db.upsert_session(&s).unwrap();
+        let codex_only = db
+            .query_sessions(&SessionFilter {
+                source: Some("codex".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(codex_only.len(), 1);
+        assert_eq!(codex_only[0].id, "cx");
+
+        let srcs = db.sources().unwrap();
+        assert_eq!(srcs.len(), 2);
+    }
 }

@@ -15,7 +15,7 @@ pub const PER_SESSION_RECENT_CAP: usize = 5_000;
 pub const GLOBAL_RECENT_CAP: usize = 20_000;
 
 /// Per-session aggregated stats and a bounded buffer of recent events.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStats {
     pub id: String,
     /// Which coding agent produced this session (kebab-case id).
@@ -66,12 +66,48 @@ fn default_session_source() -> String {
     crate::sources::AgentSource::ClaudeCode.as_str().to_owned()
 }
 
+impl Default for SessionStats {
+    fn default() -> Self {
+        // `source` defaults to claude-code (not empty) so in-memory and
+        // test-constructed sessions match the serde/DB default.
+        Self {
+            id: String::new(),
+            source: default_session_source(),
+            cwd: None,
+            git_branch: None,
+            version: None,
+            model: None,
+            first_seen: None,
+            last_seen: None,
+            last_entry_timestamp: None,
+            event_count: 0,
+            user_count: 0,
+            assistant_count: 0,
+            tool_use_count: 0,
+            tool_result_count: 0,
+            system_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cost_usd: 0.0,
+            tool_counts: HashMap::new(),
+            title: None,
+            bookmarked: false,
+            tags: Vec::new(),
+        }
+    }
+}
+
 impl SessionStats {
     fn ingest(&mut self, ev: &TraceEvent) {
         if self.id.is_empty() {
             self.id = ev.session_id.clone();
         }
-        if self.source.is_empty() {
+        // Adopt the event's source on the first event (a freshly defaulted
+        // stats block carries the claude-code default; replace it unless the
+        // event is itself unattributed).
+        if self.event_count == 0 && ev.source != "unknown" {
             self.source = ev.source.clone();
         }
         if self.first_seen.is_none() {

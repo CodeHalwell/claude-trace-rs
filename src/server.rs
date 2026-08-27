@@ -455,7 +455,8 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
     let banner = json!({
         "type": "connected",
         "watch_root": state.watch_root,
-        "message": "Streaming Claude Code traces in real time."
+        "watch_roots": state.watch_roots,
+        "message": "Streaming coding-agent traces in real time."
     });
     if socket
         .send(Message::Text(banner.to_string()))
