@@ -27,8 +27,8 @@ pub struct ServiceConfig {
     pub exe: PathBuf,
     /// Port the dashboard should listen on.
     pub port: u16,
-    /// Directory of Claude Code JSONL logs to watch.
-    pub watch_root: String,
+    /// Directories of agent trace logs to watch (one `--watch-root` each).
+    pub watch_roots: Vec<String>,
     /// Optional explicit database path.
     pub db: Option<String>,
     /// Open the browser when the service starts.
@@ -42,9 +42,11 @@ impl ServiceConfig {
             "serve".to_string(),
             "--port".to_string(),
             self.port.to_string(),
-            "--watch-root".to_string(),
-            self.watch_root.clone(),
         ];
+        for root in &self.watch_roots {
+            a.push("--watch-root".to_string());
+            a.push(root.clone());
+        }
         if let Some(db) = &self.db {
             a.push("--db".to_string());
             a.push(db.clone());
@@ -318,7 +320,7 @@ mod tests {
         ServiceConfig {
             exe: PathBuf::from("/usr/local/bin/claude-trace-rs"),
             port: 7779,
-            watch_root: "/home/me/.claude/projects".into(),
+            watch_roots: vec!["/home/me/.claude/projects".into()],
             db: Some("/data/trace.db".into()),
             open: false,
         }

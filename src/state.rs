@@ -18,6 +18,9 @@ pub const GLOBAL_RECENT_CAP: usize = 20_000;
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SessionStats {
     pub id: String,
+    /// Which coding agent produced this session (kebab-case id).
+    #[serde(default = "default_session_source")]
+    pub source: String,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
     pub version: Option<String>,
@@ -57,10 +60,19 @@ pub struct SessionStats {
     pub tags: Vec<String>,
 }
 
+/// Backward-compat default: sessions recorded before the multi-agent upgrade
+/// were all Claude Code sessions.
+fn default_session_source() -> String {
+    crate::sources::AgentSource::ClaudeCode.as_str().to_owned()
+}
+
 impl SessionStats {
     fn ingest(&mut self, ev: &TraceEvent) {
         if self.id.is_empty() {
             self.id = ev.session_id.clone();
+        }
+        if self.source.is_empty() {
+            self.source = ev.source.clone();
         }
         if self.first_seen.is_none() {
             self.first_seen = Some(ev.observed_at.clone());
@@ -91,10 +103,16 @@ impl SessionStats {
             "user" => self.user_count += 1,
             "assistant" => self.assistant_count += 1,
             "tool_use" => {
-                self.tool_use_count += 1;
-                // Top-level tool_use entries carry the name at the root.
-                if let Some(name) = ev.entry.get("name").and_then(|v| v.as_str()) {
-                    *self.tool_counts.entry(name.to_owned()).or_insert(0) += 1;
+                // Top-level tool_use entries whose adapter left `tool_uses`
+                // empty (Claude Code) carry the name at the record root.
+                // Adapters that already populated `tool_uses` (Codex, …) are
+                // counted by the loop below, so skip here to avoid double
+                // counting.
+                if ev.tool_uses.is_empty() {
+                    self.tool_use_count += 1;
+                    if let Some(name) = ev.entry.get("name").and_then(|v| v.as_str()) {
+                        *self.tool_counts.entry(name.to_owned()).or_insert(0) += 1;
+                    }
                 }
             }
             "tool_result" => self.tool_result_count += 1,

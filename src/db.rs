@@ -34,6 +34,8 @@ pub struct SessionFilter {
     pub search: Option<String>,
     /// Only sessions whose `cwd` equals this project path.
     pub project: Option<String>,
+    /// Only sessions from this agent source (kebab-case id).
+    pub source: Option<String>,
     /// Only sessions bookmarked by the user.
     pub bookmarked_only: bool,
     /// Sort key: `last_seen` (default), `first_seen`, `events`, `cost`.
@@ -109,6 +111,24 @@ impl Db {
     fn migrate(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().expect("db poisoned");
         conn.execute_batch(SCHEMA)?;
+        // Additive migrations for databases created before the multi-agent
+        // upgrade: a `source` column on both tables, defaulting to
+        // 'claude-code' so historical rows stay correctly attributed.
+        for ddl in [
+            "ALTER TABLE events ADD COLUMN source TEXT NOT NULL DEFAULT 'claude-code'",
+            "ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'claude-code'",
+        ] {
+            if let Err(e) = conn.execute_batch(ddl) {
+                // "duplicate column name" means the migration already ran.
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e.into());
+                }
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_events_source ON events(source);
+             CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);",
+        )?;
         Ok(())
     }
 
@@ -129,8 +149,8 @@ impl Db {
                (session_id, line_index, event_type, observed_at, timestamp, model,
                 cost_usd, cost_estimated, input_tokens, output_tokens,
                 cache_read_tokens, cache_creation_tokens, summary, search_text,
-                tool_uses, event_json)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                tool_uses, event_json, source)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 ev.session_id,
                 ev.line_index as i64,
@@ -148,6 +168,7 @@ impl Db {
                 ev.search_text().to_lowercase(),
                 tool_uses,
                 event_json,
+                ev.source,
             ],
         )?;
         Ok(changed > 0)
@@ -159,13 +180,14 @@ impl Db {
         let tool_counts = serde_json::to_string(&s.tool_counts)?;
         conn.execute(
             "INSERT INTO sessions
-               (id, cwd, git_branch, version, model, title, first_seen, last_seen,
+               (id, source, cwd, git_branch, version, model, title, first_seen, last_seen,
                 last_entry_timestamp, event_count, user_count, assistant_count,
                 tool_use_count, tool_result_count, system_count, input_tokens,
                 output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd,
                 tool_counts)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
              ON CONFLICT(id) DO UPDATE SET
+                source=excluded.source,
                 cwd=excluded.cwd, git_branch=excluded.git_branch,
                 version=excluded.version, model=excluded.model,
                 title=COALESCE(excluded.title, sessions.title),
@@ -182,6 +204,7 @@ impl Db {
                 cost_usd=excluded.cost_usd, tool_counts=excluded.tool_counts",
             params![
                 s.id,
+                s.source,
                 s.cwd,
                 s.git_branch,
                 s.version,
@@ -228,7 +251,8 @@ impl Db {
                     s.event_count, s.user_count, s.assistant_count, s.tool_use_count,
                     s.tool_result_count, s.system_count, s.input_tokens, s.output_tokens,
                     s.cache_read_tokens, s.cache_creation_tokens, s.cost_usd, s.tool_counts,
-                    COALESCE(m.bookmarked,0), COALESCE(m.tags,'[]'), COALESCE(m.notes,'')
+                    COALESCE(m.bookmarked,0), COALESCE(m.tags,'[]'), COALESCE(m.notes,''),
+                    s.source
              FROM sessions s LEFT JOIN session_meta m ON m.id = s.id WHERE 1=1",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -243,6 +267,11 @@ impl Db {
             let idx = args.len() + 1;
             sql.push_str(&format!(" AND s.cwd = ?{idx}"));
             args.push(Box::new(p.clone()));
+        }
+        if let Some(src) = &f.source {
+            let idx = args.len() + 1;
+            sql.push_str(&format!(" AND s.source = ?{idx}"));
+            args.push(Box::new(src.clone()));
         }
         if f.bookmarked_only {
             sql.push_str(" AND COALESCE(m.bookmarked,0) = 1");
@@ -260,6 +289,25 @@ impl Db {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Per-agent-source rollup: session count, event count, total cost.
+    pub fn sources(&self) -> anyhow::Result<Vec<Value>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT s.source, COUNT(*) AS n_sessions,
+                    COALESCE(SUM(s.event_count),0), COALESCE(SUM(s.cost_usd),0.0)
+             FROM sessions s GROUP BY s.source ORDER BY n_sessions DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(json!({
+                "source": r.get::<_, String>(0)?,
+                "sessions": r.get::<_, i64>(1)?,
+                "events": r.get::<_, i64>(2)?,
+                "cost_usd": r.get::<_, f64>(3)?,
+            }))
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
     /// Distinct project directories, most-recently-active first, with counts.
@@ -328,19 +376,45 @@ impl Db {
         })
     }
 
-    /// Global full-text-ish search across all events.
-    pub fn search_events(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Value>> {
+    /// Global full-text-ish search across all events, optionally restricted
+    /// to one agent source.
+    pub fn search_events(
+        &self,
+        query: &str,
+        limit: usize,
+        source: Option<&str>,
+    ) -> anyhow::Result<Vec<Value>> {
         let conn = self.conn.lock().expect("db poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT event_json FROM events WHERE search_text LIKE ?1
-             ORDER BY observed_at DESC LIMIT ?2",
-        )?;
         let pattern = format!("%{}%", query.to_lowercase());
-        let rows = stmt.query_map(params![pattern, limit as i64], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
-        for r in rows {
-            if let Ok(v) = serde_json::from_str::<Value>(&r?) {
-                out.push(v);
+        match source.filter(|s| !s.is_empty()) {
+            Some(src) => {
+                let mut stmt = conn.prepare(
+                    "SELECT event_json FROM events WHERE search_text LIKE ?1 AND source = ?2
+                     ORDER BY observed_at DESC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![pattern, src, limit as i64], |r| {
+                    r.get::<_, String>(0)
+                })?;
+                for r in rows {
+                    if let Ok(v) = serde_json::from_str::<Value>(&r?) {
+                        out.push(v);
+                    }
+                }
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT event_json FROM events WHERE search_text LIKE ?1
+                     ORDER BY observed_at DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![pattern, limit as i64], |r| {
+                    r.get::<_, String>(0)
+                })?;
+                for r in rows {
+                    if let Ok(v) = serde_json::from_str::<Value>(&r?) {
+                        out.push(v);
+                    }
+                }
             }
         }
         Ok(out)
@@ -371,6 +445,19 @@ impl Db {
         )?;
         let by_model = map_rows(&conn,
             "SELECT COALESCE(model,'(none)'), COUNT(*) FROM events WHERE model IS NOT NULL GROUP BY model ORDER BY 2 DESC")?;
+        let by_source = map_rows(
+            &conn,
+            "SELECT source, COUNT(*) FROM events GROUP BY source ORDER BY 2 DESC",
+        )?;
+        let cost_by_source = {
+            let mut stmt = conn.prepare(
+                "SELECT source, SUM(cost_usd) FROM events GROUP BY source ORDER BY 2 DESC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(json!({ "source": r.get::<_,String>(0)?, "cost_usd": r.get::<_,f64>(1)? }))
+            })?;
+            rows.filter_map(Result::ok).collect::<Vec<_>>()
+        };
         let cost_by_model = {
             let mut stmt = conn.prepare(
                 "SELECT COALESCE(model,'(none)'), SUM(cost_usd) FROM events
@@ -435,7 +522,9 @@ impl Db {
             "cost_usd": cost,
             "by_type": by_type,
             "by_model": by_model,
+            "by_source": by_source,
             "cost_by_model": cost_by_model,
+            "cost_by_source": cost_by_source,
             "top_tools": tools,
             "timeline": timeline,
         }))
@@ -516,6 +605,7 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionStats> {
         tool_counts: serde_json::from_str(&tool_counts).unwrap_or_default(),
         bookmarked: r.get::<_, i64>(21)? != 0,
         tags: serde_json::from_str(&tags).unwrap_or_default(),
+        source: r.get(24)?,
     })
 }
 
@@ -549,6 +639,7 @@ CREATE TABLE IF NOT EXISTS events (
     search_text           TEXT    NOT NULL DEFAULT '',
     tool_uses             TEXT    NOT NULL DEFAULT '[]',
     event_json            TEXT    NOT NULL,
+    source                TEXT    NOT NULL DEFAULT 'claude-code',
     PRIMARY KEY (session_id, line_index)
 );
 CREATE INDEX IF NOT EXISTS idx_events_session  ON events(session_id);
@@ -576,7 +667,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
     cost_usd              REAL    NOT NULL DEFAULT 0,
-    tool_counts           TEXT    NOT NULL DEFAULT '{}'
+    tool_counts           TEXT    NOT NULL DEFAULT '{}',
+    source                TEXT    NOT NULL DEFAULT 'claude-code'
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen);
 CREATE INDEX IF NOT EXISTS idx_sessions_cwd       ON sessions(cwd);
@@ -638,7 +730,7 @@ mod tests {
             json!({ "message": { "content": [{ "type": "text", "text": "refactor the parser" }] } }),
         ))
         .unwrap();
-        let hits = db.search_events("refactor", 10).unwrap();
+        let hits = db.search_events("refactor", 10, None).unwrap();
         assert_eq!(hits.len(), 1);
     }
 

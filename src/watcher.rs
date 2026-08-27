@@ -8,7 +8,11 @@ use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watche
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
-use crate::{event::TraceEvent, state::SessionStore};
+use crate::{
+    event::TraceEvent,
+    sources::{self, AgentSource, WatchRoot},
+    state::SessionStore,
+};
 
 /// Per-file reading state: tracks the last consumed byte offset and total
 /// lines seen so far for stable line indexing.
@@ -18,6 +22,11 @@ pub struct FileState {
     pub offset: u64,
     /// Total number of non-empty lines consumed so far.
     pub line_count: usize,
+    /// Source detected for this file (set on first parse).
+    pub source: Option<AgentSource>,
+    /// For whole-file JSON array sources (Cline), the byte length we last
+    /// ingested so we only re-parse when the file actually grew.
+    pub last_len: u64,
 }
 
 /// Configuration for the watcher's startup behaviour.
@@ -29,53 +38,80 @@ pub struct WatcherOptions {
     pub backfill: bool,
 }
 
-/// Watches a root directory for `.jsonl` file activity, tails newly appended
-/// lines, broadcasts `TraceEvent` values onto a shared channel, and updates
-/// an in-memory session store for late-joining clients.
+/// Watches one or more root directories for trace-file activity, tails newly
+/// appended lines, broadcasts `TraceEvent` values onto a shared channel, and
+/// updates an in-memory session store for late-joining clients.
 pub struct SessionWatcher {
-    watch_root: PathBuf,
+    roots: Vec<WatchRoot>,
     tx: broadcast::Sender<TraceEvent>,
     store: SessionStore,
     options: WatcherOptions,
 }
 
 impl SessionWatcher {
+    /// Watch a single root with content/path-based source detection
+    /// (backwards-compatible constructor).
+    #[allow(dead_code)] // compat shim; production path uses SessionWatcher::multi
     pub fn new(
         watch_root: PathBuf,
         tx: broadcast::Sender<TraceEvent>,
         store: SessionStore,
         options: WatcherOptions,
     ) -> Self {
+        Self::multi(
+            vec![WatchRoot {
+                path: watch_root,
+                source: None,
+            }],
+            tx,
+            store,
+            options,
+        )
+    }
+
+    /// Watch several roots; each root may pin a forced agent source.
+    pub fn multi(
+        roots: Vec<WatchRoot>,
+        tx: broadcast::Sender<TraceEvent>,
+        store: SessionStore,
+        options: WatcherOptions,
+    ) -> Self {
         Self {
-            watch_root,
+            roots,
             tx,
             store,
             options,
         }
     }
 
-    /// Walk every existing `.jsonl` file in the watch root. When `backfill`
+    /// Walk every existing trace file in every watch root. When `backfill`
     /// is true, process them from byte 0 so historical events populate the
     /// store. Otherwise seed offsets to current EOF so only new lines stream.
     fn seed_existing(&self, states: &mut HashMap<PathBuf, FileState>) {
-        seed_dir(
-            &self.watch_root,
-            states,
-            &self.store,
-            &self.tx,
-            self.options.backfill,
-        );
+        for root in &self.roots {
+            seed_dir(
+                &root.path,
+                root.source,
+                states,
+                &self.store,
+                &self.tx,
+                self.options.backfill,
+            );
+        }
     }
 
     /// Start the watcher on a blocking thread (notify requires a sync context).
     pub fn run(self) -> anyhow::Result<()> {
         let mut states: HashMap<PathBuf, FileState> = HashMap::new();
 
-        info!(
-            "Seeding existing JSONL files in {} (backfill={})",
-            self.watch_root.display(),
-            self.options.backfill
-        );
+        for root in &self.roots {
+            info!(
+                "Seeding trace files in {} (source={}, backfill={})",
+                root.path.display(),
+                root.source.map(|s| s.as_str()).unwrap_or("auto-detect"),
+                self.options.backfill
+            );
+        }
         self.seed_existing(&mut states);
         info!(
             "Seeded {} file(s); store currently holds {} event(s)",
@@ -85,8 +121,12 @@ impl SessionWatcher {
 
         let (fs_tx, fs_rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
         let mut watcher = RecommendedWatcher::new(fs_tx, Config::default())?;
-        watcher.watch(&self.watch_root, RecursiveMode::Recursive)?;
-        info!("Watching {} for changes", self.watch_root.display());
+        for root in &self.roots {
+            if root.path.is_dir() {
+                watcher.watch(&root.path, RecursiveMode::Recursive)?;
+                info!("Watching {} for changes", root.path.display());
+            }
+        }
 
         for res in fs_rx {
             match res {
@@ -102,9 +142,15 @@ impl SessionWatcher {
             return;
         }
         for path in event.paths {
-            if is_jsonl(&path) {
+            // Which root does this path belong to?
+            let root_src = self
+                .roots
+                .iter()
+                .find(|r| path.starts_with(&r.path))
+                .and_then(|r| r.source);
+            if sources::matches_file(root_src, &path) {
                 debug!("Processing event for {}", path.display());
-                process_file(&path, states, &self.tx, &self.store);
+                process_file(&path, root_src, states, &self.tx, &self.store);
             }
         }
     }
@@ -112,6 +158,7 @@ impl SessionWatcher {
 
 fn seed_dir(
     dir: &Path,
+    root_source: Option<AgentSource>,
     states: &mut HashMap<PathBuf, FileState>,
     store: &SessionStore,
     tx: &broadcast::Sender<TraceEvent>,
@@ -122,12 +169,12 @@ fn seed_dir(
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    seed_dir(&path, states, store, tx, backfill);
-                } else if is_jsonl(&path) {
+                    seed_dir(&path, root_source, states, store, tx, backfill);
+                } else if sources::matches_file(root_source, &path) {
                     if backfill {
                         // Process from the start of the file.
                         states.insert(path.clone(), FileState::default());
-                        process_file(&path, states, tx, store);
+                        process_file(&path, root_source, states, tx, store);
                     } else if let Ok(meta) = std::fs::metadata(&path) {
                         // Skip to EOF without emitting events; just count lines
                         // so future events get correct line indices.
@@ -137,6 +184,8 @@ fn seed_dir(
                             FileState {
                                 offset: meta.len(),
                                 line_count,
+                                source: root_source,
+                                last_len: meta.len(),
                             },
                         );
                     }
@@ -151,10 +200,17 @@ fn seed_dir(
 /// each non-empty line as JSON, and broadcast a `TraceEvent` for each one.
 pub fn process_file(
     path: &Path,
+    root_source: Option<AgentSource>,
     states: &mut HashMap<PathBuf, FileState>,
     tx: &broadcast::Sender<TraceEvent>,
     store: &SessionStore,
 ) {
+    // Whole-file JSON array sources (Cline) are re-parsed on each change.
+    if root_source == Some(AgentSource::Cline) && crate::sources::cline::is_whole_file(path) {
+        process_whole_file(path, root_source, states, tx, store);
+        return;
+    }
+
     let session_fallback = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -216,7 +272,20 @@ pub fn process_file(
                 }
                 match serde_json::from_str::<serde_json::Value>(trimmed) {
                     Ok(val) => {
-                        let event = TraceEvent::from_raw(&session_fallback, state.line_count, val);
+                        let source = match state.source {
+                            Some(s) => s,
+                            None => {
+                                let s = sources::detect(root_source, path, Some(&val));
+                                state.source = Some(s);
+                                s
+                            }
+                        };
+                        let event = TraceEvent::from_raw_as(
+                            &session_fallback,
+                            state.line_count,
+                            val,
+                            source,
+                        );
                         store.ingest(&event);
                         if let Err(e) = tx.send(event) {
                             debug!("No active subscribers (send error): {e}");
@@ -243,11 +312,60 @@ pub fn process_file(
     }
 }
 
-fn is_jsonl(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+/// Re-ingest a whole-file JSON array (Cline). Each array element becomes an
+/// event whose `line_index` is its position in the array, so re-parsing after
+/// the file grows is idempotent at the DB layer (`INSERT OR IGNORE`).
+fn process_whole_file(
+    path: &Path,
+    root_source: Option<AgentSource>,
+    states: &mut HashMap<PathBuf, FileState>,
+    tx: &broadcast::Sender<TraceEvent>,
+    store: &SessionStore,
+) {
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let state = states.entry(path.to_owned()).or_default();
+    if len == state.last_len {
+        return; // unchanged
+    }
+    state.last_len = len;
+
+    let body = match std::fs::read_to_string(path) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("Could not read {}: {e}", path.display());
+            return;
+        }
+    };
+    let arr: Vec<serde_json::Value> = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            // File may be mid-write; try again on the next event.
+            debug!("Whole-file parse not ready for {}: {e}", path.display());
+            return;
+        }
+    };
+
+    // Session id: the task directory name (`tasks/<taskId>/<file>`).
+    let session_fallback = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_owned();
+
+    let source = root_source.unwrap_or(AgentSource::Cline);
+    state.source = Some(source);
+    state.line_count = state.line_count.max(arr.len());
+
+    for (idx, val) in arr.into_iter().enumerate() {
+        let event = TraceEvent::from_raw_as(&session_fallback, idx, val, source);
+        store.ingest(&event);
+        if tx.send(event).is_err() {
+            // No subscribers yet — fine during backfill.
+        }
+    }
 }
 
-/// Count the non-empty lines in a JSONL file without broadcasting any events.
 fn count_nonempty_lines(path: &Path) -> usize {
     let Ok(f) = std::fs::File::open(path) else {
         return 0;
@@ -283,7 +401,7 @@ mod tests {
         writeln!(file, r#"{{"type":"assistant","message":{{}}}}"#).unwrap();
         file.flush().unwrap();
 
-        process_file(&path, &mut states, &tx, &store);
+        process_file(&path, None, &mut states, &tx, &store);
 
         let ev1 = rx.try_recv().expect("expected first event");
         let ev2 = rx.try_recv().expect("expected second event");
@@ -303,13 +421,13 @@ mod tests {
 
         writeln!(file, r#"{{"type":"user","content":"first"}}"#).unwrap();
         file.flush().unwrap();
-        process_file(&path, &mut states, &tx, &store);
+        process_file(&path, None, &mut states, &tx, &store);
         let ev1 = rx.try_recv().expect("expected first event");
         assert_eq!(ev1.line_index, 0);
 
         writeln!(file, r#"{{"type":"user","content":"second"}}"#).unwrap();
         file.flush().unwrap();
-        process_file(&path, &mut states, &tx, &store);
+        process_file(&path, None, &mut states, &tx, &store);
         let ev2 = rx.try_recv().expect("expected second event");
         assert_eq!(ev2.line_index, 1);
         assert!(rx.try_recv().is_err());
@@ -327,7 +445,7 @@ mod tests {
         writeln!(file, r#"{{"type":"user","content":"ok"}}"#).unwrap();
         file.flush().unwrap();
 
-        process_file(&path, &mut states, &tx, &store);
+        process_file(&path, None, &mut states, &tx, &store);
 
         let ev = rx.try_recv().expect("expected one event for valid line");
         assert_eq!(ev.line_index, 1);
@@ -347,21 +465,13 @@ mod tests {
         writeln!(file, r#"{{"type":"user","content":"b"}}"#).unwrap();
         file.flush().unwrap();
 
-        process_file(&path, &mut states, &tx, &store);
+        process_file(&path, None, &mut states, &tx, &store);
 
         let ev1 = rx.try_recv().unwrap();
         let ev2 = rx.try_recv().unwrap();
         assert_eq!(ev1.line_index, 0);
         assert_eq!(ev2.line_index, 1);
         assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn test_is_jsonl() {
-        assert!(is_jsonl(Path::new("session.jsonl")));
-        assert!(!is_jsonl(Path::new("session.json")));
-        assert!(!is_jsonl(Path::new("session.txt")));
-        assert!(!is_jsonl(Path::new("noext")));
     }
 
     #[test]
@@ -375,7 +485,7 @@ mod tests {
         writeln!(file, r#"{{"type":"user","content":"a"}}"#).unwrap();
         writeln!(file, r#"{{"type":"user","content":"b"}}"#).unwrap();
         file.flush().unwrap();
-        process_file(&path, &mut states, &tx, &store);
+        process_file(&path, None, &mut states, &tx, &store);
         rx.try_recv().unwrap();
         rx.try_recv().unwrap();
         assert!(rx.try_recv().is_err());
@@ -391,7 +501,7 @@ mod tests {
             fresh.flush().unwrap();
         }
 
-        process_file(&path, &mut states, &tx, &store);
+        process_file(&path, None, &mut states, &tx, &store);
         let ev = rx
             .try_recv()
             .expect("should have emitted the new line after reset");
@@ -419,7 +529,7 @@ mod tests {
             f.flush().unwrap();
         }
 
-        process_file(&path, &mut states, &tx, &store);
+        process_file(&path, None, &mut states, &tx, &store);
         let ev = rx.try_recv().expect("complete line should be emitted");
         assert_eq!(ev.line_index, 0);
         assert!(rx.try_recv().is_err());
@@ -433,7 +543,7 @@ mod tests {
             f.flush().unwrap();
         }
 
-        process_file(&path, &mut states, &tx, &store);
+        process_file(&path, None, &mut states, &tx, &store);
         let ev2 = rx.try_recv().expect("completed line should be emitted");
         assert_eq!(ev2.line_index, 1);
         assert!(rx.try_recv().is_err());
@@ -464,8 +574,126 @@ mod tests {
         .unwrap();
         file.flush().unwrap();
 
-        process_file(&path, &mut states, &tx, &store);
+        process_file(&path, None, &mut states, &tx, &store);
         assert!(store.session("real-sid").is_some());
         assert_eq!(store.sessions().len(), 1);
+    }
+
+    #[test]
+    fn test_forced_source_is_tagged() {
+        let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        let path = file.path().to_owned();
+        let (tx, store) = make_tx();
+        let mut states: HashMap<PathBuf, FileState> = HashMap::new();
+        let mut rx = tx.subscribe();
+
+        writeln!(file, r#"{{"type":"user","content":"hi"}}"#).unwrap();
+        file.flush().unwrap();
+        process_file(&path, Some(AgentSource::Codex), &mut states, &tx, &store);
+
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.source, "codex");
+    }
+
+    #[test]
+    fn test_sniffed_source_from_content() {
+        let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        let path = file.path().to_owned();
+        let (tx, store) = make_tx();
+        let mut states: HashMap<PathBuf, FileState> = HashMap::new();
+        let mut rx = tx.subscribe();
+
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{{"cwd":"/tmp"}}}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        process_file(&path, None, &mut states, &tx, &store);
+
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.source, "codex");
+        assert_eq!(ev.cwd.as_deref(), Some("/tmp"));
+    }
+
+    #[test]
+    fn test_whole_file_cline_ingest_and_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = dir.path().join("task-123");
+        std::fs::create_dir_all(&task).unwrap();
+        let path = task.join("api_conversation_history.json");
+        std::fs::write(
+            &path,
+            r#"[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"}]"#,
+        )
+        .unwrap();
+
+        let (tx, store) = make_tx();
+        let mut states: HashMap<PathBuf, FileState> = HashMap::new();
+        let mut rx = tx.subscribe();
+
+        process_file(&path, Some(AgentSource::Cline), &mut states, &tx, &store);
+        assert_eq!(rx.try_recv().unwrap().session_id, "task-123");
+        assert_eq!(rx.try_recv().unwrap().line_index, 1);
+        assert!(rx.try_recv().is_err());
+
+        // Grow the file: one more element appended (rewrite whole array).
+        std::fs::write(
+            &path,
+            r#"[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"more"}]"#,
+        )
+        .unwrap();
+        process_file(&path, Some(AgentSource::Cline), &mut states, &tx, &store);
+        // All three are re-emitted (DB dedups), and the third is the new one.
+        let a = rx.try_recv().unwrap();
+        let b = rx.try_recv().unwrap();
+        let c = rx.try_recv().unwrap();
+        assert_eq!(a.line_index, 0);
+        assert_eq!(b.line_index, 1);
+        assert_eq!(c.line_index, 2);
+        assert_eq!(store.session("task-123").unwrap().source, "cline");
+    }
+
+    #[test]
+    fn test_multi_root_watcher_seeds_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_root = dir.path().join("claude");
+        let codex_root = dir.path().join("codex");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        std::fs::create_dir_all(&codex_root).unwrap();
+        std::fs::write(
+            claude_root.join("s1.jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"cs\",\"content\":\"hi\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            codex_root.join("rollout-1.jsonl"),
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hey\"}]}}\n",
+        )
+        .unwrap();
+
+        let (tx, store) = make_tx();
+        let mut rx = tx.subscribe();
+        let w = SessionWatcher::multi(
+            vec![
+                WatchRoot {
+                    path: claude_root,
+                    source: Some(AgentSource::ClaudeCode),
+                },
+                WatchRoot {
+                    path: codex_root,
+                    source: Some(AgentSource::Codex),
+                },
+            ],
+            tx,
+            store.clone(),
+            WatcherOptions { backfill: true },
+        );
+        let mut states = HashMap::new();
+        w.seed_existing(&mut states);
+        assert_eq!(states.len(), 2);
+        assert_eq!(store.sessions().len(), 2);
+        let ev = rx.try_recv().unwrap();
+        assert!(ev.source == "claude-code" || ev.source == "codex");
     }
 }
