@@ -68,7 +68,7 @@ fn ingest_file(
     store: &SessionStore,
 ) -> std::io::Result<usize> {
     // Whole-file JSON array sources (Cline).
-    if root_source == Some(AgentSource::Cline) && sources::cline::is_whole_file(path) {
+    if root_source == Some(AgentSource::Cline) && sources::cline::matches_file(path) {
         return ingest_whole_file(path, root_source, store);
     }
 

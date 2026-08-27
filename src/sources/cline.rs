@@ -74,17 +74,14 @@ pub fn default_task_dirs() -> Vec<PathBuf> {
     out
 }
 
-/// File matcher for Cline roots: the two JSON array files per task.
+/// File matcher for Cline roots: the two JSON array files per task. These are
+/// whole-file JSON arrays (not JSONL), so matching files are ingested via the
+/// whole-file path in the loader/watcher.
 pub fn matches_file(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|n| n.to_str()),
         Some("api_conversation_history.json") | Some("ui_messages.json")
     )
-}
-
-/// Returns true when `path` is a Cline whole-file JSON array (vs JSONL).
-pub fn is_whole_file(path: &Path) -> bool {
-    matches_file(path)
 }
 
 /// Normalise one Cline record (one element of either array file).

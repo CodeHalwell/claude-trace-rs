@@ -206,7 +206,7 @@ pub fn process_file(
     store: &SessionStore,
 ) {
     // Whole-file JSON array sources (Cline) are re-parsed on each change.
-    if root_source == Some(AgentSource::Cline) && crate::sources::cline::is_whole_file(path) {
+    if root_source == Some(AgentSource::Cline) && crate::sources::cline::matches_file(path) {
         process_whole_file(path, root_source, states, tx, store);
         return;
     }
