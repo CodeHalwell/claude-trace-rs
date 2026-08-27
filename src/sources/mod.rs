@@ -25,7 +25,7 @@ pub mod copilot;
 pub mod cursor;
 pub mod kimi;
 
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -109,10 +109,7 @@ impl AgentSource {
             AgentSource::Copilot => vec![home.join(".copilot")],
             AgentSource::Kimi => vec![home.join(".kimi")],
             AgentSource::Cline => cline::default_task_dirs(),
-            AgentSource::Cursor => vec![
-                home.join(".cursor/projects"),
-                home.join(".cursor-agent"),
-            ],
+            AgentSource::Cursor => vec![home.join(".cursor/projects"), home.join(".cursor-agent")],
             AgentSource::Unknown => vec![],
         }
     }
@@ -125,6 +122,17 @@ pub struct WatchRoot {
     /// Forced source for everything under this root. `None` means
     /// "detect from path/content per file".
     pub source: Option<AgentSource>,
+    /// Optional source allow-list for auto-detected files under this root.
+    pub allowed_sources: Option<HashSet<AgentSource>>,
+}
+
+impl WatchRoot {
+    pub fn allows(&self, source: AgentSource) -> bool {
+        self.allowed_sources
+            .as_ref()
+            .map(|allowed| allowed.contains(&source))
+            .unwrap_or(true)
+    }
 }
 
 /// Compute the default set of watch roots: every known agent directory that
@@ -142,6 +150,7 @@ pub fn default_roots() -> Vec<WatchRoot> {
                 out.push(WatchRoot {
                     path: dir,
                     source: Some(*src),
+                    allowed_sources: None,
                 });
             }
         }
@@ -215,9 +224,7 @@ pub fn sniff_source(v: &serde_json::Value) -> AgentSource {
         }
     }
     // Cline task entries: {"ts":…,"type":"say","say":"text",…} or ask/api_req.
-    if v.get("ts").is_some()
-        && (v.get("say").is_some() || v.get("ask").is_some())
-    {
+    if v.get("ts").is_some() && (v.get("say").is_some() || v.get("ask").is_some()) {
         return AgentSource::Cline;
     }
     // Claude Code: has sessionId plus a Claude-ish type, or gitBranch/cwd.

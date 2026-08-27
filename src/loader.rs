@@ -25,6 +25,7 @@ pub fn ingest_directory(root: &Path, store: &SessionStore) -> std::io::Result<us
         &[WatchRoot {
             path: root.to_path_buf(),
             source: None,
+            allowed_sources: None,
         }],
         store,
     )
@@ -35,14 +36,14 @@ pub fn ingest_directory(root: &Path, store: &SessionStore) -> std::io::Result<us
 pub fn ingest_roots(roots: &[WatchRoot], store: &SessionStore) -> std::io::Result<usize> {
     let mut count = 0usize;
     for root in roots {
-        ingest_inner(&root.path, root.source, store, &mut count)?;
+        ingest_inner(&root.path, root, store, &mut count)?;
     }
     Ok(count)
 }
 
 fn ingest_inner(
     dir: &Path,
-    root_source: Option<AgentSource>,
+    root: &WatchRoot,
     store: &SessionStore,
     count: &mut usize,
 ) -> std::io::Result<()> {
@@ -54,22 +55,18 @@ fn ingest_inner(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            ingest_inner(&path, root_source, store, count)?;
-        } else if sources::matches_file(root_source, &path) {
-            *count += ingest_file(&path, root_source, store)?;
+            ingest_inner(&path, root, store, count)?;
+        } else if sources::matches_file(root.source, &path) {
+            *count += ingest_file(&path, root, store)?;
         }
     }
     Ok(())
 }
 
-fn ingest_file(
-    path: &Path,
-    root_source: Option<AgentSource>,
-    store: &SessionStore,
-) -> std::io::Result<usize> {
+fn ingest_file(path: &Path, root: &WatchRoot, store: &SessionStore) -> std::io::Result<usize> {
     // Whole-file JSON array sources (Cline).
-    if root_source == Some(AgentSource::Cline) && sources::cline::matches_file(path) {
-        return ingest_whole_file(path, root_source, store);
+    if root.source == Some(AgentSource::Cline) && sources::cline::matches_file(path) {
+        return ingest_whole_file(path, root.source, store);
     }
 
     let session_fallback = path
@@ -79,7 +76,7 @@ fn ingest_file(
         .to_owned();
     let file = std::fs::File::open(path)?;
     let mut n = 0;
-    let mut detected = root_source;
+    let mut detected = root.source;
     for (idx, line) in BufReader::new(file).lines().enumerate() {
         let Ok(line) = line else { continue };
         let trimmed = line.trim();
@@ -92,11 +89,14 @@ fn ingest_file(
         let source = match detected {
             Some(s) => s,
             None => {
-                let s = sources::detect(root_source, path, Some(&val));
+                let s = sources::detect(root.source, path, Some(&val));
                 detected = Some(s);
                 s
             }
         };
+        if !root.allows(source) {
+            return Ok(0);
+        }
         let ev = TraceEvent::from_raw_as(&session_fallback, idx, val, source);
         store.ingest(&ev);
         n += 1;
@@ -110,7 +110,12 @@ fn ingest_whole_file(
     store: &SessionStore,
 ) -> std::io::Result<usize> {
     let body = std::fs::read_to_string(path)?;
-    let arr: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to parse {} as JSON array: {e}", path.display()),
+        )
+    })?;
     let session_fallback = path
         .parent()
         .and_then(|p| p.file_name())
@@ -184,10 +189,12 @@ mod tests {
                 WatchRoot {
                     path: claude_root,
                     source: Some(AgentSource::ClaudeCode),
+                    allowed_sources: None,
                 },
                 WatchRoot {
                     path: codex_root,
                     source: Some(AgentSource::Codex),
+                    allowed_sources: None,
                 },
             ],
             &store,
@@ -216,6 +223,7 @@ mod tests {
             &[WatchRoot {
                 path: dir.path().join("tasks"),
                 source: Some(AgentSource::Cline),
+                allowed_sources: None,
             }],
             &store,
         )
@@ -224,5 +232,56 @@ mod tests {
         let s = store.session("42").unwrap();
         assert_eq!(s.source, "cline");
         assert_eq!(s.tool_counts.get("read_file"), Some(&1));
+    }
+
+    #[test]
+    fn explicit_root_only_filters_auto_detected_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("claude.jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"claude\",\"content\":\"hi\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("codex.jsonl"),
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"shell\",\"call_id\":\"c1\"}}\n",
+        )
+        .unwrap();
+
+        let store = SessionStore::new();
+        let n = ingest_roots(
+            &[WatchRoot {
+                path: dir.path().to_path_buf(),
+                source: None,
+                allowed_sources: Some(std::collections::HashSet::from([AgentSource::Codex])),
+            }],
+            &store,
+        )
+        .unwrap();
+
+        assert_eq!(n, 1);
+        let sessions = store.sessions();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].source, "codex");
+    }
+
+    #[test]
+    fn invalid_cline_whole_file_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = dir.path().join("tasks").join("42");
+        std::fs::create_dir_all(&task).unwrap();
+        std::fs::write(task.join("api_conversation_history.json"), "{not json").unwrap();
+
+        let err = ingest_roots(
+            &[WatchRoot {
+                path: dir.path().join("tasks"),
+                source: Some(AgentSource::Cline),
+                allowed_sources: None,
+            }],
+            &SessionStore::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

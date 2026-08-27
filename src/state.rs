@@ -104,10 +104,10 @@ impl SessionStats {
         if self.id.is_empty() {
             self.id = ev.session_id.clone();
         }
-        // Adopt the event's source on the first event (a freshly defaulted
-        // stats block carries the claude-code default; replace it unless the
-        // event is itself unattributed).
-        if self.event_count == 0 && ev.source != "unknown" {
+        // Adopt the event's source on the first event so freshly created stats
+        // blocks do not keep the legacy claude-code default when the session is
+        // actually attributed to some other source (including "unknown").
+        if self.event_count == 0 {
             self.source = ev.source.clone();
         }
         if self.first_seen.is_none() {
@@ -412,6 +412,25 @@ mod tests {
         assert_eq!(s.tool_counts.get("Read"), Some(&2));
         assert_eq!(s.tool_counts.get("Bash"), Some(&1));
         assert_eq!(s.tool_use_count, 3);
+    }
+
+    #[test]
+    fn store_adopts_unknown_source_on_first_event() {
+        let store = SessionStore::new();
+        let ev = TraceEvent::from_raw_as(
+            "fallback",
+            0,
+            json!({
+                "type": "user",
+                "sessionId": "u1",
+                "content": "hi"
+            }),
+            crate::sources::AgentSource::Unknown,
+        );
+
+        store.ingest(&ev);
+
+        assert_eq!(store.session("u1").unwrap().source, "unknown");
     }
 
     #[test]

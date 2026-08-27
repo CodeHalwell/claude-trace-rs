@@ -169,21 +169,19 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let forced_source = cli
-        .source
-        .as_deref()
-        .and_then(|s| {
-            let p = sources::AgentSource::parse(s);
-            if p.is_none() {
-                warn!("Unrecognised --source '{s}'; falling back to auto-detect");
-            }
-            p
-        });
-    let only: Option<std::collections::HashSet<sources::AgentSource>> = cli.only.as_ref().map(|v| {
-        v.iter()
-            .filter_map(|s| sources::AgentSource::parse(s))
-            .collect()
+    let forced_source = cli.source.as_deref().and_then(|s| {
+        let p = sources::AgentSource::parse(s);
+        if p.is_none() {
+            warn!("Unrecognised --source '{s}'; falling back to auto-detect");
+        }
+        p
     });
+    let only: Option<std::collections::HashSet<sources::AgentSource>> =
+        cli.only.as_ref().map(|v| {
+            v.iter()
+                .filter_map(|s| sources::AgentSource::parse(s))
+                .collect()
+        });
     let roots = resolve_roots(&cli.watch_root, forced_source, only, cli.no_default_roots);
 
     match cli.cmd.unwrap_or(Cmd::Serve(ServeArgs::default())) {
@@ -197,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
 /// Turn the CLI flags into a concrete set of watch roots.
 ///
 /// - Any explicit `--watch-root` entries are always included (tagged with
-///   `--source` if given, else auto-detect per file).
+///   `--source` if given, else auto-detect per file within any `--only` filter).
 /// - Unless `--no-default-roots`, every known agent log directory that exists
 ///   on disk is added (tagged with its agent), filtered by `--only`.
 fn resolve_roots(
@@ -210,7 +208,9 @@ fn resolve_roots(
 
     for raw in explicit {
         let path = expand_tilde(raw);
-        // Honour --only for explicit roots too when a source is forced.
+        // Honour --only for explicit roots too, either by dropping a forced
+        // source outside the allow-list or by carrying the allow-list forward
+        // for per-file auto-detection.
         if let (Some(only), Some(src)) = (&only, forced_source) {
             if !only.contains(&src) {
                 continue;
@@ -219,6 +219,7 @@ fn resolve_roots(
         roots.push(sources::WatchRoot {
             path,
             source: forced_source,
+            allowed_sources: forced_source.is_none().then(|| only.clone()).flatten(),
         });
     }
 
@@ -246,6 +247,7 @@ fn resolve_roots(
         roots.push(sources::WatchRoot {
             path: expand_tilde("~/.claude/projects"),
             source: Some(sources::AgentSource::ClaudeCode),
+            allowed_sources: None,
         });
     }
 
@@ -483,7 +485,10 @@ fn open_in_browser(url: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::expand_tilde;
+    use std::collections::HashSet;
+
+    use super::{expand_tilde, resolve_roots};
+    use crate::sources::AgentSource;
 
     #[test]
     fn tilde_expansion() {
@@ -501,5 +506,22 @@ mod tests {
             expand_tilde("rel/path"),
             std::path::PathBuf::from("rel/path")
         );
+    }
+
+    #[test]
+    fn resolve_roots_preserves_only_for_explicit_auto_detect_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = resolve_roots(
+            &[dir.path().display().to_string()],
+            None,
+            Some(HashSet::from([AgentSource::Codex])),
+            true,
+        );
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, dir.path());
+        assert_eq!(roots[0].source, None);
+        assert!(roots[0].allows(AgentSource::Codex));
+        assert!(!roots[0].allows(AgentSource::ClaudeCode));
     }
 }

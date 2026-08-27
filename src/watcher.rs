@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
@@ -62,6 +62,7 @@ impl SessionWatcher {
             vec![WatchRoot {
                 path: watch_root,
                 source: None,
+                allowed_sources: None,
             }],
             tx,
             store,
@@ -92,6 +93,7 @@ impl SessionWatcher {
             seed_dir(
                 &root.path,
                 root.source,
+                root.allowed_sources.as_ref(),
                 states,
                 &self.store,
                 &self.tx,
@@ -142,23 +144,34 @@ impl SessionWatcher {
             return;
         }
         for path in event.paths {
-            // Which root does this path belong to?
-            let root_src = self
-                .roots
-                .iter()
-                .find(|r| path.starts_with(&r.path))
-                .and_then(|r| r.source);
+            let root = most_specific_root(&self.roots, &path);
+            let root_src = root.and_then(|r| r.source);
             if sources::matches_file(root_src, &path) {
                 debug!("Processing event for {}", path.display());
-                process_file(&path, root_src, states, &self.tx, &self.store);
+                process_file(
+                    &path,
+                    root_src,
+                    root.and_then(|r| r.allowed_sources.as_ref()),
+                    states,
+                    &self.tx,
+                    &self.store,
+                );
             }
         }
     }
 }
 
+fn most_specific_root<'a>(roots: &'a [WatchRoot], path: &Path) -> Option<&'a WatchRoot> {
+    roots
+        .iter()
+        .filter(|r| path.starts_with(&r.path))
+        .max_by_key(|r| r.path.as_os_str().len())
+}
+
 fn seed_dir(
     dir: &Path,
     root_source: Option<AgentSource>,
+    allowed_sources: Option<&HashSet<AgentSource>>,
     states: &mut HashMap<PathBuf, FileState>,
     store: &SessionStore,
     tx: &broadcast::Sender<TraceEvent>,
@@ -169,16 +182,30 @@ fn seed_dir(
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    seed_dir(&path, root_source, states, store, tx, backfill);
+                    seed_dir(
+                        &path,
+                        root_source,
+                        allowed_sources,
+                        states,
+                        store,
+                        tx,
+                        backfill,
+                    );
                 } else if sources::matches_file(root_source, &path) {
                     if backfill {
                         // Process from the start of the file.
                         states.insert(path.clone(), FileState::default());
-                        process_file(&path, root_source, states, tx, store);
+                        process_file(&path, root_source, allowed_sources, states, tx, store);
                     } else if let Ok(meta) = std::fs::metadata(&path) {
                         // Skip to EOF without emitting events; just count lines
                         // so future events get correct line indices.
-                        let line_count = count_nonempty_lines(&path);
+                        let line_count = if root_source == Some(AgentSource::Cline)
+                            && crate::sources::cline::matches_file(&path)
+                        {
+                            count_whole_file_events(&path).unwrap_or(0)
+                        } else {
+                            count_nonempty_lines(&path)
+                        };
                         states.insert(
                             path,
                             FileState {
@@ -201,13 +228,14 @@ fn seed_dir(
 pub fn process_file(
     path: &Path,
     root_source: Option<AgentSource>,
+    allowed_sources: Option<&HashSet<AgentSource>>,
     states: &mut HashMap<PathBuf, FileState>,
     tx: &broadcast::Sender<TraceEvent>,
     store: &SessionStore,
 ) {
     // Whole-file JSON array sources (Cline) are re-parsed on each change.
     if root_source == Some(AgentSource::Cline) && crate::sources::cline::matches_file(path) {
-        process_whole_file(path, root_source, states, tx, store);
+        process_whole_file(path, root_source, allowed_sources, states, tx, store);
         return;
     }
 
@@ -280,6 +308,10 @@ pub fn process_file(
                                 s
                             }
                         };
+                        if !source_allowed(allowed_sources, source) {
+                            state.line_count += 1;
+                            continue;
+                        }
                         let event = TraceEvent::from_raw_as(
                             &session_fallback,
                             state.line_count,
@@ -312,22 +344,22 @@ pub fn process_file(
     }
 }
 
-/// Re-ingest a whole-file JSON array (Cline). Each array element becomes an
-/// event whose `line_index` is its position in the array, so re-parsing after
-/// the file grows is idempotent at the DB layer (`INSERT OR IGNORE`).
+/// Ingest a whole-file JSON array source (Cline), emitting only the newly
+/// appended elements after growth and resetting to index 0 after shrinkage.
 fn process_whole_file(
     path: &Path,
     root_source: Option<AgentSource>,
+    allowed_sources: Option<&HashSet<AgentSource>>,
     states: &mut HashMap<PathBuf, FileState>,
     tx: &broadcast::Sender<TraceEvent>,
     store: &SessionStore,
 ) {
     let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let state = states.entry(path.to_owned()).or_default();
-    if len == state.last_len {
+    let previous_len = state.last_len;
+    if len == previous_len {
         return; // unchanged
     }
-    state.last_len = len;
 
     let body = match std::fs::read_to_string(path) {
         Ok(b) => b,
@@ -344,6 +376,7 @@ fn process_whole_file(
             return;
         }
     };
+    let arr_len = arr.len();
 
     // Session id: the task directory name (`tasks/<taskId>/<file>`).
     let session_fallback = path
@@ -354,16 +387,27 @@ fn process_whole_file(
         .to_owned();
 
     let source = root_source.unwrap_or(AgentSource::Cline);
+    if !source_allowed(allowed_sources, source) {
+        state.last_len = len;
+        state.line_count = arr_len;
+        return;
+    }
     state.source = Some(source);
-    state.line_count = state.line_count.max(arr.len());
+    let start_idx = if len < previous_len {
+        0
+    } else {
+        state.line_count.min(arr_len)
+    };
 
-    for (idx, val) in arr.into_iter().enumerate() {
+    for (idx, val) in arr.into_iter().enumerate().skip(start_idx) {
         let event = TraceEvent::from_raw_as(&session_fallback, idx, val, source);
         store.ingest(&event);
         if tx.send(event).is_err() {
             // No subscribers yet — fine during backfill.
         }
     }
+    state.last_len = len;
+    state.line_count = arr_len;
 }
 
 fn count_nonempty_lines(path: &Path) -> usize {
@@ -375,6 +419,19 @@ fn count_nonempty_lines(path: &Path) -> usize {
         .map_while(Result::ok)
         .filter(|l| !l.trim().is_empty())
         .count()
+}
+
+fn count_whole_file_events(path: &Path) -> Option<usize> {
+    let body = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<Vec<serde_json::Value>>(&body)
+        .ok()
+        .map(|arr| arr.len())
+}
+
+fn source_allowed(allowed_sources: Option<&HashSet<AgentSource>>, source: AgentSource) -> bool {
+    allowed_sources
+        .map(|allowed| allowed.contains(&source))
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -401,7 +458,7 @@ mod tests {
         writeln!(file, r#"{{"type":"assistant","message":{{}}}}"#).unwrap();
         file.flush().unwrap();
 
-        process_file(&path, None, &mut states, &tx, &store);
+        process_file(&path, None, None, &mut states, &tx, &store);
 
         let ev1 = rx.try_recv().expect("expected first event");
         let ev2 = rx.try_recv().expect("expected second event");
@@ -421,13 +478,13 @@ mod tests {
 
         writeln!(file, r#"{{"type":"user","content":"first"}}"#).unwrap();
         file.flush().unwrap();
-        process_file(&path, None, &mut states, &tx, &store);
+        process_file(&path, None, None, &mut states, &tx, &store);
         let ev1 = rx.try_recv().expect("expected first event");
         assert_eq!(ev1.line_index, 0);
 
         writeln!(file, r#"{{"type":"user","content":"second"}}"#).unwrap();
         file.flush().unwrap();
-        process_file(&path, None, &mut states, &tx, &store);
+        process_file(&path, None, None, &mut states, &tx, &store);
         let ev2 = rx.try_recv().expect("expected second event");
         assert_eq!(ev2.line_index, 1);
         assert!(rx.try_recv().is_err());
@@ -445,7 +502,7 @@ mod tests {
         writeln!(file, r#"{{"type":"user","content":"ok"}}"#).unwrap();
         file.flush().unwrap();
 
-        process_file(&path, None, &mut states, &tx, &store);
+        process_file(&path, None, None, &mut states, &tx, &store);
 
         let ev = rx.try_recv().expect("expected one event for valid line");
         assert_eq!(ev.line_index, 1);
@@ -465,7 +522,7 @@ mod tests {
         writeln!(file, r#"{{"type":"user","content":"b"}}"#).unwrap();
         file.flush().unwrap();
 
-        process_file(&path, None, &mut states, &tx, &store);
+        process_file(&path, None, None, &mut states, &tx, &store);
 
         let ev1 = rx.try_recv().unwrap();
         let ev2 = rx.try_recv().unwrap();
@@ -485,7 +542,7 @@ mod tests {
         writeln!(file, r#"{{"type":"user","content":"a"}}"#).unwrap();
         writeln!(file, r#"{{"type":"user","content":"b"}}"#).unwrap();
         file.flush().unwrap();
-        process_file(&path, None, &mut states, &tx, &store);
+        process_file(&path, None, None, &mut states, &tx, &store);
         rx.try_recv().unwrap();
         rx.try_recv().unwrap();
         assert!(rx.try_recv().is_err());
@@ -501,7 +558,7 @@ mod tests {
             fresh.flush().unwrap();
         }
 
-        process_file(&path, None, &mut states, &tx, &store);
+        process_file(&path, None, None, &mut states, &tx, &store);
         let ev = rx
             .try_recv()
             .expect("should have emitted the new line after reset");
@@ -529,7 +586,7 @@ mod tests {
             f.flush().unwrap();
         }
 
-        process_file(&path, None, &mut states, &tx, &store);
+        process_file(&path, None, None, &mut states, &tx, &store);
         let ev = rx.try_recv().expect("complete line should be emitted");
         assert_eq!(ev.line_index, 0);
         assert!(rx.try_recv().is_err());
@@ -543,7 +600,7 @@ mod tests {
             f.flush().unwrap();
         }
 
-        process_file(&path, None, &mut states, &tx, &store);
+        process_file(&path, None, None, &mut states, &tx, &store);
         let ev2 = rx.try_recv().expect("completed line should be emitted");
         assert_eq!(ev2.line_index, 1);
         assert!(rx.try_recv().is_err());
@@ -574,7 +631,7 @@ mod tests {
         .unwrap();
         file.flush().unwrap();
 
-        process_file(&path, None, &mut states, &tx, &store);
+        process_file(&path, None, None, &mut states, &tx, &store);
         assert!(store.session("real-sid").is_some());
         assert_eq!(store.sessions().len(), 1);
     }
@@ -589,7 +646,14 @@ mod tests {
 
         writeln!(file, r#"{{"type":"user","content":"hi"}}"#).unwrap();
         file.flush().unwrap();
-        process_file(&path, Some(AgentSource::Codex), &mut states, &tx, &store);
+        process_file(
+            &path,
+            Some(AgentSource::Codex),
+            None,
+            &mut states,
+            &tx,
+            &store,
+        );
 
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.source, "codex");
@@ -609,7 +673,7 @@ mod tests {
         )
         .unwrap();
         file.flush().unwrap();
-        process_file(&path, None, &mut states, &tx, &store);
+        process_file(&path, None, None, &mut states, &tx, &store);
 
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.source, "codex");
@@ -632,7 +696,14 @@ mod tests {
         let mut states: HashMap<PathBuf, FileState> = HashMap::new();
         let mut rx = tx.subscribe();
 
-        process_file(&path, Some(AgentSource::Cline), &mut states, &tx, &store);
+        process_file(
+            &path,
+            Some(AgentSource::Cline),
+            None,
+            &mut states,
+            &tx,
+            &store,
+        );
         assert_eq!(rx.try_recv().unwrap().session_id, "task-123");
         assert_eq!(rx.try_recv().unwrap().line_index, 1);
         assert!(rx.try_recv().is_err());
@@ -643,15 +714,133 @@ mod tests {
             r#"[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"more"}]"#,
         )
         .unwrap();
-        process_file(&path, Some(AgentSource::Cline), &mut states, &tx, &store);
-        // All three are re-emitted (DB dedups), and the third is the new one.
-        let a = rx.try_recv().unwrap();
-        let b = rx.try_recv().unwrap();
-        let c = rx.try_recv().unwrap();
-        assert_eq!(a.line_index, 0);
-        assert_eq!(b.line_index, 1);
-        assert_eq!(c.line_index, 2);
+        process_file(
+            &path,
+            Some(AgentSource::Cline),
+            None,
+            &mut states,
+            &tx,
+            &store,
+        );
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.line_index, 2);
+        assert!(rx.try_recv().is_err());
         assert_eq!(store.session("task-123").unwrap().source, "cline");
+    }
+
+    #[test]
+    fn test_whole_file_cline_backfill_false_only_emits_appended_events_and_resets_on_shrink() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = dir.path().join("task-123");
+        std::fs::create_dir_all(&task).unwrap();
+        let path = task.join("api_conversation_history.json");
+        std::fs::write(&path, r#"[{"role":"user","content":"hi"}]"#).unwrap();
+
+        let (tx, store) = make_tx();
+        let mut states: HashMap<PathBuf, FileState> = HashMap::new();
+        let mut rx = tx.subscribe();
+
+        seed_dir(
+            &task,
+            Some(AgentSource::Cline),
+            None,
+            &mut states,
+            &store,
+            &tx,
+            false,
+        );
+        assert_eq!(store.total_events(), 0);
+        assert!(rx.try_recv().is_err());
+
+        std::fs::write(
+            &path,
+            r#"[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"}]"#,
+        )
+        .unwrap();
+        process_file(
+            &path,
+            Some(AgentSource::Cline),
+            None,
+            &mut states,
+            &tx,
+            &store,
+        );
+        let appended = rx.try_recv().unwrap();
+        assert_eq!(appended.line_index, 1);
+        assert!(rx.try_recv().is_err());
+
+        std::fs::write(&path, r#"[{"role":"user","content":"fresh"}]"#).unwrap();
+        process_file(
+            &path,
+            Some(AgentSource::Cline),
+            None,
+            &mut states,
+            &tx,
+            &store,
+        );
+        let reset = rx.try_recv().unwrap();
+        assert_eq!(reset.line_index, 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_process_file_respects_allowed_sources() {
+        let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        let path = file.path().to_owned();
+        let (tx, store) = make_tx();
+        let mut states: HashMap<PathBuf, FileState> = HashMap::new();
+        let mut rx = tx.subscribe();
+        let allowed = HashSet::from([AgentSource::Codex]);
+
+        writeln!(file, r#"{{"type":"user","content":"hi"}}"#).unwrap();
+        file.flush().unwrap();
+
+        process_file(&path, None, Some(&allowed), &mut states, &tx, &store);
+        assert_eq!(store.total_events(), 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_handle_event_uses_most_specific_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let path = child.join("trace.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"shell\",\"call_id\":\"c1\"}}\n",
+        )
+        .unwrap();
+
+        let (tx, store) = make_tx();
+        let watcher = SessionWatcher::multi(
+            vec![
+                WatchRoot {
+                    path: parent,
+                    source: Some(AgentSource::ClaudeCode),
+                    allowed_sources: None,
+                },
+                WatchRoot {
+                    path: child,
+                    source: Some(AgentSource::Codex),
+                    allowed_sources: None,
+                },
+            ],
+            tx,
+            store.clone(),
+            WatcherOptions { backfill: false },
+        );
+
+        let event = Event {
+            kind: EventKind::Create(notify::event::CreateKind::Any),
+            paths: vec![path],
+            attrs: Default::default(),
+        };
+        watcher.handle_event(event, &mut HashMap::new());
+
+        let session = store.sessions().pop().unwrap();
+        assert_eq!(session.source, "codex");
     }
 
     #[test]
@@ -679,10 +868,12 @@ mod tests {
                 WatchRoot {
                     path: claude_root,
                     source: Some(AgentSource::ClaudeCode),
+                    allowed_sources: None,
                 },
                 WatchRoot {
                     path: codex_root,
                     source: Some(AgentSource::Codex),
+                    allowed_sources: None,
                 },
             ],
             tx,
