@@ -89,7 +89,14 @@ impl SessionWatcher {
     /// is true, process them from byte 0 so historical events populate the
     /// store. Otherwise seed offsets to current EOF so only new lines stream.
     fn seed_existing(&self, states: &mut HashMap<PathBuf, FileState>) {
-        for root in &self.roots {
+        // Roots can nest (an explicit `--watch-root ~/.codex` above the
+        // auto-discovered `~/.codex/sessions`). Seed the most specific root
+        // first so it claims its own files, and skip files a previous root
+        // already seeded — otherwise a backfill replays them once per covering
+        // root. Live events already resolve the overlap via most_specific_root.
+        let mut ordered: Vec<&WatchRoot> = self.roots.iter().collect();
+        ordered.sort_by_key(|r| std::cmp::Reverse(r.path.as_os_str().len()));
+        for root in ordered {
             seed_dir(
                 &root.path,
                 root.source,
@@ -192,6 +199,10 @@ fn seed_dir(
                         backfill,
                     );
                 } else if sources::matches_file(root_source, &path) {
+                    // Already seeded through a more specific overlapping root.
+                    if states.contains_key(&path) {
+                        continue;
+                    }
                     if backfill {
                         // Process from the start of the file.
                         states.insert(path.clone(), FileState::default());
@@ -304,7 +315,11 @@ pub fn process_file(
                             Some(s) => s,
                             None => {
                                 let s = sources::detect(root_source, path, Some(&val));
-                                state.source = Some(s);
+                                // Only cache a conclusive answer — see the note
+                                // in loader::ingest_file.
+                                if s != AgentSource::Unknown {
+                                    state.source = Some(s);
+                                }
                                 s
                             }
                         };

@@ -6,8 +6,9 @@
 //! the server alive.
 
 use std::{
+    collections::HashSet,
     io::{BufRead, BufReader},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use tracing::warn;
@@ -37,8 +38,21 @@ pub fn ingest_directory(root: &Path, store: &SessionStore) -> std::io::Result<us
 /// source) into `store`. Returns the number of events successfully ingested.
 pub fn ingest_roots(roots: &[WatchRoot], store: &SessionStore) -> std::io::Result<usize> {
     let mut count = 0usize;
-    for root in roots {
-        ingest_inner(&root.path, root, store, &mut count)?;
+    // Roots can nest: an explicit `--watch-root ~/.codex` sits above the
+    // auto-discovered `~/.codex/sessions`, and resolve_roots only drops exact
+    // duplicates. Each root is walked recursively, so without cross-root
+    // de-duplication every nested file is ingested once per covering root —
+    // doubling session counts and duplicating exported training records.
+    //
+    // Walk the most specific root first so the more precisely source-tagged
+    // root claims its own files, then skip anything already ingested. The
+    // watcher resolves the same overlap with `most_specific_root`.
+    let mut ordered: Vec<&WatchRoot> = roots.iter().collect();
+    ordered.sort_by_key(|r| std::cmp::Reverse(r.path.as_os_str().len()));
+
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for root in ordered {
+        ingest_inner(&root.path, root, store, &mut count, &mut seen)?;
     }
     Ok(count)
 }
@@ -48,6 +62,7 @@ fn ingest_inner(
     root: &WatchRoot,
     store: &SessionStore,
     count: &mut usize,
+    seen: &mut HashSet<PathBuf>,
 ) -> std::io::Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -57,8 +72,12 @@ fn ingest_inner(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            ingest_inner(&path, root, store, count)?;
+            ingest_inner(&path, root, store, count, seen)?;
         } else if sources::matches_file(root.source, &path) {
+            // Already ingested through a more specific overlapping root.
+            if !seen.insert(path.clone()) {
+                continue;
+            }
             *count += ingest_file(&path, root, store)?;
         }
     }
@@ -94,12 +113,21 @@ fn ingest_file(path: &Path, root: &WatchRoot, store: &SessionStore) -> std::io::
             Some(s) => s,
             None => {
                 let s = sources::detect(root.source, path, Some(&val));
-                detected = Some(s);
+                // Only cache a conclusive answer. A generic first record (say a
+                // metadata header) sniffs as Unknown, and caching that would
+                // stop us ever inspecting the later records that do carry an
+                // unmistakable signature.
+                if s != AgentSource::Unknown {
+                    detected = Some(s);
+                }
                 s
             }
         };
         if !root.allows(source) {
-            return Ok(0);
+            // Skip this record rather than abandoning the file: under `--only`
+            // an inconclusive first line would otherwise drop a file whose next
+            // line identifies it as a source the user did ask for.
+            continue;
         }
         let ev = TraceEvent::from_raw_as(&session_fallback, idx, val, source);
         store.ingest(&ev);
@@ -377,5 +405,71 @@ mod tests {
 
         assert_eq!(n, 1);
         assert_eq!(store.session("7").unwrap().source, "cline");
+    }
+    #[test]
+    fn overlapping_roots_ingest_each_file_once() {
+        // `--watch-root ~/.codex` alongside the auto-discovered
+        // ~/.codex/sessions: resolve_roots keeps both (they are not equal), and
+        // each is walked recursively, so the nested file was ingested twice.
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout-1.jsonl"),
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}}\n",
+        )
+        .unwrap();
+
+        let store = SessionStore::new();
+        let n = ingest_roots(
+            &[
+                WatchRoot {
+                    path: dir.path().to_path_buf(),
+                    source: None,
+                    allowed_sources: None,
+                },
+                WatchRoot {
+                    path: sessions,
+                    source: Some(AgentSource::Codex),
+                    allowed_sources: None,
+                },
+            ],
+            &store,
+        )
+        .unwrap();
+
+        assert_eq!(n, 1, "one file on disk must be ingested once");
+        let sessions = store.sessions();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].event_count, 1);
+        // The more specific root claims the file, so its source tag wins.
+        assert_eq!(sessions[0].source, "codex");
+    }
+
+    #[test]
+    fn inconclusive_first_record_does_not_drop_the_file() {
+        // Under --only codex a generic first line sniffs as Unknown. Caching
+        // that verdict, and bailing out of the file on it, discarded the rest —
+        // including the very records that identify it as Codex.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mixed.jsonl"),
+            "{\"note\":\"generic header\"}\n             {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}}\n",
+        )
+        .unwrap();
+
+        let store = SessionStore::new();
+        let n = ingest_roots(
+            &[WatchRoot {
+                path: dir.path().to_path_buf(),
+                source: None,
+                allowed_sources: Some(HashSet::from([AgentSource::Codex])),
+            }],
+            &store,
+        )
+        .unwrap();
+
+        assert_eq!(n, 1, "the Codex record is still ingested");
+        assert_eq!(store.sessions()[0].source, "codex");
     }
 }
