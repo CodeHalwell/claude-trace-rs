@@ -151,7 +151,15 @@ impl SessionStats {
                     }
                 }
             }
-            "tool_result" => self.tool_result_count += 1,
+            "tool_result" => {
+                // Mirror of the `tool_use` guard above: adapters that already
+                // populated `tool_results` (Codex, Cursor, Copilot) are counted
+                // by the loop below, so only count the record itself when it
+                // carries no explicit result ids.
+                if ev.tool_results.is_empty() {
+                    self.tool_result_count += 1;
+                }
+            }
             "system" => self.system_count += 1,
             _ => {}
         }
@@ -474,5 +482,46 @@ mod tests {
         let snap = store.snapshot(10);
         assert_eq!(snap.sessions[0].id, "new");
         assert_eq!(snap.sessions[1].id, "old");
+    }
+    #[test]
+    fn store_counts_tool_results_once_per_record() {
+        // A Codex `function_call_output` sets both `event_type = "tool_result"`
+        // and `tool_results = ["c1"]`; it must count as one result, not two.
+        let store = SessionStore::new();
+        let ev = TraceEvent::from_raw_as(
+            "s",
+            0,
+            json!({
+                "type": "response_item",
+                "payload": {"type": "function_call_output", "call_id": "c1", "output": "done"}
+            }),
+            crate::sources::AgentSource::Codex,
+        );
+        assert_eq!(ev.event_type, "tool_result");
+        assert_eq!(ev.tool_results, vec!["c1"]);
+
+        store.ingest(&ev);
+        assert_eq!(store.session("s").unwrap().tool_result_count, 1);
+    }
+
+    #[test]
+    fn store_counts_claude_tool_result_blocks() {
+        // Claude Code carries tool results as blocks inside a `user` record —
+        // the guard above must not stop those from being counted.
+        let store = SessionStore::new();
+        let ev = TraceEvent::from_raw_as(
+            "s",
+            0,
+            json!({
+                "type": "user",
+                "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "a"},
+                    {"type": "tool_result", "tool_use_id": "b"}
+                ]}
+            }),
+            crate::sources::AgentSource::ClaudeCode,
+        );
+        store.ingest(&ev);
+        assert_eq!(store.session("s").unwrap().tool_result_count, 2);
     }
 }

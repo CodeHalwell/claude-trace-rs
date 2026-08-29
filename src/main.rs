@@ -243,7 +243,16 @@ fn resolve_roots(
     // Fallback: if nothing was specified and nothing exists on disk yet, use
     // the historical Claude Code default so `claude-trace-rs` with no args
     // behaves exactly as before (and creates the directory).
-    if roots.is_empty() && explicit.is_empty() {
+    //
+    // This only applies when the user has not narrowed the source set: with
+    // `--only codex` or `--no-default-roots` an empty result is the honest
+    // answer, and the caller reports "no watch roots" rather than silently
+    // watching (and creating) a Claude Code directory the user excluded.
+    let claude_code_wanted = only
+        .as_ref()
+        .map(|o| o.contains(&sources::AgentSource::ClaudeCode))
+        .unwrap_or(true);
+    if roots.is_empty() && explicit.is_empty() && !no_default_roots && claude_code_wanted {
         roots.push(sources::WatchRoot {
             path: expand_tilde("~/.claude/projects"),
             source: Some(sources::AgentSource::ClaudeCode),
@@ -486,12 +495,22 @@ fn open_in_browser(url: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::Mutex;
 
     use super::{expand_tilde, resolve_roots};
     use crate::sources::AgentSource;
 
+    /// `HOME` is process-global, so the tests that override it must not run
+    /// concurrently with each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn tilde_expansion() {
+        let _guard = lock_env();
         std::env::set_var("HOME", "/home/test");
         assert_eq!(
             expand_tilde("~/.claude/projects"),
@@ -523,5 +542,33 @@ mod tests {
         assert_eq!(roots[0].source, None);
         assert!(roots[0].allows(AgentSource::Codex));
         assert!(!roots[0].allows(AgentSource::ClaudeCode));
+    }
+    #[test]
+    fn resolve_roots_fallback_respects_only_filter() {
+        // `--only codex` with no Codex directory on disk must not fall back to
+        // watching (and creating) the Claude Code root the user excluded.
+        let _guard = lock_env();
+        let empty = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", empty.path());
+
+        let roots = resolve_roots(&[], None, Some(HashSet::from([AgentSource::Codex])), false);
+        assert!(
+            roots.is_empty(),
+            "expected no roots, got {:?}",
+            roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>()
+        );
+
+        // Without --only the historical Claude Code default still applies.
+        let roots = resolve_roots(&[], None, None, false);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].source, Some(AgentSource::ClaudeCode));
+    }
+
+    #[test]
+    fn resolve_roots_no_default_roots_yields_nothing_without_explicit() {
+        let _guard = lock_env();
+        let empty = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", empty.path());
+        assert!(resolve_roots(&[], None, None, true).is_empty());
     }
 }
