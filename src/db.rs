@@ -407,9 +407,8 @@ impl Db {
                     "SELECT event_json FROM events WHERE search_text LIKE ?1
                      ORDER BY observed_at DESC LIMIT ?2",
                 )?;
-                let rows = stmt.query_map(params![pattern, limit as i64], |r| {
-                    r.get::<_, String>(0)
-                })?;
+                let rows =
+                    stmt.query_map(params![pattern, limit as i64], |r| r.get::<_, String>(0))?;
                 for r in rows {
                     if let Ok(v) = serde_json::from_str::<Value>(&r?) {
                         out.push(v);

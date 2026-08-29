@@ -107,10 +107,7 @@ fn enrich_response_item(payload: &Value, e: &mut Enrichment) {
         }
         "function_call" => {
             e.event_type = "tool_use".to_owned();
-            let name = payload
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
+            let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("?");
             e.tool_uses.push(name.to_owned());
             e.summary = format!("🔧 {name}");
         }
@@ -158,10 +155,7 @@ fn enrich_event_msg(payload: &Value, e: &mut Enrichment) {
             let info = payload.get("info").unwrap_or(&Value::Null);
             let usage = pick_usage(info);
             if let Some(u) = &usage {
-                e.summary = format!(
-                    "⚙️  Tokens: {} in · {} out",
-                    u.input, u.output
-                );
+                e.summary = format!("⚙️  Tokens: {} in · {} out", u.input, u.output);
             } else {
                 e.summary = "⚙️  Token count".to_owned();
             }

@@ -83,7 +83,11 @@ pub fn enrich(raw: &Value) -> Enrichment {
         .get("costUSD")
         .or_else(|| raw.get("cost_usd"))
         .and_then(|v| v.as_f64())
-        .or_else(|| e.usage.as_ref().map(|u| estimate_cost(e.model.as_deref(), u)));
+        .or_else(|| {
+            e.usage
+                .as_ref()
+                .map(|u| estimate_cost(e.model.as_deref(), u))
+        });
 
     e.summary = summarise(raw, &e.event_type, &e.tool_uses);
     e
@@ -139,9 +143,7 @@ fn extract_tools(raw: &Value, e: &mut Enrichment) {
 }
 
 fn extract_usage(raw: &Value) -> Option<TokenUsage> {
-    let usage = raw
-        .pointer("/message/usage")
-        .or_else(|| raw.get("usage"))?;
+    let usage = raw.pointer("/message/usage").or_else(|| raw.get("usage"))?;
     let input = usage
         .get("input_tokens")
         .or_else(|| usage.get("prompt_tokens"))

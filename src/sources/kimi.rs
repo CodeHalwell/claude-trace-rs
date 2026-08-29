@@ -54,7 +54,9 @@ mod tests {
 
     #[test]
     fn explicit_cost_respected() {
-        let e = enrich(&json!({"type":"assistant","costUSD":0.01,"message":{"usage":{"input_tokens":5}}}));
+        let e = enrich(
+            &json!({"type":"assistant","costUSD":0.01,"message":{"usage":{"input_tokens":5}}}),
+        );
         assert_eq!(e.cost_usd, Some(0.01));
     }
 }

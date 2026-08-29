@@ -185,9 +185,7 @@ fn enrich_ui_message(raw: &Value) -> Enrichment {
         timestamp: raw
             .get("ts")
             .and_then(|v| v.as_i64())
-            .and_then(|ms| {
-                chrono::DateTime::from_timestamp_millis(ms).map(|d| d.to_rfc3339())
-            }),
+            .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms).map(|d| d.to_rfc3339())),
         cwd: None,
         git_branch: None,
         version: None,
@@ -225,7 +223,10 @@ fn extract_content_kinds(val: &Value) -> (Vec<String>, Vec<String>) {
 
 fn extract_usage(val: &Value) -> Option<TokenUsage> {
     let usage = val.get("usage")?;
-    let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let input = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let output = usage
         .get("output_tokens")
         .and_then(|v| v.as_u64())
@@ -300,7 +301,9 @@ mod tests {
 
     #[test]
     fn ui_message_say_text() {
-        let e = enrich(&json!({"ts":1750000000000i64,"type":"say","say":"text","text":"working on it"}));
+        let e = enrich(
+            &json!({"ts":1750000000000i64,"type":"say","say":"text","text":"working on it"}),
+        );
         assert_eq!(e.event_type, "assistant");
         assert!(e.summary.contains("working on it"));
         assert!(e.timestamp.is_some());

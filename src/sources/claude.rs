@@ -320,7 +320,9 @@ mod tests {
 
     #[test]
     fn explicit_cost_wins() {
-        let e = enrich(&json!({"type":"assistant","costUSD":0.5,"message":{"usage":{"input_tokens":10}}}));
+        let e = enrich(
+            &json!({"type":"assistant","costUSD":0.5,"message":{"usage":{"input_tokens":10}}}),
+        );
         assert_eq!(e.cost_usd, Some(0.5));
     }
 }
