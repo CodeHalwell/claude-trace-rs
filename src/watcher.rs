@@ -199,9 +199,7 @@ fn seed_dir(
                     } else if let Ok(meta) = std::fs::metadata(&path) {
                         // Skip to EOF without emitting events; just count lines
                         // so future events get correct line indices.
-                        let line_count = if root_source == Some(AgentSource::Cline)
-                            && crate::sources::cline::matches_file(&path)
-                        {
+                        let line_count = if crate::sources::cline::matches_file(&path) {
                             count_whole_file_events(&path).unwrap_or(0)
                         } else {
                             count_nonempty_lines(&path)
@@ -234,7 +232,9 @@ pub fn process_file(
     store: &SessionStore,
 ) {
     // Whole-file JSON array sources (Cline) are re-parsed on each change.
-    if root_source == Some(AgentSource::Cline) && crate::sources::cline::matches_file(path) {
+    // Routed on the filename rather than the root's source tag so Cline tasks
+    // under an auto-detect root are not line-parsed as JSONL.
+    if crate::sources::cline::matches_file(path) {
         process_whole_file(path, root_source, allowed_sources, states, tx, store);
         return;
     }

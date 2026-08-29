@@ -74,13 +74,23 @@ pub fn default_task_dirs() -> Vec<PathBuf> {
     out
 }
 
-/// File matcher for Cline roots: the two JSON array files per task. These are
-/// whole-file JSON arrays (not JSONL), so matching files are ingested via the
+/// File matcher for Cline tasks: the API conversation history. This is a
+/// whole-file JSON array (not JSONL), so matching files are ingested via the
 /// whole-file path in the loader/watcher.
+///
+/// `ui_messages.json` is deliberately **not** matched. It is the UI-layer view
+/// of the very same conversation, so ingesting both would record every Cline
+/// turn twice. Worse, both files sit in `tasks/<taskId>/` and so share a
+/// session id and a 0-based index space: their records collide on the
+/// `(session_id, line_index)` key, which means double-counted events without a
+/// database and silently dropped events with one (whichever file `read_dir`
+/// happened to yield second lost its records). The API history is the
+/// authoritative record — it alone carries token usage and cost — so it is the
+/// one we ingest.
 pub fn matches_file(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|n| n.to_str()),
-        Some("api_conversation_history.json") | Some("ui_messages.json")
+        Some("api_conversation_history.json")
     )
 }
 
@@ -275,7 +285,10 @@ mod tests {
     #[test]
     fn file_matcher() {
         assert!(matches_file(Path::new("/x/api_conversation_history.json")));
-        assert!(matches_file(Path::new("/x/ui_messages.json")));
+        // ui_messages.json is the UI view of the same conversation: ingesting
+        // it too would duplicate every turn and collide on (session_id,
+        // line_index) with the API history.
+        assert!(!matches_file(Path::new("/x/ui_messages.json")));
         assert!(!matches_file(Path::new("/x/other.json")));
         assert!(!matches_file(Path::new("/x/s.jsonl")));
     }

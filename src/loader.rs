@@ -64,9 +64,11 @@ fn ingest_inner(
 }
 
 fn ingest_file(path: &Path, root: &WatchRoot, store: &SessionStore) -> std::io::Result<usize> {
-    // Whole-file JSON array sources (Cline).
-    if root.source == Some(AgentSource::Cline) && sources::cline::matches_file(path) {
-        return ingest_whole_file(path, root.source, store);
+    // Whole-file JSON array sources (Cline). Routed on the filename rather than
+    // the root's source tag so Cline tasks under an auto-detect root are read
+    // as whole-file JSON instead of being line-parsed as JSONL.
+    if sources::cline::matches_file(path) {
+        return ingest_whole_file(path, root, store);
     }
 
     let session_fallback = path
@@ -106,7 +108,7 @@ fn ingest_file(path: &Path, root: &WatchRoot, store: &SessionStore) -> std::io::
 
 fn ingest_whole_file(
     path: &Path,
-    root_source: Option<AgentSource>,
+    root: &WatchRoot,
     store: &SessionStore,
 ) -> std::io::Result<usize> {
     let body = std::fs::read_to_string(path)?;
@@ -122,7 +124,10 @@ fn ingest_whole_file(
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_owned();
-    let source = root_source.unwrap_or(AgentSource::Cline);
+    let source = root.source.unwrap_or(AgentSource::Cline);
+    if !root.allows(source) {
+        return Ok(0);
+    }
     let mut n = 0;
     for (idx, val) in arr.into_iter().enumerate() {
         let ev = TraceEvent::from_raw_as(&session_fallback, idx, val, source);
@@ -283,5 +288,68 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+    #[test]
+    fn cline_task_with_both_files_is_not_double_counted() {
+        // Both files live in tasks/<taskId>/ and each enumerates from index 0,
+        // so ingesting both collided on (session_id, line_index): 4 events
+        // without a database, 2 with one (the loser silently dropped).
+        let dir = tempfile::tempdir().unwrap();
+        let task = dir.path().join("tasks").join("42");
+        std::fs::create_dir_all(&task).unwrap();
+        std::fs::write(
+            task.join("api_conversation_history.json"),
+            r#"[{"role":"user","content":"go"},{"role":"assistant","content":[{"type":"text","text":"ok"}]}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            task.join("ui_messages.json"),
+            r#"[{"ts":1,"type":"say","say":"text","text":"go"},{"ts":2,"type":"say","say":"text","text":"ok"}]"#,
+        )
+        .unwrap();
+
+        let store = SessionStore::new();
+        let n = ingest_roots(
+            &[WatchRoot {
+                path: dir.path().join("tasks"),
+                source: Some(AgentSource::Cline),
+                allowed_sources: None,
+            }],
+            &store,
+        )
+        .unwrap();
+
+        assert_eq!(n, 2, "the API history is ingested once, the UI log skipped");
+        let s = store.session("42").unwrap();
+        assert_eq!(s.event_count, 2);
+        assert_eq!(s.source, "cline");
+    }
+
+    #[test]
+    fn cline_task_is_ingested_under_an_auto_detect_root() {
+        // An installed service persists roots without a source tag; an untagged
+        // root previously admitted only *.jsonl, so Cline was never watched.
+        let dir = tempfile::tempdir().unwrap();
+        let task = dir.path().join("tasks").join("7");
+        std::fs::create_dir_all(&task).unwrap();
+        std::fs::write(
+            task.join("api_conversation_history.json"),
+            r#"[{"role":"user","content":"hello"}]"#,
+        )
+        .unwrap();
+
+        let store = SessionStore::new();
+        let n = ingest_roots(
+            &[WatchRoot {
+                path: dir.path().to_path_buf(),
+                source: None,
+                allowed_sources: None,
+            }],
+            &store,
+        )
+        .unwrap();
+
+        assert_eq!(n, 1);
+        assert_eq!(store.session("7").unwrap().source, "cline");
     }
 }

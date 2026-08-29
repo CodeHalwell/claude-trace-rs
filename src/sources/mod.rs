@@ -168,7 +168,12 @@ pub fn matches_file(root_source: Option<AgentSource>, path: &Path) -> bool {
     let ext = path.extension().and_then(|e| e.to_str());
     match root_source {
         Some(AgentSource::Cline) => cline::matches_file(path),
-        _ => ext == Some("jsonl"),
+        Some(_) => ext == Some("jsonl"),
+        // Auto-detect roots admit Cline's whole-file JSON as well as JSONL, so
+        // a Cline task directory reached through `--watch-root` (or through a
+        // service-installed root, which carries no source tag) is still
+        // ingested rather than silently ignored for having the wrong extension.
+        None => ext == Some("jsonl") || cline::matches_file(path),
     }
 }
 
@@ -450,5 +455,9 @@ mod tests {
         assert!(matches_file(Some(AgentSource::Cline), json));
         assert!(!matches_file(Some(AgentSource::Cline), jsonl));
         assert!(matches_file(None, jsonl));
+        // An auto-detect root (e.g. an installed service's untagged root) must
+        // still admit Cline's whole-file JSON, or Cline tasks are never seen.
+        assert!(matches_file(None, json));
+        assert!(!matches_file(Some(AgentSource::Codex), json));
     }
 }
