@@ -196,9 +196,14 @@ fn message_text(payload: &Value) -> String {
 /// Pull token usage out of a `token_count` info payload, trying the common
 /// shapes (`total_token_usage`, `last_token_usage`, flat fields).
 fn pick_usage(info: &Value) -> Option<TokenUsage> {
+    // `last_token_usage` first: SessionStats aggregates usage with `+=`, so it
+    // needs the per-event delta. `total_token_usage` is a running cumulative
+    // total for the session — summing those snapshots inflates tokens (and the
+    // cost derived from them) more and more as a session goes on. The total is
+    // kept only as a fallback for records that carry nothing else.
     let candidates = [
-        info.get("total_token_usage"),
         info.get("last_token_usage"),
+        info.get("total_token_usage"),
         Some(info),
     ];
     for c in candidates.into_iter().flatten() {
@@ -285,5 +290,31 @@ mod tests {
         let u = e.usage.expect("usage");
         assert_eq!(u.input, 1_000_000);
         assert!(e.cost_usd.unwrap() > 0.0);
+    }
+    #[test]
+    fn token_count_prefers_per_event_delta() {
+        let e = enrich(&json!({
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 5000, "output_tokens": 900},
+                "last_token_usage":  {"input_tokens": 120,  "output_tokens": 30}
+            }}
+        }));
+        let u = e.usage.expect("usage");
+        assert_eq!(u.input, 120);
+        assert_eq!(u.output, 30);
+    }
+
+    #[test]
+    fn token_count_falls_back_to_total_when_no_delta() {
+        let e = enrich(&json!({
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 42, "output_tokens": 7}
+            }}
+        }));
+        let u = e.usage.expect("usage");
+        assert_eq!(u.input, 42);
+        assert_eq!(u.output, 7);
     }
 }

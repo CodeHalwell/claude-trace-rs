@@ -524,4 +524,31 @@ mod tests {
         store.ingest(&ev);
         assert_eq!(store.session("s").unwrap().tool_result_count, 2);
     }
+    #[test]
+    fn store_aggregates_codex_token_deltas_not_cumulative_totals() {
+        // Codex `token_count` records carry a cumulative `total_token_usage`
+        // alongside the per-event `last_token_usage`. Aggregation is `+=`, so
+        // summing the cumulative snapshots would report 750 here instead of the
+        // true session total of 400.
+        let store = SessionStore::new();
+        for (i, (total, last)) in [(100u64, 100u64), (250, 150), (400, 150)]
+            .iter()
+            .enumerate()
+        {
+            let ev = TraceEvent::from_raw_as(
+                "s",
+                i,
+                json!({
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": {
+                        "total_token_usage": {"input_tokens": total, "output_tokens": 0},
+                        "last_token_usage":  {"input_tokens": last,  "output_tokens": 0}
+                    }}
+                }),
+                crate::sources::AgentSource::Codex,
+            );
+            store.ingest(&ev);
+        }
+        assert_eq!(store.session("s").unwrap().input_tokens, 400);
+    }
 }
