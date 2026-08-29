@@ -14,7 +14,7 @@ It is designed for the case where you have **many coding agents running in paral
 | **Codex CLI** | `~/.codex/sessions/**/rollout-*.jsonl` | JSONL | ✅ Full |
 | **GitHub Copilot CLI** | `~/.copilot/**` | JSONL | ✅ Best-effort |
 | **Kimi Code** | `~/.kimi/**` | JSONL (Claude-shaped) | ✅ Full |
-| **Cline** (VS Code ext) | `<globalStorage>/saoudrizwan.claude-dev/tasks/**` | Whole-file JSON arrays | ✅ Full |
+| **Cline** (VS Code ext) | `<globalStorage>/saoudrizwan.claude-dev/tasks/**/api_conversation_history.json` | Whole-file JSON array | ✅ Full |
 | **Cursor Agent** | `~/.cursor/projects`, `~/.cursor-agent` | JSONL | ✅ Best-effort |
 
 Every known directory that **exists** is watched automatically; point at
@@ -40,7 +40,7 @@ the auto-discovered roots entirely with `--no-default-roots`.
 - **Clean, uncluttered UI** with a calm light/dark theme, a single global search, a project-grouped session navigator, and three focused tabs (Live · Conversation · Analytics).
 - **Multi-session sidebar.** Sessions grouped by project (cwd), with a live-activity dot, agent badge, event/cost summary, last-seen time, and one-click bookmarking.
 - **Live event feed.** Real-time stream over WebSocket with type/text filters, pause/resume, and a slide-in JSON inspector.
-- **Conversation view.** Threaded transcript of user / assistant / tool messages — text, `thinking` blocks, `tool_use` invocations with inputs, `tool_result` payloads, and a **latency badge** (`⚡ 2.4s`) on each assistant turn. Codex `function_call` items and Cline `say`/`ask` records render natively.
+- **Conversation view.** Threaded transcript of user / assistant / tool messages — text, `thinking` blocks, `tool_use` invocations with inputs, `tool_result` payloads, and a **latency badge** (`⚡ 2.4s`) on each assistant turn. Codex `function_call` items render natively.
 - **Analytics tab.** Tokens, cache usage, estimated cost (public per-model pricing), top tool calls, cost-by-model, cost-by-agent, and an activity timeline.
 
 ### Training-dataset export
@@ -320,7 +320,10 @@ The database lives in your platform's data directory (override with `--db` or `C
 Events are de-duplicated by `(session_id, line_index)`, so restarting the watcher or running with `--backfill` never double-counts. Nothing ever leaves your machine.
 
 - Each parsed record is attributed to an **agent source** (path-based first, then content-sniffing) and normalised by that agent's adapter — so Claude Code, Codex, Copilot, Kimi, Cline, and Cursor sessions all land in one model.
-- Each parsed line is enriched with a `session_id` taken from the entry's session field where present — so two concurrent agent processes that happen to write to the same path stay cleanly separated. Cline sessions are keyed on their task directory.
+- Each parsed line is enriched with a `session_id` taken from the entry's session field where present — so two concurrent agent processes that happen to write to the same path stay cleanly separated. Cline sessions are keyed on their task directory: only
+  `api_conversation_history.json` is read, since `ui_messages.json` is the
+  UI-layer view of the same conversation and ingesting both would record every
+  turn twice under the same session and event key.
 - Tool names are extracted from embedded tool-call blocks; tokens from input/output/cache fields; cost estimated per-model (per-agent pricing families) where the agent doesn't report an explicit cost.
 - A bounded in-memory `SessionStore` retains per-session aggregates plus a 5,000-event ring buffer per session so reconnecting dashboards (and the live API) get an instant snapshot.
 - The `export` CLI subcommand sidesteps the watcher entirely — it walks the watch root once via `loader.rs`, then emits the chosen format and exits.

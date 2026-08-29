@@ -185,7 +185,16 @@ async fn main() -> anyhow::Result<()> {
     let roots = resolve_roots(&cli.watch_root, forced_source, only, cli.no_default_roots);
 
     match cli.cmd.unwrap_or(Cmd::Serve(ServeArgs::default())) {
-        Cmd::Service(args) => run_service(&roots, args),
+        // Service install persists the user's CLI intent rather than the
+        // resolved roots, so `--source` survives and default-root discovery
+        // re-runs at service start-up.
+        Cmd::Service(args) => run_service(
+            &cli.watch_root,
+            cli.source.as_deref(),
+            cli.only.as_deref(),
+            cli.no_default_roots,
+            args,
+        ),
         Cmd::Serve(args) => run_serve(roots, args).await,
         Cmd::Export(args) => run_export(&roots, args),
         Cmd::List => run_list(&roots),
@@ -416,27 +425,36 @@ fn run_export(roots: &[sources::WatchRoot], args: ExportArgs) -> anyhow::Result<
     Ok(())
 }
 
-fn run_service(roots: &[sources::WatchRoot], args: ServiceArgs) -> anyhow::Result<()> {
+fn run_service(
+    explicit_roots: &[String],
+    source: Option<&str>,
+    only: Option<&[String]>,
+    no_default_roots: bool,
+    args: ServiceArgs,
+) -> anyhow::Result<()> {
     match args.action {
         ServiceAction::Install(opts) => {
             let exe = std::env::current_exe()
                 .context("could not determine the path to the running executable")?;
-            // Persist the watch roots as absolute paths so the service is
-            // independent of the directory it was installed from.
-            let watch_roots: Vec<String> = roots
+            // Persist the explicitly requested roots as absolute paths so the
+            // service is independent of the directory it was installed from.
+            // Auto-discovered roots are deliberately not baked in: the service
+            // rediscovers them at start-up, so they stay correctly source-tagged
+            // and a newly installed agent is picked up without reinstalling.
+            let watch_roots: Vec<String> = explicit_roots
                 .iter()
                 .map(|r| {
-                    r.path
-                        .canonicalize()
-                        .unwrap_or_else(|_| r.path.clone())
-                        .to_string_lossy()
-                        .to_string()
+                    let p = expand_tilde(r);
+                    p.canonicalize().unwrap_or(p).to_string_lossy().to_string()
                 })
                 .collect();
             let cfg = service::ServiceConfig {
                 exe,
                 port: opts.port,
                 watch_roots,
+                source: source.map(str::to_owned),
+                only: only.map(<[String]>::to_vec).unwrap_or_default(),
+                no_default_roots,
                 db: opts
                     .db
                     .map(|d| expand_tilde(&d).to_string_lossy().to_string()),
