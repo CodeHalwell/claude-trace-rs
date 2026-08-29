@@ -87,6 +87,25 @@ impl AgentSource {
         }
     }
 
+    /// Model family to assume when a record carries no model name of its own.
+    ///
+    /// [`pricing_for`] falls back to Claude Sonnet rates for an unrecognised
+    /// model, which silently misprices other agents: Codex `token_count`
+    /// records, for instance, carry usage but usually no model (it is stated
+    /// once on a separate `turn_context` record), so a GPT-5 session was billed
+    /// at Sonnet's $3/$15 per Mtok. `None` means the Sonnet default is a
+    /// reasonable guess for that agent.
+    pub fn default_model_hint(&self) -> Option<&'static str> {
+        match self {
+            AgentSource::Codex => Some("gpt-5"),
+            AgentSource::Copilot => Some("gpt-4"),
+            AgentSource::Kimi => Some("kimi"),
+            // Cline and Cursor drive a mix of providers and most often Claude
+            // models, so the Sonnet default is left in place.
+            _ => None,
+        }
+    }
+
     /// All known (non-Unknown) sources — used for default root discovery.
     pub fn all_known() -> &'static [AgentSource] {
         &[
@@ -331,6 +350,17 @@ pub fn pricing_for(model: Option<&str>) -> Pricing {
             cache_creation_per_mtok: 3.75,
         }
     }
+}
+
+/// Compute an estimated USD cost for `source`, assuming that agent's usual
+/// model family when the record itself names no model. See
+/// [`AgentSource::default_model_hint`].
+pub fn estimate_cost_for(
+    source: AgentSource,
+    model: Option<&str>,
+    u: &crate::event::TokenUsage,
+) -> f64 {
+    estimate_cost(model.or_else(|| source.default_model_hint()), u)
 }
 
 /// Compute an estimated USD cost for a token usage breakdown.

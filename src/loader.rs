@@ -10,6 +10,8 @@ use std::{
     path::Path,
 };
 
+use tracing::warn;
+
 use crate::{
     event::TraceEvent,
     sources::{self, AgentSource, WatchRoot},
@@ -112,12 +114,21 @@ fn ingest_whole_file(
     store: &SessionStore,
 ) -> std::io::Result<usize> {
     let body = std::fs::read_to_string(path)?;
-    let arr: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("failed to parse {} as JSON array: {e}", path.display()),
-        )
-    })?;
+    // Cline rewrites this file in place as a task progresses, so reading it
+    // mid-write is expected rather than exceptional. Warn and skip the one
+    // file: propagating the error would abort the whole walk and lose every
+    // other session in the export, and silently treating it as empty (the
+    // previous `unwrap_or_default`) gave no indication anything was missed.
+    let arr: Vec<serde_json::Value> = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "Skipping {}: could not parse as a JSON array: {e}",
+                path.display()
+            );
+            return Ok(0);
+        }
+    };
     let session_fallback = path
         .parent()
         .and_then(|p| p.file_name())
@@ -271,23 +282,38 @@ mod tests {
     }
 
     #[test]
-    fn invalid_cline_whole_file_returns_error() {
+    fn invalid_cline_whole_file_is_skipped_without_aborting_the_walk() {
+        // Cline rewrites this file in place, so catching one mid-write is
+        // routine; it must not take the rest of the export down with it.
         let dir = tempfile::tempdir().unwrap();
-        let task = dir.path().join("tasks").join("42");
-        std::fs::create_dir_all(&task).unwrap();
-        std::fs::write(task.join("api_conversation_history.json"), "{not json").unwrap();
+        let tasks = dir.path().join("tasks");
+        std::fs::create_dir_all(tasks.join("42")).unwrap();
+        std::fs::create_dir_all(tasks.join("43")).unwrap();
+        std::fs::write(
+            tasks.join("42").join("api_conversation_history.json"),
+            "{not json",
+        )
+        .unwrap();
+        std::fs::write(
+            tasks.join("43").join("api_conversation_history.json"),
+            r#"[{"role":"user","content":"fine"}]"#,
+        )
+        .unwrap();
 
-        let err = ingest_roots(
+        let store = SessionStore::new();
+        let n = ingest_roots(
             &[WatchRoot {
-                path: dir.path().join("tasks"),
+                path: tasks,
                 source: Some(AgentSource::Cline),
                 allowed_sources: None,
             }],
-            &SessionStore::new(),
+            &store,
         )
-        .unwrap_err();
+        .expect("a half-written file must not fail the whole ingest");
 
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(n, 1, "the intact task is still ingested");
+        assert!(store.session("43").is_some());
+        assert!(store.session("42").is_none());
     }
     #[test]
     fn cline_task_with_both_files_is_not_double_counted() {

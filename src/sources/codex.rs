@@ -18,7 +18,7 @@
 use serde_json::Value;
 
 use crate::event::TokenUsage;
-use crate::sources::{estimate_cost, truncate, Enrichment};
+use crate::sources::{estimate_cost_for, truncate, AgentSource, Enrichment};
 
 /// Normalise one Codex rollout record.
 pub fn enrich(raw: &Value) -> Enrichment {
@@ -78,7 +78,7 @@ pub fn enrich(raw: &Value) -> Enrichment {
     // Estimated cost when we have usage but no explicit figure.
     if e.cost_usd.is_none() {
         if let Some(u) = &e.usage {
-            e.cost_usd = Some(estimate_cost(e.model.as_deref(), u));
+            e.cost_usd = Some(estimate_cost_for(AgentSource::Codex, e.model.as_deref(), u));
         }
     }
     e
@@ -316,5 +316,23 @@ mod tests {
         let u = e.usage.expect("usage");
         assert_eq!(u.input, 42);
         assert_eq!(u.output, 7);
+    }
+    #[test]
+    fn unnamed_codex_model_is_priced_as_gpt_not_sonnet() {
+        // token_count records carry usage but usually no model — the model is
+        // stated once on a separate turn_context record. Falling through to the
+        // pricing table's Claude Sonnet default billed GPT-5 usage at $3/Mtok.
+        let e = enrich(&json!({
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {
+                "last_token_usage": {"input_tokens": 1_000_000, "output_tokens": 0}
+            }}
+        }));
+        assert!(e.model.is_none());
+        let c = e.cost_usd.expect("cost");
+        assert!(
+            (c - 1.25).abs() < 0.001,
+            "expected GPT-5 input pricing, got {c}"
+        );
     }
 }

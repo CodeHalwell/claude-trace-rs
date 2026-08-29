@@ -13,7 +13,7 @@
 use serde_json::Value;
 
 use crate::event::TokenUsage;
-use crate::sources::{estimate_cost, truncate, Enrichment};
+use crate::sources::{estimate_cost_for, truncate, AgentSource, Enrichment};
 
 /// Normalise one Copilot CLI record.
 pub fn enrich(raw: &Value) -> Enrichment {
@@ -86,7 +86,7 @@ pub fn enrich(raw: &Value) -> Enrichment {
         .or_else(|| {
             e.usage
                 .as_ref()
-                .map(|u| estimate_cost(e.model.as_deref(), u))
+                .map(|u| estimate_cost_for(AgentSource::Copilot, e.model.as_deref(), u))
         });
 
     e.summary = summarise(raw, &e.event_type, &e.tool_uses);

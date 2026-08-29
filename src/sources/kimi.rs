@@ -8,7 +8,7 @@
 
 use serde_json::Value;
 
-use crate::sources::{estimate_cost, Enrichment};
+use crate::sources::{estimate_cost_for, AgentSource, Enrichment};
 
 /// Normalise one Kimi Code record.
 pub fn enrich(raw: &Value) -> Enrichment {
@@ -23,7 +23,7 @@ pub fn enrich(raw: &Value) -> Enrichment {
         .and_then(|v| v.as_f64());
     e.cost_usd = match (explicit, &e.usage) {
         (Some(c), _) => Some(c),
-        (None, Some(u)) => Some(estimate_cost(e.model.as_deref(), u)),
+        (None, Some(u)) => Some(estimate_cost_for(AgentSource::Kimi, e.model.as_deref(), u)),
         (None, None) => None,
     };
     e
