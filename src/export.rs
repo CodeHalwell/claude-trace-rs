@@ -121,12 +121,27 @@ fn render_messages_line(sess: &SessionExport<'_>) -> String {
                 "timestamp": ev.timestamp,
                 "usage": ev.usage,
             })),
+            // Agents that emit tool calls as standalone records (Codex) rather
+            // than as blocks inside a turn. Anthropic's convention puts a
+            // tool_use on the assistant side and its result on the user side.
+            "tool_use" => Some(json!({
+                "role": "assistant",
+                "content": extract_message_content(&ev.entry),
+                "model": ev.model,
+                "timestamp": ev.timestamp,
+            })),
+            "tool_result" => Some(json!({
+                "role": "user",
+                "content": extract_message_content(&ev.entry),
+                "timestamp": ev.timestamp,
+            })),
             _ => None,
         })
         .collect();
 
     let record = json!({
         "session_id": sess.stats.id,
+        "source": sess.stats.source,
         "model": sess.stats.model,
         "cwd": sess.stats.cwd,
         "git_branch": sess.stats.git_branch,
@@ -149,12 +164,18 @@ fn render_openai_line(sess: &SessionExport<'_>) -> String {
         match ev.event_type.as_str() {
             "user" => push_openai_user(&mut messages, &ev.entry),
             "assistant" => push_openai_assistant(&mut messages, ev),
+            // Codex records a tool call as its own rollout item rather than as
+            // a content block inside an assistant turn; route it through the
+            // same writers so those turns survive the export.
+            "tool_use" => push_openai_assistant(&mut messages, ev),
+            "tool_result" => push_openai_user(&mut messages, &ev.entry),
             _ => {}
         }
     }
 
     let record = json!({
         "session_id": sess.stats.id,
+        "source": sess.stats.source,
         "model": sess.stats.model,
         "messages": messages,
         "metadata": metadata_object(sess.stats),
@@ -166,10 +187,10 @@ fn render_openai_line(sess: &SessionExport<'_>) -> String {
 }
 
 fn push_openai_user(messages: &mut Vec<Value>, entry: &Value) {
-    let content = entry
-        .pointer("/message/content")
-        .or_else(|| entry.get("content"));
-    let Some(content) = content else { return };
+    let Some(content) = canonical_content(entry) else {
+        return;
+    };
+    let content = &content;
 
     // Plain-string user message.
     if let Some(s) = content.as_str() {
@@ -210,8 +231,10 @@ fn push_openai_user(messages: &mut Vec<Value>, entry: &Value) {
 }
 
 fn push_openai_assistant(messages: &mut Vec<Value>, ev: &TraceEvent) {
-    let content = ev.entry.pointer("/message/content");
-    let Some(content) = content else { return };
+    let Some(content) = canonical_content(&ev.entry) else {
+        return;
+    };
+    let content = &content;
 
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
@@ -288,11 +311,27 @@ fn render_sharegpt_line(sess: &SessionExport<'_>) -> String {
                     }
                 }
             }
+            // Standalone tool records (Codex).
+            "tool_use" => {
+                if let Some(tool_uses) = extract_tool_uses_text(&ev.entry) {
+                    if !tool_uses.is_empty() {
+                        conversations.push(json!({ "from": "function_call", "value": tool_uses }));
+                    }
+                }
+            }
+            "tool_result" => {
+                if let Some(tr) = extract_tool_results_text(&ev.entry) {
+                    if !tr.is_empty() {
+                        conversations.push(json!({ "from": "tool", "value": tr }));
+                    }
+                }
+            }
             _ => {}
         }
     }
     let record = json!({
         "id": sess.stats.id,
+        "source": sess.stats.source,
         "title": sess.stats.title,
         "model": sess.stats.model,
         "conversations": conversations,
@@ -308,7 +347,20 @@ fn render_sharegpt_line(sess: &SessionExport<'_>) -> String {
 fn render_raw_jsonl(sess: &SessionExport<'_>) -> String {
     let mut out = String::with_capacity(sess.events.len() * 256);
     for ev in sess.events {
-        if let Ok(s) = serde_json::to_string(&ev.entry) {
+        // Attach the source so mixed-agent datasets stay attributable even
+        // when the raw record itself has no agent-identifying field. Prefer
+        // the session's attributed source; fall back to the event's own.
+        let mut entry = ev.entry.clone();
+        let src = if ev.source.is_empty() || ev.source == "unknown" {
+            sess.stats.source.as_str()
+        } else {
+            ev.source.as_str()
+        };
+        if let Some(obj) = entry.as_object_mut() {
+            obj.entry("source".to_owned())
+                .or_insert_with(|| Value::String(src.to_owned()));
+        }
+        if let Ok(s) = serde_json::to_string(&entry) {
             out.push_str(&s);
             out.push('\n');
         }
@@ -349,12 +401,7 @@ fn render_markdown(sess: &SessionExport<'_>) -> String {
             "user" => {
                 let _ = writeln!(out, "## 👤 User");
                 let _ = writeln!(out);
-                write_content_md(
-                    &mut out,
-                    ev.entry
-                        .pointer("/message/content")
-                        .or_else(|| ev.entry.get("content")),
-                );
+                write_content_md(&mut out, canonical_content(&ev.entry).as_ref());
                 let _ = writeln!(out);
             }
             "assistant" => {
@@ -363,7 +410,12 @@ fn render_markdown(sess: &SessionExport<'_>) -> String {
                     let _ = writeln!(out, "*{}*", t);
                 }
                 let _ = writeln!(out);
-                write_content_md(&mut out, ev.entry.pointer("/message/content"));
+                write_content_md(&mut out, canonical_content(&ev.entry).as_ref());
+                let _ = writeln!(out);
+            }
+            // Standalone tool records (Codex).
+            "tool_use" | "tool_result" => {
+                write_content_md(&mut out, canonical_content(&ev.entry).as_ref());
                 let _ = writeln!(out);
             }
             "summary" => {
@@ -431,20 +483,84 @@ fn write_content_md(out: &mut String, content: Option<&Value>) {
 
 // -- Helpers -------------------------------------------------------------------
 
-fn extract_message_content(entry: &Value) -> Value {
+/// Canonical Anthropic-shaped content blocks for an entry, normalised across
+/// agent formats so every exporter below sees one vocabulary.
+///
+/// Claude Code, Cline and Kimi already write the Anthropic shape, under
+/// `/message/content` or a top-level `content`. Codex rollout records instead
+/// nest a Responses-API item under `/payload`, using different block types
+/// (`input_text` / `output_text`) and expressing tool calls as standalone
+/// `function_call` / `function_call_output` items rather than content blocks.
+/// Without this translation the exporters find nothing at the paths they know
+/// and Codex sessions export as `content: null` or are dropped entirely.
+fn canonical_content(entry: &Value) -> Option<Value> {
     if let Some(c) = entry.pointer("/message/content") {
-        return c.clone();
+        return Some(c.clone());
     }
     if let Some(c) = entry.get("content") {
-        return c.clone();
+        return Some(c.clone());
     }
-    Value::Null
+
+    // Codex: {"type":"response_item","payload":{…}}
+    let payload = entry.get("payload")?;
+    match payload.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "message" => {
+            let arr = payload.get("content")?.as_array()?;
+            let blocks: Vec<Value> = arr
+                .iter()
+                .filter_map(|b| {
+                    let kind = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match kind {
+                        "input_text" | "output_text" | "text" => {
+                            let t = b.get("text").and_then(|v| v.as_str())?;
+                            Some(json!({ "type": "text", "text": t }))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            Some(Value::Array(blocks))
+        }
+        "function_call" | "custom_tool_call" => {
+            let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let id = payload
+                .get("call_id")
+                .or_else(|| payload.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // Codex serialises call arguments as a JSON string; re-parse so the
+            // exported `input` is structured like every other agent's.
+            let input = match payload.get("arguments") {
+                Some(Value::String(s)) => {
+                    serde_json::from_str::<Value>(s).unwrap_or_else(|_| Value::String(s.clone()))
+                }
+                Some(other) => other.clone(),
+                None => json!({}),
+            };
+            Some(json!([{ "type": "tool_use", "id": id, "name": name, "input": input }]))
+        }
+        "function_call_output" | "custom_tool_call_output" => {
+            let id = payload
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let body = match payload.get("output") {
+                Some(Value::String(s)) => Value::String(s.clone()),
+                Some(other) => Value::String(other.to_string()),
+                None => Value::String(String::new()),
+            };
+            Some(json!([{ "type": "tool_result", "tool_use_id": id, "content": body }]))
+        }
+        _ => None,
+    }
+}
+
+fn extract_message_content(entry: &Value) -> Value {
+    canonical_content(entry).unwrap_or(Value::Null)
 }
 
 fn extract_plain_text(entry: &Value) -> Option<String> {
-    let c = entry
-        .pointer("/message/content")
-        .or_else(|| entry.get("content"))?;
+    let c = canonical_content(entry)?;
     if let Some(s) = c.as_str() {
         return Some(s.to_owned());
     }
@@ -463,7 +579,8 @@ fn extract_plain_text(entry: &Value) -> Option<String> {
 }
 
 fn extract_tool_uses_text(entry: &Value) -> Option<String> {
-    let arr = entry.pointer("/message/content")?.as_array()?;
+    let c = canonical_content(entry)?;
+    let arr = c.as_array()?;
     let mut out = Vec::new();
     for b in arr {
         if b.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
@@ -476,9 +593,7 @@ fn extract_tool_uses_text(entry: &Value) -> Option<String> {
 }
 
 fn extract_tool_results_text(entry: &Value) -> Option<String> {
-    let c = entry
-        .pointer("/message/content")
-        .or_else(|| entry.get("content"))?;
+    let c = canonical_content(entry)?;
     let arr = c.as_array()?;
     let mut parts = Vec::new();
     for b in arr {
@@ -496,6 +611,7 @@ fn extract_tool_results_text(entry: &Value) -> Option<String> {
 
 fn metadata_object(s: &SessionStats) -> Value {
     json!({
+        "source": s.source,
         "input_tokens": s.input_tokens,
         "output_tokens": s.output_tokens,
         "cache_read_tokens": s.cache_read_tokens,
@@ -754,6 +870,39 @@ mod tests {
     }
 
     #[test]
+    fn raw_jsonl_tags_source_for_mixed_agents() {
+        let s = stats();
+        let events = vec![ev("user", json!({ "content": "hi" }))];
+        let out = render_session(
+            &SessionExport {
+                stats: &s,
+                events: &events,
+            },
+            ExportFormat::Jsonl,
+        );
+        // The raw record gains a top-level "source" for attribution.
+        let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(line["source"], "claude-code");
+    }
+
+    #[test]
+    fn messages_record_carries_source() {
+        let mut s = stats();
+        s.source = "codex".to_owned();
+        let events = vec![ev("user", json!({ "content": "hi" }))];
+        let out = render_session(
+            &SessionExport {
+                stats: &s,
+                events: &events,
+            },
+            ExportFormat::Messages,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(parsed["source"], "codex");
+        assert_eq!(parsed["metadata"]["source"], "codex");
+    }
+
+    #[test]
     fn render_many_concatenates_sessions() {
         let s1 = stats();
         let mut s2 = stats();
@@ -772,5 +921,108 @@ mod tests {
         ];
         let out = render_many(&sessions, ExportFormat::Messages);
         assert_eq!(out.lines().count(), 2);
+    }
+    /// A Codex rollout session: content lives under `/payload/content` with
+    /// Responses-API block types, and tool calls are standalone records. Before
+    /// normalisation every exporter silently produced empty output for these.
+    fn codex_session() -> (SessionStats, Vec<TraceEvent>) {
+        let mut st = stats();
+        st.source = "codex".to_owned();
+        let mk = |raw: serde_json::Value| {
+            TraceEvent::from_raw_as("s", 0, raw, crate::sources::AgentSource::Codex)
+        };
+        let events = vec![
+            mk(json!({"type":"response_item","payload":{
+                "type":"message","role":"user",
+                "content":[{"type":"input_text","text":"list the files"}]}})),
+            mk(json!({"type":"response_item","payload":{
+                "type":"function_call","name":"shell","call_id":"c1",
+                "arguments":"{\"command\":\"ls\"}"}})),
+            mk(json!({"type":"response_item","payload":{
+                "type":"function_call_output","call_id":"c1","output":"Cargo.toml"}})),
+            mk(json!({"type":"response_item","payload":{
+                "type":"message","role":"assistant",
+                "content":[{"type":"output_text","text":"There is one file."}]}})),
+        ];
+        (st, events)
+    }
+
+    #[test]
+    fn codex_messages_export_carries_content() {
+        let (st, events) = codex_session();
+        let out = render_session(
+            &SessionExport {
+                stats: &st,
+                events: &events,
+            },
+            ExportFormat::Messages,
+        );
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4, "all four turns exported: {msgs:?}");
+        assert_eq!(msgs[0]["content"][0]["text"], "list the files");
+        assert_eq!(msgs[1]["content"][0]["type"], "tool_use");
+        assert_eq!(msgs[1]["content"][0]["name"], "shell");
+        // Codex serialises arguments as a JSON string; it is re-parsed.
+        assert_eq!(msgs[1]["content"][0]["input"]["command"], "ls");
+        assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[3]["content"][0]["text"], "There is one file.");
+    }
+
+    #[test]
+    fn codex_openai_export_carries_content() {
+        let (st, events) = codex_session();
+        let out = render_session(
+            &SessionExport {
+                stats: &st,
+                events: &events,
+            },
+            ExportFormat::Openai,
+        );
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "list the files");
+        let call = msgs
+            .iter()
+            .find(|m| m.get("tool_calls").is_some())
+            .expect("a tool_calls message");
+        assert_eq!(call["tool_calls"][0]["function"]["name"], "shell");
+        assert!(
+            msgs.iter().any(|m| m["content"] == "There is one file."),
+            "assistant text missing: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn codex_sharegpt_and_markdown_exports_are_not_empty() {
+        let (st, events) = codex_session();
+        let sg = render_session(
+            &SessionExport {
+                stats: &st,
+                events: &events,
+            },
+            ExportFormat::Sharegpt,
+        );
+        let v: serde_json::Value = serde_json::from_str(sg.trim()).unwrap();
+        let conv = v["conversations"].as_array().unwrap();
+        assert!(
+            conv.iter().any(|c| c["value"] == "list the files"),
+            "human turn missing: {conv:?}"
+        );
+        assert!(
+            conv.iter().any(|c| c["from"] == "function_call"),
+            "tool call missing: {conv:?}"
+        );
+
+        let md = render_session(
+            &SessionExport {
+                stats: &st,
+                events: &events,
+            },
+            ExportFormat::Markdown,
+        );
+        assert!(md.contains("list the files"), "markdown missing user text");
+        assert!(md.contains("There is one file."), "markdown missing reply");
     }
 }

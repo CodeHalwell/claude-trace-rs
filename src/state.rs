@@ -15,9 +15,12 @@ pub const PER_SESSION_RECENT_CAP: usize = 5_000;
 pub const GLOBAL_RECENT_CAP: usize = 20_000;
 
 /// Per-session aggregated stats and a bounded buffer of recent events.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStats {
     pub id: String,
+    /// Which coding agent produced this session (kebab-case id).
+    #[serde(default = "default_session_source")]
+    pub source: String,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
     pub version: Option<String>,
@@ -57,10 +60,55 @@ pub struct SessionStats {
     pub tags: Vec<String>,
 }
 
+/// Backward-compat default: sessions recorded before the multi-agent upgrade
+/// were all Claude Code sessions.
+fn default_session_source() -> String {
+    crate::sources::AgentSource::ClaudeCode.as_str().to_owned()
+}
+
+impl Default for SessionStats {
+    fn default() -> Self {
+        // `source` defaults to claude-code (not empty) so in-memory and
+        // test-constructed sessions match the serde/DB default.
+        Self {
+            id: String::new(),
+            source: default_session_source(),
+            cwd: None,
+            git_branch: None,
+            version: None,
+            model: None,
+            first_seen: None,
+            last_seen: None,
+            last_entry_timestamp: None,
+            event_count: 0,
+            user_count: 0,
+            assistant_count: 0,
+            tool_use_count: 0,
+            tool_result_count: 0,
+            system_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cost_usd: 0.0,
+            tool_counts: HashMap::new(),
+            title: None,
+            bookmarked: false,
+            tags: Vec::new(),
+        }
+    }
+}
+
 impl SessionStats {
     fn ingest(&mut self, ev: &TraceEvent) {
         if self.id.is_empty() {
             self.id = ev.session_id.clone();
+        }
+        // Adopt the event's source on the first event so freshly created stats
+        // blocks do not keep the legacy claude-code default when the session is
+        // actually attributed to some other source (including "unknown").
+        if self.event_count == 0 {
+            self.source = ev.source.clone();
         }
         if self.first_seen.is_none() {
             self.first_seen = Some(ev.observed_at.clone());
@@ -91,13 +139,27 @@ impl SessionStats {
             "user" => self.user_count += 1,
             "assistant" => self.assistant_count += 1,
             "tool_use" => {
-                self.tool_use_count += 1;
-                // Top-level tool_use entries carry the name at the root.
-                if let Some(name) = ev.entry.get("name").and_then(|v| v.as_str()) {
-                    *self.tool_counts.entry(name.to_owned()).or_insert(0) += 1;
+                // Top-level tool_use entries whose adapter left `tool_uses`
+                // empty (Claude Code) carry the name at the record root.
+                // Adapters that already populated `tool_uses` (Codex, …) are
+                // counted by the loop below, so skip here to avoid double
+                // counting.
+                if ev.tool_uses.is_empty() {
+                    self.tool_use_count += 1;
+                    if let Some(name) = ev.entry.get("name").and_then(|v| v.as_str()) {
+                        *self.tool_counts.entry(name.to_owned()).or_insert(0) += 1;
+                    }
                 }
             }
-            "tool_result" => self.tool_result_count += 1,
+            "tool_result" => {
+                // Mirror of the `tool_use` guard above: adapters that already
+                // populated `tool_results` (Codex, Cursor, Copilot) are counted
+                // by the loop below, so only count the record itself when it
+                // carries no explicit result ids.
+                if ev.tool_results.is_empty() {
+                    self.tool_result_count += 1;
+                }
+            }
             "system" => self.system_count += 1,
             _ => {}
         }
@@ -361,6 +423,25 @@ mod tests {
     }
 
     #[test]
+    fn store_adopts_unknown_source_on_first_event() {
+        let store = SessionStore::new();
+        let ev = TraceEvent::from_raw_as(
+            "fallback",
+            0,
+            json!({
+                "type": "user",
+                "sessionId": "u1",
+                "content": "hi"
+            }),
+            crate::sources::AgentSource::Unknown,
+        );
+
+        store.ingest(&ev);
+
+        assert_eq!(store.session("u1").unwrap().source, "unknown");
+    }
+
+    #[test]
     fn store_counts_top_level_tool_use_names() {
         let store = SessionStore::new();
         store.ingest(&ev("a", "tool_use", json!({ "name": "WebFetch" })));
@@ -401,5 +482,73 @@ mod tests {
         let snap = store.snapshot(10);
         assert_eq!(snap.sessions[0].id, "new");
         assert_eq!(snap.sessions[1].id, "old");
+    }
+    #[test]
+    fn store_counts_tool_results_once_per_record() {
+        // A Codex `function_call_output` sets both `event_type = "tool_result"`
+        // and `tool_results = ["c1"]`; it must count as one result, not two.
+        let store = SessionStore::new();
+        let ev = TraceEvent::from_raw_as(
+            "s",
+            0,
+            json!({
+                "type": "response_item",
+                "payload": {"type": "function_call_output", "call_id": "c1", "output": "done"}
+            }),
+            crate::sources::AgentSource::Codex,
+        );
+        assert_eq!(ev.event_type, "tool_result");
+        assert_eq!(ev.tool_results, vec!["c1"]);
+
+        store.ingest(&ev);
+        assert_eq!(store.session("s").unwrap().tool_result_count, 1);
+    }
+
+    #[test]
+    fn store_counts_claude_tool_result_blocks() {
+        // Claude Code carries tool results as blocks inside a `user` record —
+        // the guard above must not stop those from being counted.
+        let store = SessionStore::new();
+        let ev = TraceEvent::from_raw_as(
+            "s",
+            0,
+            json!({
+                "type": "user",
+                "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "a"},
+                    {"type": "tool_result", "tool_use_id": "b"}
+                ]}
+            }),
+            crate::sources::AgentSource::ClaudeCode,
+        );
+        store.ingest(&ev);
+        assert_eq!(store.session("s").unwrap().tool_result_count, 2);
+    }
+    #[test]
+    fn store_aggregates_codex_token_deltas_not_cumulative_totals() {
+        // Codex `token_count` records carry a cumulative `total_token_usage`
+        // alongside the per-event `last_token_usage`. Aggregation is `+=`, so
+        // summing the cumulative snapshots would report 750 here instead of the
+        // true session total of 400.
+        let store = SessionStore::new();
+        for (i, (total, last)) in [(100u64, 100u64), (250, 150), (400, 150)]
+            .iter()
+            .enumerate()
+        {
+            let ev = TraceEvent::from_raw_as(
+                "s",
+                i,
+                json!({
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": {
+                        "total_token_usage": {"input_tokens": total, "output_tokens": 0},
+                        "last_token_usage":  {"input_tokens": last,  "output_tokens": 0}
+                    }}
+                }),
+                crate::sources::AgentSource::Codex,
+            );
+            store.ingest(&ev);
+        }
+        assert_eq!(store.session("s").unwrap().input_tokens, 400);
     }
 }

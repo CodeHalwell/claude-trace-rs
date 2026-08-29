@@ -5,6 +5,7 @@ mod export;
 mod loader;
 mod server;
 mod service;
+mod sources;
 mod state;
 mod watcher;
 
@@ -14,24 +15,40 @@ use std::path::PathBuf;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-/// Claude Trace — local-first real-time observability for Claude Code sessions.
+/// Agent Trace — local-first real-time observability for terminal coding
+/// agents (Claude Code, Codex CLI, Copilot CLI, Kimi Code, Cline, Cursor).
 ///
-/// Watches one or more directories of Claude Code JSONL session logs, parses
-/// new events as they appear, and either serves a built-in browser dashboard
-/// (`serve`, the default) or dumps them to disk in a training-friendly format
+/// Watches one or more directories of agent session logs, parses new events
+/// as they appear, and either serves a built-in browser dashboard (`serve`,
+/// the default) or dumps them to disk in a training-friendly format
 /// (`export`).
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None, arg_required_else_help = false)]
 struct Cli {
-    /// Root directory to watch / read Claude Code JSONL session files from.
+    /// Root directory to watch / read agent trace files from. Repeatable.
+    /// When omitted (and --no-default-roots is not set), every known agent
+    /// log directory that exists is watched.
     #[arg(
         short = 'w',
         long,
         env = "CLAUDE_TRACE_WATCH_ROOT",
-        default_value = "~/.claude/projects",
+        value_delimiter = ',',
         global = true
     )]
-    watch_root: String,
+    watch_root: Vec<String>,
+
+    /// Force the agent source for `--watch-root` directories
+    /// (claude|codex|copilot|kimi|cline|cursor). Auto-detected when omitted.
+    #[arg(long, env = "CLAUDE_TRACE_SOURCE", global = true)]
+    source: Option<String>,
+
+    /// Only trace these agent sources (comma-separated).
+    #[arg(long, value_delimiter = ',', global = true)]
+    only: Option<Vec<String>>,
+
+    /// Do not auto-add known agent log directories as watch roots.
+    #[arg(long, global = true)]
+    no_default_roots: bool,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -133,6 +150,10 @@ struct ExportArgs {
     #[arg(long, value_delimiter = ',')]
     session: Vec<String>,
 
+    /// Only export sessions from these agent sources (comma-separated).
+    #[arg(long = "from", value_delimiter = ',')]
+    from_source: Option<Vec<String>>,
+
     /// Skip sessions whose event count is below this threshold.
     #[arg(long, default_value_t = 1)]
     min_events: usize,
@@ -148,28 +169,124 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let watch_root = expand_tilde(&cli.watch_root);
+    let forced_source = cli.source.as_deref().and_then(|s| {
+        let p = sources::AgentSource::parse(s);
+        if p.is_none() {
+            warn!("Unrecognised --source '{s}'; falling back to auto-detect");
+        }
+        p
+    });
+    let only: Option<std::collections::HashSet<sources::AgentSource>> =
+        cli.only.as_ref().map(|v| {
+            v.iter()
+                .filter_map(|s| sources::AgentSource::parse(s))
+                .collect()
+        });
+    let roots = resolve_roots(&cli.watch_root, forced_source, only, cli.no_default_roots);
 
     match cli.cmd.unwrap_or(Cmd::Serve(ServeArgs::default())) {
-        Cmd::Service(args) => run_service(&cli.watch_root, args),
-        Cmd::Serve(args) => run_serve(watch_root, args).await,
-        Cmd::Export(args) => run_export(&watch_root, args),
-        Cmd::List => run_list(&watch_root),
+        // Service install persists the user's CLI intent rather than the
+        // resolved roots, so `--source` survives and default-root discovery
+        // re-runs at service start-up.
+        Cmd::Service(args) => run_service(
+            &cli.watch_root,
+            cli.source.as_deref(),
+            cli.only.as_deref(),
+            cli.no_default_roots,
+            args,
+        ),
+        Cmd::Serve(args) => run_serve(roots, args).await,
+        Cmd::Export(args) => run_export(&roots, args),
+        Cmd::List => run_list(&roots),
     }
 }
 
-async fn run_serve(watch_root: PathBuf, args: ServeArgs) -> anyhow::Result<()> {
+/// Turn the CLI flags into a concrete set of watch roots.
+///
+/// - Any explicit `--watch-root` entries are always included (tagged with
+///   `--source` if given, else auto-detect per file within any `--only` filter).
+/// - Unless `--no-default-roots`, every known agent log directory that exists
+///   on disk is added (tagged with its agent), filtered by `--only`.
+fn resolve_roots(
+    explicit: &[String],
+    forced_source: Option<sources::AgentSource>,
+    only: Option<std::collections::HashSet<sources::AgentSource>>,
+    no_default_roots: bool,
+) -> Vec<sources::WatchRoot> {
+    let mut roots: Vec<sources::WatchRoot> = Vec::new();
+
+    for raw in explicit {
+        let path = expand_tilde(raw);
+        // Honour --only for explicit roots too, either by dropping a forced
+        // source outside the allow-list or by carrying the allow-list forward
+        // for per-file auto-detection.
+        if let (Some(only), Some(src)) = (&only, forced_source) {
+            if !only.contains(&src) {
+                continue;
+            }
+        }
+        roots.push(sources::WatchRoot {
+            path,
+            source: forced_source,
+            allowed_sources: forced_source.is_none().then(|| only.clone()).flatten(),
+        });
+    }
+
+    if !no_default_roots {
+        for r in sources::default_roots() {
+            if let Some(only) = &only {
+                if let Some(src) = r.source {
+                    if !only.contains(&src) {
+                        continue;
+                    }
+                }
+            }
+            // Avoid double-adding a directory the user already listed.
+            if roots.iter().any(|e| e.path == r.path) {
+                continue;
+            }
+            roots.push(r);
+        }
+    }
+
+    // Fallback: if nothing was specified and nothing exists on disk yet, use
+    // the historical Claude Code default so `claude-trace-rs` with no args
+    // behaves exactly as before (and creates the directory).
+    //
+    // This only applies when the user has not narrowed the source set: with
+    // `--only codex` or `--no-default-roots` an empty result is the honest
+    // answer, and the caller reports "no watch roots" rather than silently
+    // watching (and creating) a Claude Code directory the user excluded.
+    let claude_code_wanted = only
+        .as_ref()
+        .map(|o| o.contains(&sources::AgentSource::ClaudeCode))
+        .unwrap_or(true);
+    if roots.is_empty() && explicit.is_empty() && !no_default_roots && claude_code_wanted {
+        roots.push(sources::WatchRoot {
+            path: expand_tilde("~/.claude/projects"),
+            source: Some(sources::AgentSource::ClaudeCode),
+            allowed_sources: None,
+        });
+    }
+
+    roots
+}
+
+async fn run_serve(roots: Vec<sources::WatchRoot>, args: ServeArgs) -> anyhow::Result<()> {
     anyhow::ensure!(
         args.channel_capacity > 0,
         "--channel-capacity must be at least 1"
     );
+    anyhow::ensure!(!roots.is_empty(), "No watch roots to serve");
 
-    if !watch_root.exists() {
-        info!(
-            "Watch root {} does not exist; creating it",
-            watch_root.display()
-        );
-        std::fs::create_dir_all(&watch_root)?;
+    for root in &roots {
+        if !root.path.exists() {
+            info!(
+                "Watch root {} does not exist; creating it",
+                root.path.display()
+            );
+            std::fs::create_dir_all(&root.path)?;
+        }
     }
 
     // Open the persistent trace database and seed the in-memory store with the
@@ -192,22 +309,26 @@ async fn run_serve(watch_root: PathBuf, args: ServeArgs) -> anyhow::Result<()> {
 
     let (tx, _) = broadcast::channel::<event::TraceEvent>(args.channel_capacity);
 
+    let root_strings: Vec<String> = roots
+        .iter()
+        .map(|r| r.path.to_string_lossy().to_string())
+        .collect();
     let server_state = server::AppState {
         tx: tx.clone(),
-        watch_root: watch_root.to_string_lossy().to_string(),
+        watch_root: root_strings.first().cloned().unwrap_or_default(),
+        watch_roots: root_strings,
         port: args.port,
         store: store.clone(),
         db: database,
     };
 
     let watcher_tx = tx.clone();
-    let watcher_root = watch_root.clone();
     let watcher_store = store.clone();
     let opts = watcher::WatcherOptions {
         backfill: args.backfill,
     };
     std::thread::spawn(move || {
-        let watcher = watcher::SessionWatcher::new(watcher_root, watcher_tx, watcher_store, opts);
+        let watcher = watcher::SessionWatcher::multi(roots, watcher_tx, watcher_store, opts);
         if let Err(e) = watcher.run() {
             tracing::error!("SessionWatcher exited with error: {e}");
         }
@@ -227,11 +348,11 @@ async fn run_serve(watch_root: PathBuf, args: ServeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_export(watch_root: &std::path::Path, args: ExportArgs) -> anyhow::Result<()> {
+fn run_export(roots: &[sources::WatchRoot], args: ExportArgs) -> anyhow::Result<()> {
     use std::io::Write as _;
 
     let store = state::SessionStore::new();
-    let n = loader::ingest_directory(watch_root, &store)?;
+    let n = loader::ingest_roots(roots, &store)?;
     info!(
         "Loaded {} events across {} sessions",
         n,
@@ -239,11 +360,21 @@ fn run_export(watch_root: &std::path::Path, args: ExportArgs) -> anyhow::Result<
     );
 
     let want: std::collections::HashSet<String> = args.session.into_iter().collect();
+    let want_source: Option<std::collections::HashSet<String>> = args.from_source.map(|v| {
+        v.iter()
+            .filter_map(|s| sources::AgentSource::parse(s))
+            .map(|s| s.as_str().to_owned())
+            .collect()
+    });
     let sessions: Vec<_> = store
         .sessions()
         .into_iter()
         .filter(|s| s.event_count >= args.min_events)
         .filter(|s| want.is_empty() || want.contains(&s.id))
+        .filter(|s| match &want_source {
+            Some(ws) => ws.contains(&s.source),
+            None => true,
+        })
         .collect();
 
     anyhow::ensure!(!sessions.is_empty(), "No sessions matched the filter");
@@ -294,22 +425,36 @@ fn run_export(watch_root: &std::path::Path, args: ExportArgs) -> anyhow::Result<
     Ok(())
 }
 
-fn run_service(watch_root_raw: &str, args: ServiceArgs) -> anyhow::Result<()> {
+fn run_service(
+    explicit_roots: &[String],
+    source: Option<&str>,
+    only: Option<&[String]>,
+    no_default_roots: bool,
+    args: ServiceArgs,
+) -> anyhow::Result<()> {
     match args.action {
         ServiceAction::Install(opts) => {
             let exe = std::env::current_exe()
                 .context("could not determine the path to the running executable")?;
-            // Persist the watch root as an absolute path so the service is
-            // independent of the directory it was installed from.
-            let watch_root = expand_tilde(watch_root_raw)
-                .canonicalize()
-                .unwrap_or_else(|_| expand_tilde(watch_root_raw))
-                .to_string_lossy()
-                .to_string();
+            // Persist the explicitly requested roots as absolute paths so the
+            // service is independent of the directory it was installed from.
+            // Auto-discovered roots are deliberately not baked in: the service
+            // rediscovers them at start-up, so they stay correctly source-tagged
+            // and a newly installed agent is picked up without reinstalling.
+            let watch_roots: Vec<String> = explicit_roots
+                .iter()
+                .map(|r| {
+                    let p = expand_tilde(r);
+                    p.canonicalize().unwrap_or(p).to_string_lossy().to_string()
+                })
+                .collect();
             let cfg = service::ServiceConfig {
                 exe,
                 port: opts.port,
-                watch_root,
+                watch_roots,
+                source: source.map(str::to_owned),
+                only: only.map(<[String]>::to_vec).unwrap_or_default(),
+                no_default_roots,
                 db: opts
                     .db
                     .map(|d| expand_tilde(&d).to_string_lossy().to_string()),
@@ -322,9 +467,9 @@ fn run_service(watch_root_raw: &str, args: ServiceArgs) -> anyhow::Result<()> {
     }
 }
 
-fn run_list(watch_root: &std::path::Path) -> anyhow::Result<()> {
+fn run_list(roots: &[sources::WatchRoot]) -> anyhow::Result<()> {
     let store = state::SessionStore::new();
-    loader::ingest_directory(watch_root, &store)?;
+    loader::ingest_roots(roots, &store)?;
     let sessions = store.sessions();
     let out = serde_json::to_string_pretty(&sessions)?;
     println!("{out}");
@@ -367,10 +512,23 @@ fn open_in_browser(url: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::expand_tilde;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use super::{expand_tilde, resolve_roots};
+    use crate::sources::AgentSource;
+
+    /// `HOME` is process-global, so the tests that override it must not run
+    /// concurrently with each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn tilde_expansion() {
+        let _guard = lock_env();
         std::env::set_var("HOME", "/home/test");
         assert_eq!(
             expand_tilde("~/.claude/projects"),
@@ -385,5 +543,50 @@ mod tests {
             expand_tilde("rel/path"),
             std::path::PathBuf::from("rel/path")
         );
+    }
+
+    #[test]
+    fn resolve_roots_preserves_only_for_explicit_auto_detect_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = resolve_roots(
+            &[dir.path().display().to_string()],
+            None,
+            Some(HashSet::from([AgentSource::Codex])),
+            true,
+        );
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, dir.path());
+        assert_eq!(roots[0].source, None);
+        assert!(roots[0].allows(AgentSource::Codex));
+        assert!(!roots[0].allows(AgentSource::ClaudeCode));
+    }
+    #[test]
+    fn resolve_roots_fallback_respects_only_filter() {
+        // `--only codex` with no Codex directory on disk must not fall back to
+        // watching (and creating) the Claude Code root the user excluded.
+        let _guard = lock_env();
+        let empty = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", empty.path());
+
+        let roots = resolve_roots(&[], None, Some(HashSet::from([AgentSource::Codex])), false);
+        assert!(
+            roots.is_empty(),
+            "expected no roots, got {:?}",
+            roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>()
+        );
+
+        // Without --only the historical Claude Code default still applies.
+        let roots = resolve_roots(&[], None, None, false);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].source, Some(AgentSource::ClaudeCode));
+    }
+
+    #[test]
+    fn resolve_roots_no_default_roots_yields_nothing_without_explicit() {
+        let _guard = lock_env();
+        let empty = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", empty.path());
+        assert!(resolve_roots(&[], None, None, true).is_empty());
     }
 }

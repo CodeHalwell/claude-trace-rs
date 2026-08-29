@@ -27,8 +27,19 @@ pub struct ServiceConfig {
     pub exe: PathBuf,
     /// Port the dashboard should listen on.
     pub port: u16,
-    /// Directory of Claude Code JSONL logs to watch.
-    pub watch_root: String,
+    /// Explicitly requested directories of agent trace logs (one
+    /// `--watch-root` each). Empty means "discover the known agent
+    /// directories at start-up", which also lets an agent installed after the
+    /// service was set up be picked up without reinstalling it.
+    pub watch_roots: Vec<String>,
+    /// Forced agent source for those roots, as passed to `--source`. Persisted
+    /// so an installed service keeps the attribution the user asked for; an
+    /// untagged root would otherwise fall back to per-file auto-detection.
+    pub source: Option<String>,
+    /// Agent sources to restrict tracing to, as passed to `--only`.
+    pub only: Vec<String>,
+    /// Whether the user asked to skip auto-discovered roots.
+    pub no_default_roots: bool,
     /// Optional explicit database path.
     pub db: Option<String>,
     /// Open the browser when the service starts.
@@ -42,9 +53,22 @@ impl ServiceConfig {
             "serve".to_string(),
             "--port".to_string(),
             self.port.to_string(),
-            "--watch-root".to_string(),
-            self.watch_root.clone(),
         ];
+        for root in &self.watch_roots {
+            a.push("--watch-root".to_string());
+            a.push(root.clone());
+        }
+        if let Some(src) = &self.source {
+            a.push("--source".to_string());
+            a.push(src.clone());
+        }
+        if !self.only.is_empty() {
+            a.push("--only".to_string());
+            a.push(self.only.join(","));
+        }
+        if self.no_default_roots {
+            a.push("--no-default-roots".to_string());
+        }
         if let Some(db) = &self.db {
             a.push("--db".to_string());
             a.push(db.clone());
@@ -318,7 +342,10 @@ mod tests {
         ServiceConfig {
             exe: PathBuf::from("/usr/local/bin/claude-trace-rs"),
             port: 7779,
-            watch_root: "/home/me/.claude/projects".into(),
+            watch_roots: vec!["/home/me/.claude/projects".into()],
+            source: None,
+            only: Vec::new(),
+            no_default_roots: false,
             db: Some("/data/trace.db".into()),
             open: false,
         }
@@ -355,5 +382,48 @@ mod tests {
         let mut c = cfg();
         c.open = true;
         assert!(systemd_unit(&c).contains("--open"));
+    }
+    #[test]
+    fn serve_args_persist_source_and_only_flags() {
+        // An installed service that dropped --source left custom roots on
+        // per-file auto-detection, which cannot tell Kimi or Cursor apart from
+        // Claude Code (all carry a bare sessionId).
+        let cfg = ServiceConfig {
+            exe: PathBuf::from("/usr/local/bin/claude-trace-rs"),
+            port: 7779,
+            watch_roots: vec!["/srv/logs".into()],
+            source: Some("kimi".into()),
+            only: vec!["kimi".into(), "codex".into()],
+            no_default_roots: true,
+            db: None,
+            open: false,
+        };
+        let args = cfg.serve_args();
+        let joined = args.join(" ");
+        assert!(joined.contains("--watch-root /srv/logs"), "{joined}");
+        assert!(joined.contains("--source kimi"), "{joined}");
+        assert!(joined.contains("--only kimi,codex"), "{joined}");
+        assert!(joined.contains("--no-default-roots"), "{joined}");
+    }
+
+    #[test]
+    fn serve_args_omit_absent_flags() {
+        // Plain `service install`: no explicit roots are baked in, so the
+        // service rediscovers the known agent directories at start-up.
+        let cfg = ServiceConfig {
+            exe: PathBuf::from("/usr/local/bin/claude-trace-rs"),
+            port: 7779,
+            watch_roots: Vec::new(),
+            source: None,
+            only: Vec::new(),
+            no_default_roots: false,
+            db: None,
+            open: false,
+        };
+        let joined = cfg.serve_args().join(" ");
+        assert!(!joined.contains("--watch-root"), "{joined}");
+        assert!(!joined.contains("--source"), "{joined}");
+        assert!(!joined.contains("--only"), "{joined}");
+        assert!(!joined.contains("--no-default-roots"), "{joined}");
     }
 }

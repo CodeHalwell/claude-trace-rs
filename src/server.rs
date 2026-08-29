@@ -30,6 +30,8 @@ use crate::{
 pub struct AppState {
     pub tx: broadcast::Sender<TraceEvent>,
     pub watch_root: String,
+    /// All watch roots (display/health purposes).
+    pub watch_roots: Vec<String>,
     pub port: u16,
     pub store: SessionStore,
     pub db: Db,
@@ -57,6 +59,7 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
         .route("/api/snapshot", get(api_snapshot))
         // Database-backed history & analytics (persists across restarts).
         .route("/api/db/sessions", get(db_sessions))
+        .route("/api/db/sources", get(db_sources))
         .route("/api/db/projects", get(db_projects))
         .route("/api/db/sessions/:id/events", get(db_session_events))
         .route(
@@ -86,6 +89,7 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "status": "ok",
         "watch_root": state.watch_root,
+        "watch_roots": state.watch_roots,
         "sessions": state.store.sessions().len(),
         "total_events": state.store.total_events(),
     }))
@@ -94,6 +98,7 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
 async fn api_sessions(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "watch_root": state.watch_root,
+        "watch_roots": state.watch_roots,
         "sessions": state.store.sessions(),
     }))
 }
@@ -269,6 +274,8 @@ fn short_filename(id: &str) -> String {
 struct DbSessionsQuery {
     search: Option<String>,
     project: Option<String>,
+    /// Only sessions from this agent source (kebab-case id).
+    source: Option<String>,
     #[serde(default)]
     bookmarked: bool,
     sort: Option<String>,
@@ -279,6 +286,7 @@ async fn db_sessions(Query(q): Query<DbSessionsQuery>, State(state): State<AppSt
     let filter = SessionFilter {
         search: q.search.filter(|s| !s.is_empty()),
         project: q.project.filter(|s| !s.is_empty()),
+        source: q.source.filter(|s| !s.is_empty()),
         bookmarked_only: q.bookmarked,
         sort: q.sort,
         // Clamp to a sane maximum so a caller can't request an unbounded result
@@ -294,6 +302,13 @@ async fn db_sessions(Query(q): Query<DbSessionsQuery>, State(state): State<AppSt
 async fn db_projects(State(state): State<AppState>) -> Response {
     match state.db.projects() {
         Ok(projects) => Json(json!({ "projects": projects })).into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+async fn db_sources(State(state): State<AppState>) -> Response {
+    match state.db.sources() {
+        Ok(sources) => Json(json!({ "sources": sources })).into_response(),
         Err(e) => db_error(e),
     }
 }
@@ -339,6 +354,8 @@ async fn db_session_events(
 struct SearchQuery {
     q: String,
     limit: Option<usize>,
+    /// Restrict results to this agent source.
+    source: Option<String>,
 }
 
 async fn db_search(Query(q): Query<SearchQuery>, State(state): State<AppState>) -> Response {
@@ -346,7 +363,10 @@ async fn db_search(Query(q): Query<SearchQuery>, State(state): State<AppState>) 
     if q.q.trim().is_empty() {
         return Json(json!({ "events": [] })).into_response();
     }
-    match state.db.search_events(q.q.trim(), limit) {
+    match state
+        .db
+        .search_events(q.q.trim(), limit, q.source.as_deref())
+    {
         Ok(events) => Json(json!({ "query": q.q, "events": events })).into_response(),
         Err(e) => db_error(e),
     }
@@ -435,7 +455,8 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
     let banner = json!({
         "type": "connected",
         "watch_root": state.watch_root,
-        "message": "Streaming Claude Code traces in real time."
+        "watch_roots": state.watch_roots,
+        "message": "Streaming coding-agent traces in real time."
     });
     if socket
         .send(Message::Text(banner.to_string()))

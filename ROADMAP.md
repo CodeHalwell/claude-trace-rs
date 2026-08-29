@@ -12,6 +12,9 @@ committed — it's a menu of ideas, roughly grouped by theme.
 - Server-side bookmarks / tags / notes (no longer trapped in `localStorage`).
 - Clean, decluttered UI: global search, project-grouped navigator, 3 focused tabs.
 - One-line installers for macOS/Linux/Windows, `.deb`, and a tagged-release CI.
+- **Harmonised multi-agent tracing** — Claude Code, Codex CLI, Copilot CLI,
+  Kimi Code, Cline, and Cursor Agent adapters feeding one dashboard/database/
+  exporter, with per-agent badges, filters, and cost analytics.
 
 ## Near-term, high-impact
 1. **SQLite FTS5 full-text search.** Swap the `LIKE` search for an FTS5 virtual
