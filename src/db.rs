@@ -44,6 +44,36 @@ pub struct SessionFilter {
     pub limit: Option<usize>,
 }
 
+/// Result of [`Db::upsert_event`].
+#[derive(Debug)]
+pub enum Upsert {
+    /// A new `(session_id, line_index)` row was written.
+    Inserted,
+    /// The row existed with different content and was replaced; carries the
+    /// previous version so callers can retract its aggregates.
+    Updated(Box<TraceEvent>),
+    /// The row existed with identical content.
+    Unchanged,
+}
+
+/// Persisted read position for one ingested file or database, so a restart
+/// resumes where it left off instead of missing (or re-reading) records.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileCheckpoint {
+    pub path: String,
+    pub source: String,
+    /// Byte offset consumed so far (append-only JSONL).
+    pub offset: u64,
+    /// Non-empty lines consumed so far (the next record's line index).
+    pub line_count: usize,
+    /// File length when last processed.
+    pub len: u64,
+    /// Modification time (ms since the epoch) when last processed.
+    pub mtime_ms: i64,
+    /// Adapter-defined incremental cursor (e.g. a SQLite watermark).
+    pub cursor: Option<String>,
+}
+
 /// Page of events for one session, plus the unfiltered total for pagination.
 #[derive(Debug)]
 pub struct EventPage {
@@ -117,6 +147,7 @@ impl Db {
         for ddl in [
             "ALTER TABLE events ADD COLUMN source TEXT NOT NULL DEFAULT 'claude-code'",
             "ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'claude-code'",
+            "ALTER TABLE sessions ADD COLUMN first_prompt TEXT",
         ] {
             if let Err(e) = conn.execute_batch(ddl) {
                 // "duplicate column name" means the migration already ran.
@@ -137,7 +168,73 @@ impl Db {
     /// Returns `true` if a new row was inserted.
     pub fn insert_event(&self, ev: &TraceEvent) -> anyhow::Result<bool> {
         let conn = self.conn.lock().expect("db poisoned");
-        let event_json = serde_json::to_string(ev)?;
+        Self::insert_or_ignore(&conn, ev)
+    }
+
+    /// Persist an event, replacing a stored record whose content changed.
+    ///
+    /// Append-only logs never change a record once written, but whole-file
+    /// documents (Gemini CLI, Cline, …) and databases (OpenCode, Goose, …)
+    /// rewrite records in place as a turn streams in — a tool result lands on
+    /// an existing message, token counts are filled in at the end. Comparing
+    /// the raw entry lets those updates through while keeping re-reads of
+    /// unchanged data free.
+    pub fn upsert_event(&self, ev: &TraceEvent) -> anyhow::Result<Upsert> {
+        let conn = self.conn.lock().expect("db poisoned");
+        if Self::insert_or_ignore(&conn, ev)? {
+            return Ok(Upsert::Inserted);
+        }
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT event_json FROM events WHERE session_id = ?1 AND line_index = ?2",
+                params![ev.session_id, ev.line_index as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(Upsert::Inserted);
+        };
+        let mut old: TraceEvent = serde_json::from_str(&stored)?;
+        if old.entry == ev.entry && old.source == ev.source {
+            return Ok(Upsert::Unchanged);
+        }
+        conn.execute(
+            "DELETE FROM events WHERE session_id = ?1 AND line_index = ?2",
+            params![ev.session_id, ev.line_index as i64],
+        )?;
+        Self::insert_or_ignore(&conn, ev)?;
+        old.hydrate();
+        Ok(Upsert::Updated(Box::new(old)))
+    }
+
+    /// Delete one event, returning it if it existed.
+    pub fn delete_event(
+        &self,
+        session_id: &str,
+        line_index: usize,
+    ) -> anyhow::Result<Option<TraceEvent>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT event_json FROM events WHERE session_id = ?1 AND line_index = ?2",
+                params![session_id, line_index as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        conn.execute(
+            "DELETE FROM events WHERE session_id = ?1 AND line_index = ?2",
+            params![session_id, line_index as i64],
+        )?;
+        let mut ev: TraceEvent = serde_json::from_str(&stored)?;
+        ev.hydrate();
+        Ok(Some(ev))
+    }
+
+    fn insert_or_ignore(conn: &Connection, ev: &TraceEvent) -> anyhow::Result<bool> {
+        let event_json = stored_event_json(ev)?;
         let tool_uses = serde_json::to_string(&ev.tool_uses)?;
         let (input, output, cr, cc) = ev
             .usage
@@ -184,10 +281,11 @@ impl Db {
                 last_entry_timestamp, event_count, user_count, assistant_count,
                 tool_use_count, tool_result_count, system_count, input_tokens,
                 output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd,
-                tool_counts)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
+                tool_counts, first_prompt)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
              ON CONFLICT(id) DO UPDATE SET
                 source=excluded.source,
+                first_prompt=COALESCE(sessions.first_prompt, excluded.first_prompt),
                 cwd=excluded.cwd, git_branch=excluded.git_branch,
                 version=excluded.version, model=excluded.model,
                 title=COALESCE(excluded.title, sessions.title),
@@ -225,6 +323,7 @@ impl Db {
                 s.cache_creation_tokens as i64,
                 s.cost_usd,
                 tool_counts,
+                s.first_prompt,
             ],
         )?;
         Ok(())
@@ -252,14 +351,15 @@ impl Db {
                     s.tool_result_count, s.system_count, s.input_tokens, s.output_tokens,
                     s.cache_read_tokens, s.cache_creation_tokens, s.cost_usd, s.tool_counts,
                     COALESCE(m.bookmarked,0), COALESCE(m.tags,'[]'), COALESCE(m.notes,''),
-                    s.source
+                    s.source, s.first_prompt
              FROM sessions s LEFT JOIN session_meta m ON m.id = s.id WHERE 1=1",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(q) = &f.search {
             sql.push_str(
                 " AND (lower(s.id) LIKE ?1 OR lower(s.title) LIKE ?1
-                       OR lower(s.cwd) LIKE ?1 OR lower(s.git_branch) LIKE ?1)",
+                       OR lower(s.cwd) LIKE ?1 OR lower(s.git_branch) LIKE ?1
+                       OR lower(s.first_prompt) LIKE ?1)",
             );
             args.push(Box::new(format!("%{}%", q.to_lowercase())));
         }
@@ -366,7 +466,7 @@ impl Db {
         let rows = stmt.query_map(arg_refs.as_slice(), |r| r.get::<_, String>(0))?;
         let mut events = Vec::new();
         for r in rows {
-            if let Ok(v) = serde_json::from_str::<Value>(&r?) {
+            if let Some(v) = hydrated_value(&r?) {
                 events.push(v);
             }
         }
@@ -397,7 +497,7 @@ impl Db {
                     r.get::<_, String>(0)
                 })?;
                 for r in rows {
-                    if let Ok(v) = serde_json::from_str::<Value>(&r?) {
+                    if let Some(v) = hydrated_value(&r?) {
                         out.push(v);
                     }
                 }
@@ -410,7 +510,7 @@ impl Db {
                 let rows =
                     stmt.query_map(params![pattern, limit as i64], |r| r.get::<_, String>(0))?;
                 for r in rows {
-                    if let Ok(v) = serde_json::from_str::<Value>(&r?) {
+                    if let Some(v) = hydrated_value(&r?) {
                         out.push(v);
                     }
                 }
@@ -529,6 +629,102 @@ impl Db {
         }))
     }
 
+    /// Total cost of events stamped at or after `since` (an RFC 3339 UTC
+    /// timestamp). Used to seed the desktop app's daily budget.
+    pub fn cost_since(&self, since: &str) -> anyhow::Result<f64> {
+        let conn = self.conn.lock().expect("db poisoned");
+        Ok(conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM events
+             WHERE COALESCE(timestamp, observed_at) >= ?1",
+            params![since],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Every stored event for one session in order, hydrated — used to export
+    /// full histories that no longer fit the in-memory ring buffers.
+    pub fn all_session_events(&self, session_id: &str) -> anyhow::Result<Vec<TraceEvent>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT event_json FROM events WHERE session_id = ?1 ORDER BY line_index ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            if let Ok(mut ev) = serde_json::from_str::<TraceEvent>(&r?) {
+                ev.hydrate();
+                out.push(ev);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The saved read position for a file, if any.
+    pub fn checkpoint(&self, path: &str) -> anyhow::Result<Option<FileCheckpoint>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT path, source, byte_offset, line_count, len, mtime_ms, cursor
+                 FROM ingest_files WHERE path = ?1",
+                params![path],
+                |r| {
+                    Ok(FileCheckpoint {
+                        path: r.get(0)?,
+                        source: r.get(1)?,
+                        offset: r.get::<_, i64>(2)? as u64,
+                        line_count: r.get::<_, i64>(3)? as usize,
+                        len: r.get::<_, i64>(4)? as u64,
+                        mtime_ms: r.get(5)?,
+                        cursor: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Save a file's read position.
+    pub fn save_checkpoint(&self, c: &FileCheckpoint) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute(
+            "INSERT INTO ingest_files (path, source, byte_offset, line_count, len, mtime_ms, cursor)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(path) DO UPDATE SET
+                source=excluded.source, byte_offset=excluded.byte_offset,
+                line_count=excluded.line_count, len=excluded.len,
+                mtime_ms=excluded.mtime_ms, cursor=excluded.cursor",
+            params![
+                c.path,
+                c.source,
+                c.offset as i64,
+                c.line_count as i64,
+                c.len as i64,
+                c.mtime_ms,
+                c.cursor
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Newest file modification time among saved checkpoints: roughly when
+    /// the tracer last saw activity. Files first seen after a restart and
+    /// modified after this were written while it was not running.
+    pub fn checkpoint_horizon(&self) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        Ok(conn.query_row(
+            "SELECT MAX(mtime_ms) FROM ingest_files WHERE mtime_ms > 0",
+            [],
+            |r| r.get::<_, Option<i64>>(0),
+        )?)
+    }
+
+    /// Per-agent counts of files being tracked, for the agents overview.
+    pub fn tracked_files_by_source(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut stmt = conn.prepare("SELECT source, COUNT(*) FROM ingest_files GROUP BY source")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     /// Read user annotations (bookmark/tags/notes) for a session.
     pub fn get_meta(&self, id: &str) -> anyhow::Result<Value> {
         let conn = self.conn.lock().expect("db poisoned");
@@ -605,7 +801,26 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionStats> {
         bookmarked: r.get::<_, i64>(21)? != 0,
         tags: serde_json::from_str(&tags).unwrap_or_default(),
         source: r.get(24)?,
+        first_prompt: r.get(25)?,
     })
+}
+
+/// The JSON stored in `events.event_json`: the full event minus the
+/// canonical message, which [`TraceEvent::hydrate`] re-derives on read.
+fn stored_event_json(ev: &TraceEvent) -> anyhow::Result<String> {
+    let mut v = serde_json::to_value(ev)?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("message");
+    }
+    Ok(serde_json::to_string(&v)?)
+}
+
+/// Parse a stored event row and re-derive its canonical message, returning
+/// the API-facing JSON.
+fn hydrated_value(stored: &str) -> Option<Value> {
+    let mut ev: TraceEvent = serde_json::from_str(stored).ok()?;
+    ev.hydrate();
+    serde_json::to_value(ev).ok()
 }
 
 /// Resolve the default on-disk database path in the platform data directory,
@@ -672,6 +887,16 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen);
 CREATE INDEX IF NOT EXISTS idx_sessions_cwd       ON sessions(cwd);
 
+CREATE TABLE IF NOT EXISTS ingest_files (
+    path        TEXT PRIMARY KEY,
+    source      TEXT    NOT NULL,
+    byte_offset INTEGER NOT NULL DEFAULT 0,
+    line_count  INTEGER NOT NULL DEFAULT 0,
+    len         INTEGER NOT NULL DEFAULT 0,
+    mtime_ms    INTEGER NOT NULL DEFAULT 0,
+    cursor      TEXT
+);
+
 CREATE TABLE IF NOT EXISTS session_meta (
     id         TEXT PRIMARY KEY,
     bookmarked INTEGER NOT NULL DEFAULT 0,
@@ -731,6 +956,24 @@ mod tests {
         .unwrap();
         let hits = db.search_events("refactor", 10, None).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn cost_since_filters_by_timestamp() {
+        let db = Db::open_in_memory().unwrap();
+        let usage = |ts: &str, line| {
+            ev(
+                "a",
+                line,
+                "assistant",
+                json!({ "timestamp": ts, "costUSD": 1.5, "message": { "content": "x" } }),
+            )
+        };
+        db.insert_event(&usage("2026-09-28T23:59:00Z", 0)).unwrap();
+        db.insert_event(&usage("2026-09-29T08:00:00.123Z", 1))
+            .unwrap();
+        let today = db.cost_since("2026-09-29T00:00:00Z").unwrap();
+        assert!((today - 1.5).abs() < 1e-9, "{today}");
     }
 
     #[test]

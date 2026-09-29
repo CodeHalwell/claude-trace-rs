@@ -6,7 +6,7 @@ RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 LABEL org.opencontainers.image.source="https://github.com/CodeHalwell/claude-trace-rs" \
-      org.opencontainers.image.description="Local-first observability dashboard + trace database for terminal coding agents (Claude Code, Codex, Copilot, Kimi, Cline, Cursor)" \
+      org.opencontainers.image.description="Local-first observability dashboard + trace database for coding agents (Claude Code, Codex, Gemini CLI, Copilot, Cursor, Cline, OpenCode, Aider and more)" \
       org.opencontainers.image.licenses="MIT"
 
 COPY --from=builder /app/target/release/claude-trace-rs /usr/local/bin/claude-trace-rs

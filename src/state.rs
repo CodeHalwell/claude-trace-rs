@@ -6,7 +6,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::{db::Db, event::TraceEvent};
+use crate::{
+    db::{Db, Upsert},
+    event::TraceEvent,
+};
 
 /// Cap on how many events we retain per session in memory for client backfill.
 pub const PER_SESSION_RECENT_CAP: usize = 5_000;
@@ -49,8 +52,13 @@ pub struct SessionStats {
     /// Tool name → invocation count.
     pub tool_counts: HashMap<String, usize>,
 
-    /// AI-generated title from `ai-title` events, when present.
+    /// Session title reported by the agent (AI-generated titles, session
+    /// names), when present.
     pub title: Option<String>,
+    /// The first real user prompt of the session, truncated — a readable
+    /// label for agents that never title their sessions.
+    #[serde(default)]
+    pub first_prompt: Option<String>,
 
     /// Whether the user has bookmarked this session (persisted in the database).
     #[serde(default)]
@@ -93,6 +101,7 @@ impl Default for SessionStats {
             cost_usd: 0.0,
             tool_counts: HashMap::new(),
             title: None,
+            first_prompt: None,
             bookmarked: false,
             tags: Vec::new(),
         }
@@ -179,12 +188,104 @@ impl SessionStats {
         }
         self.cost_usd += ev.cost_usd;
 
-        // Capture AI-generated session title when emitted.
-        if ev.event_type == "ai-title" {
-            if let Some(t) = ev.entry.get("aiTitle").and_then(|v| v.as_str()) {
-                self.title = Some(t.to_owned());
-            }
+        if let Some(t) = &ev.title {
+            self.title = Some(t.clone());
         }
+        if self.first_prompt.is_none() {
+            self.first_prompt = first_prompt_of(ev);
+        }
+    }
+
+    /// Undo [`SessionStats::ingest`] for an event that is being replaced or
+    /// removed, so in-place record updates never double count. Identity and
+    /// timing fields (cwd, first/last seen, title) are left alone.
+    fn retract(&mut self, ev: &TraceEvent) {
+        self.event_count = self.event_count.saturating_sub(1);
+        match ev.event_type.as_str() {
+            "user" => self.user_count = self.user_count.saturating_sub(1),
+            "assistant" => self.assistant_count = self.assistant_count.saturating_sub(1),
+            "tool_use" if ev.tool_uses.is_empty() => {
+                self.tool_use_count = self.tool_use_count.saturating_sub(1);
+                if let Some(name) = ev.entry.get("name").and_then(|v| v.as_str()) {
+                    decrement(&mut self.tool_counts, name);
+                }
+            }
+            "tool_result" if ev.tool_results.is_empty() => {
+                self.tool_result_count = self.tool_result_count.saturating_sub(1);
+            }
+            "system" => self.system_count = self.system_count.saturating_sub(1),
+            _ => {}
+        }
+        for name in &ev.tool_uses {
+            self.tool_use_count = self.tool_use_count.saturating_sub(1);
+            decrement(&mut self.tool_counts, name);
+        }
+        self.tool_result_count = self.tool_result_count.saturating_sub(ev.tool_results.len());
+        if let Some(u) = &ev.usage {
+            self.input_tokens = self.input_tokens.saturating_sub(u.input);
+            self.output_tokens = self.output_tokens.saturating_sub(u.output);
+            self.cache_read_tokens = self.cache_read_tokens.saturating_sub(u.cache_read);
+            self.cache_creation_tokens =
+                self.cache_creation_tokens.saturating_sub(u.cache_creation);
+        }
+        self.cost_usd = (self.cost_usd - ev.cost_usd).max(0.0);
+    }
+}
+
+fn decrement(map: &mut HashMap<String, usize>, key: &str) {
+    if let Some(n) = map.get_mut(key) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            map.remove(key);
+        }
+    }
+}
+
+/// Text of a genuine user prompt, skipping tool results and the context
+/// blocks agents inject as user turns (environment info, command wrappers,
+/// instructions files).
+fn first_prompt_of(ev: &TraceEvent) -> Option<String> {
+    let msg = ev.message.as_ref()?;
+    if msg.role != crate::message::Role::User {
+        return None;
+    }
+    let text = msg.plain_text();
+    let t = text.trim();
+    if t.is_empty() || is_injected_context(t) {
+        return None;
+    }
+    Some(crate::sources::truncate(t, 160))
+}
+
+fn is_injected_context(t: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "<environment_context",
+        "<user_instructions",
+        "<command-",
+        "<local-command",
+        "<system-reminder",
+        "Caveat:",
+        "# AGENTS.md",
+        "<user_action",
+        "This session is being continued",
+    ];
+    PREFIXES.iter().any(|p| t.starts_with(p))
+}
+
+/// What [`SessionStore::ingest`] did with an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ingested {
+    /// A record not seen before.
+    New,
+    /// A record whose content changed in place (documents, databases).
+    Updated,
+    /// Already stored with identical content; nothing changed.
+    Unchanged,
+}
+
+impl Ingested {
+    pub fn changed(self) -> bool {
+        self != Ingested::Unchanged
     }
 }
 
@@ -266,21 +367,46 @@ impl SessionStore {
     /// never double-counts the in-memory aggregates. All writes happen while the
     /// in-memory lock is held, so the persisted aggregates can never be
     /// clobbered by an out-of-order snapshot.
-    pub fn ingest(&self, ev: &TraceEvent) {
+    pub fn ingest(&self, ev: &TraceEvent) -> Ingested {
         let mut g = self.inner.write().expect("session store poisoned");
 
-        if let Some(db) = &self.db {
-            match db.insert_event(ev) {
-                // Already persisted — it has already been counted; skip it.
-                Ok(false) => return,
-                Ok(true) => {}
-                Err(e) => warn!("Failed to persist event to database: {e}"),
+        // Find the previous version of this record, if any. With a database
+        // that is authoritative; without one, the in-memory ring buffer is the
+        // best we have (records evicted from it are treated as new).
+        let previous: Option<TraceEvent> = match &self.db {
+            Some(db) => match db.upsert_event(ev) {
+                Ok(Upsert::Inserted) => None,
+                Ok(Upsert::Unchanged) => return Ingested::Unchanged,
+                Ok(Upsert::Updated(old)) => Some(*old),
+                Err(e) => {
+                    warn!("Failed to persist event to database: {e}");
+                    None
+                }
+            },
+            None => {
+                let prior = g
+                    .per_session_events
+                    .get(&ev.session_id)
+                    .and_then(|q| q.iter().rev().find(|e| e.line_index == ev.line_index));
+                match prior {
+                    Some(p) if p.entry == ev.entry => return Ingested::Unchanged,
+                    Some(p) => Some(p.clone()),
+                    None => None,
+                }
             }
-        }
+        };
 
-        g.total_events += 1;
+        let outcome = if previous.is_some() {
+            Ingested::Updated
+        } else {
+            g.total_events += 1;
+            Ingested::New
+        };
 
         let stats = g.sessions.entry(ev.session_id.clone()).or_default();
+        if let Some(old) = &previous {
+            stats.retract(old);
+        }
         stats.ingest(ev);
         if let Some(db) = &self.db {
             if let Err(e) = db.upsert_session(stats) {
@@ -292,15 +418,74 @@ impl SessionStore {
             .per_session_events
             .entry(ev.session_id.clone())
             .or_default();
-        per.push_back(ev.clone());
+        if previous.is_some() {
+            if let Some(slot) = per.iter_mut().rev().find(|e| e.line_index == ev.line_index) {
+                *slot = ev.clone();
+            } else {
+                per.push_back(ev.clone());
+            }
+        } else {
+            per.push_back(ev.clone());
+        }
         while per.len() > PER_SESSION_RECENT_CAP {
             per.pop_front();
         }
 
-        g.global_events.push_back(ev.clone());
+        let replaced = previous.is_some()
+            && g.global_events
+                .iter_mut()
+                .rev()
+                .find(|e| e.line_index == ev.line_index && e.session_id == ev.session_id)
+                .map(|slot| *slot = ev.clone())
+                .is_some();
+        if !replaced {
+            g.global_events.push_back(ev.clone());
+        }
         while g.global_events.len() > GLOBAL_RECENT_CAP {
             g.global_events.pop_front();
         }
+        outcome
+    }
+
+    /// Remove a record that disappeared from its source (a document that was
+    /// rewritten shorter, e.g. after a checkpoint restore). Returns whether a
+    /// record was removed.
+    pub fn remove(&self, session_id: &str, line_index: usize) -> bool {
+        let mut g = self.inner.write().expect("session store poisoned");
+        let old: Option<TraceEvent> = match &self.db {
+            Some(db) => match db.delete_event(session_id, line_index) {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!("Failed to delete event from database: {e}");
+                    None
+                }
+            },
+            None => g
+                .per_session_events
+                .get(session_id)
+                .and_then(|q| q.iter().rev().find(|e| e.line_index == line_index).cloned()),
+        };
+        let Some(old) = old else { return false };
+        g.total_events = g.total_events.saturating_sub(1);
+        if let Some(stats) = g.sessions.get_mut(session_id) {
+            stats.retract(&old);
+            if let Some(db) = &self.db {
+                if let Err(e) = db.upsert_session(stats) {
+                    warn!("Failed to persist session aggregates: {e}");
+                }
+            }
+        }
+        if let Some(q) = g.per_session_events.get_mut(session_id) {
+            q.retain(|e| e.line_index != line_index);
+        }
+        g.global_events
+            .retain(|e| !(e.session_id == session_id && e.line_index == line_index));
+        true
+    }
+
+    /// The attached database, if any.
+    pub fn db(&self) -> Option<&Db> {
+        self.db.as_ref()
     }
 
     /// Snapshot of all known sessions and the global event tail.
@@ -355,11 +540,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Each call gets a fresh line index: the store keys records on
+    /// (session, line), so reusing one would model an in-place update.
     fn ev(session: &str, kind: &str, body: serde_json::Value) -> TraceEvent {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static LINE: AtomicUsize = AtomicUsize::new(0);
         let mut val = body;
         val["type"] = json!(kind);
         val["sessionId"] = json!(session);
-        TraceEvent::from_raw("fallback", 0, val)
+        TraceEvent::from_raw("fallback", LINE.fetch_add(1, Ordering::Relaxed), val)
     }
 
     #[test]

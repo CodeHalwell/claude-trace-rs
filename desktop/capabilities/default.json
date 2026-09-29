@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The bundled start-up page. The dashboard itself is served over loopback HTTP and receives its permissions at runtime once its port is known.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "allow-desktop-info",
+    "allow-get-settings",
+    "allow-save-settings",
+    "allow-restart-app",
+    "allow-open-data-dir"
+  ]
+}
