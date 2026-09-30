@@ -133,7 +133,7 @@ impl Activity {
     /// Feed one event. Returns any notices it triggers.
     pub fn on_event(&mut self, ev: &TraceEvent, now: Instant) -> Vec<Notice> {
         let mut out = Vec::new();
-        if ev.replayed {
+        if ev.replayed || ev.removed {
             return out;
         }
         let is_new = !self.sessions.contains_key(&ev.session_id);
@@ -409,6 +409,15 @@ mod tests {
             other => panic!("expected a finished turn, got {other:?}"),
         }
         assert!((a.spent_today() - done.cost_usd).abs() < 1e-12);
+    }
+
+    #[test]
+    fn tombstones_are_ignored() {
+        let mut a = Activity::new(Duration::from_secs(30), Some(0.0001));
+        let mut ev = assistant("s9", true);
+        ev.removed = true;
+        assert!(a.on_event(&ev, Instant::now()).is_empty());
+        assert_eq!(a.spent_today(), 0.0);
     }
 
     #[test]

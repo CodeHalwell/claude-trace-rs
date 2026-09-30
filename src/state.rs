@@ -455,7 +455,9 @@ impl SessionStore {
     /// Remove a record that disappeared from its source (a document that was
     /// rewritten shorter, e.g. after a checkpoint restore). Returns whether a
     /// record was removed.
-    pub fn remove(&self, session_id: &str, line_index: usize) -> bool {
+    /// Retract one event. Returns it if it existed. A session left with no
+    /// events is dropped altogether (its annotations are kept).
+    pub fn remove(&self, session_id: &str, line_index: usize) -> Option<TraceEvent> {
         let mut g = self.inner.write().expect("session store poisoned");
         let old: Option<TraceEvent> = match &self.db {
             Some(db) => match db.delete_event(session_id, line_index) {
@@ -470,22 +472,32 @@ impl SessionStore {
                 .get(session_id)
                 .and_then(|q| q.iter().rev().find(|e| e.line_index == line_index).cloned()),
         };
-        let Some(old) = old else { return false };
+        let old = old?;
         g.total_events = g.total_events.saturating_sub(1);
+        let mut emptied = false;
         if let Some(stats) = g.sessions.get_mut(session_id) {
             stats.retract(&old);
+            emptied = stats.event_count == 0;
             if let Some(db) = &self.db {
-                if let Err(e) = db.upsert_session(stats) {
+                let res = if emptied {
+                    db.delete_session(session_id)
+                } else {
+                    db.upsert_session(stats)
+                };
+                if let Err(e) = res {
                     warn!("Failed to persist session aggregates: {e}");
                 }
             }
         }
-        if let Some(q) = g.per_session_events.get_mut(session_id) {
+        if emptied {
+            g.sessions.remove(session_id);
+            g.per_session_events.remove(session_id);
+        } else if let Some(q) = g.per_session_events.get_mut(session_id) {
             q.retain(|e| e.line_index != line_index);
         }
         g.global_events
             .retain(|e| !(e.session_id == session_id && e.line_index == line_index));
-        true
+        Some(old)
     }
 
     /// The attached database, if any.

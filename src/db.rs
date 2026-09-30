@@ -299,6 +299,14 @@ impl Db {
     }
 
     /// Insert (or update) the rolled-up aggregates for a session.
+    /// Drop a session's aggregate row (its last event was retracted).
+    /// Bookmarks, tags and notes in `session_meta` are kept.
+    pub fn delete_session(&self, id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     pub fn upsert_session(&self, s: &SessionStats) -> anyhow::Result<()> {
         let conn = self.conn.lock().expect("db poisoned");
         let tool_counts = serde_json::to_string(&s.tool_counts)?;
@@ -900,6 +908,7 @@ fn stored_event_json(ev: &TraceEvent) -> anyhow::Result<String> {
     if let Some(obj) = v.as_object_mut() {
         obj.remove("message");
         obj.remove("replayed");
+        obj.remove("removed");
     }
     Ok(serde_json::to_string(&v)?)
 }

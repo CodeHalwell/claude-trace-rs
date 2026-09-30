@@ -471,11 +471,11 @@ impl Engine {
             }
         }
         let changed = !emitted.is_empty() || !retract.is_empty();
+        // Retract first: a record that moved to another line (a compacted
+        // log) must not find its old line still owning its usage.
+        self.retract(retract);
         for ev in emitted {
             self.emit(ev);
-        }
-        for (sid, idx) in retract {
-            self.store.remove(&sid, idx);
         }
         if changed || self.store.db().is_some() {
             let src = self
@@ -632,11 +632,9 @@ impl Engine {
                 st.docs.insert(doc.session_id, hashes);
             }
         }
+        self.retract(to_remove);
         for ev in to_emit {
             self.emit(ev);
-        }
-        for (sid, idx) in to_remove {
-            self.store.remove(&sid, idx);
         }
         self.save_checkpoint(unit, source);
         if let (Some(db), Some(st)) = (self.store.db(), self.states.get(unit)) {
@@ -655,6 +653,30 @@ impl Engine {
     // ------------------------------------------------------------------
     // Output & checkpoints
     // ------------------------------------------------------------------
+
+    /// Retract records deleted at their source: drop them from the store,
+    /// release any usage they owned (a replacement may now own it), and tell
+    /// live subscribers with a tombstone.
+    fn retract(&mut self, keys: Vec<(String, usize)>) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut released: HashSet<(String, usize)> = HashSet::new();
+        for (sid, idx) in keys {
+            if let Some(mut old) = self.store.remove(&sid, idx) {
+                released.insert((sid, idx));
+                old.removed = true;
+                old.replayed = self.replaying;
+                if let Some(tx) = &self.tx {
+                    let _ = tx.send(old);
+                }
+            }
+        }
+        if !released.is_empty() {
+            self.usage_owners
+                .retain(|_, owner| !released.contains(owner));
+        }
+    }
 
     fn emit(&mut self, mut ev: TraceEvent) {
         ev.replayed = self.replaying;
@@ -914,9 +936,12 @@ mod tests {
         assert_eq!(drain(&mut rx).len(), 2);
         std::fs::write(&p, "{\"type\":\"user\",\"content\":\"new\"}\n").unwrap();
         e.path_changed(&p);
-        let evs = drain(&mut rx);
+        let (evs, gone): (Vec<_>, Vec<_>) = drain(&mut rx).into_iter().partition(|e| !e.removed);
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].line_index, 0);
+        // The second line no longer exists: retracted, with a tombstone.
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].line_index, 1);
     }
 
     #[test]
@@ -1018,9 +1043,11 @@ mod tests {
         .unwrap();
         e.path_changed(&p);
         e.flush();
-        let evs = drain(&mut rx);
+        let (evs, gone): (Vec<_>, Vec<_>) = drain(&mut rx).into_iter().partition(|e| !e.removed);
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].line_index, 1);
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].line_index, 2);
         let s = store.session("task-1").unwrap();
         assert_eq!(s.event_count, 2, "edited in place, tail removed");
         assert_eq!(s.user_count, 1);
@@ -1473,7 +1500,9 @@ mod tests {
             db.session_events("old", None, None, 10, 0).unwrap().total,
             0
         );
-        assert_eq!(store2.session("old").map(|s| s.event_count), Some(0));
+        // No empty "ghost" session is left behind, in memory or on disk.
+        assert!(store2.session("old").is_none());
+        assert!(db.load_sessions().unwrap().iter().all(|s| s.id != "old"));
         assert_eq!(store2.session("new").map(|s| s.event_count), Some(1));
     }
 
@@ -1530,5 +1559,29 @@ mod tests {
         e2.scan(false);
         let ev = rx.try_recv().expect("the new record");
         assert_eq!(ev.model.as_deref(), Some("o4-mini"));
+    }
+
+    #[test]
+    fn compaction_keeps_usage_of_a_record_that_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.jsonl");
+        let user =
+            |t: &str| format!("{{\"type\":\"user\",\"sessionId\":\"s\",\"content\":\"{t}\"}}\n");
+        let reply = "{\"type\":\"assistant\",\"sessionId\":\"s\",\"message\":{\"id\":\"msg_9\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"usage\":{\"input_tokens\":500,\"output_tokens\":5}}}\n";
+        append(&p, &(user("one") + reply + &user("two")));
+        let (mut e, store, mut rx) = engine(vec![root(dir.path(), Some(AgentSource::ClaudeCode))]);
+        e.scan(true);
+        drain(&mut rx);
+        assert_eq!(store.session("s").unwrap().input_tokens, 500);
+
+        // Compacted: the reply is now the first line.
+        std::fs::write(&p, reply).unwrap();
+        e.path_changed(&p);
+        let s = store.session("s").unwrap();
+        assert_eq!(s.event_count, 1);
+        assert_eq!(s.input_tokens, 500, "the moved reply's usage was lost");
+        // Live subscribers are told about the retracted records.
+        let gone = drain(&mut rx).into_iter().filter(|e| e.removed).count();
+        assert_eq!(gone, 2);
     }
 }

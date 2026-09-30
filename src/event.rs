@@ -74,6 +74,11 @@ pub struct TraceEvent {
     /// persisted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replayed: bool,
+    /// A tombstone: this record was deleted at its source (a history rewind,
+    /// a truncated or replaced log) and has been retracted. Live consumers
+    /// drop it. Not persisted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
 }
 
 /// Backward-compat default: traces recorded before the multi-agent upgrade
@@ -145,6 +150,7 @@ impl TraceEvent {
             turn_end: en.turn_end,
             usage_key: en.usage_key,
             replayed: false,
+            removed: false,
             entry: raw,
         }
     }

@@ -553,6 +553,17 @@ function updateConn(){
 let refreshDebounce;
 function ingest(ev, live){
   const key = ev.session_id+':'+ev.line_index;
+  if(ev.removed){
+    // Deleted at its source (a rewind, a truncated log): drop the row.
+    state.feedSeen.delete(key);
+    state.feed=state.feed.filter(e=> (e.session_id+':'+e.line_index)!==key);
+    const row=document.querySelector(`#feed .event[data-key="${CSS.escape(key)}"]`);
+    if(row) row.remove();
+    if(live && state.tab==='conversation' && ev.session_id===state.selected) scheduleConvRefresh();
+    clearTimeout(refreshDebounce);
+    refreshDebounce=setTimeout(()=>{ loadSessions(); if(state.tab==='analytics') loadAnalytics(); }, 1200);
+    return;
+  }
   if(state.feedSeen.has(key)){
     // Documents and databases update records in place: replace the row.
     const i=state.feed.findIndex(e=> (e.session_id+':'+e.line_index)===key);
