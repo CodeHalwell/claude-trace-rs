@@ -189,7 +189,12 @@ impl SessionStats {
         self.cost_usd += ev.cost_usd;
 
         if let Some(t) = &ev.title {
-            self.title = Some(t.clone());
+            // Claude Code's `summary` records are older-style short titles
+            // (and can describe the conversation a resumed session came
+            // from): a fallback only, never over an AI or user-set title.
+            if ev.event_type != "summary" || self.title.is_none() {
+                self.title = Some(t.clone());
+            }
         }
         if self.first_prompt.is_none() {
             self.first_prompt = first_prompt_of(ev);

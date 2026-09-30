@@ -117,7 +117,11 @@ pub fn enrich(raw: &Value) -> Enrichment {
     let message = canonical_message(raw, &event_type);
     let title = match event_type.as_str() {
         "ai-title" => raw.get("aiTitle").and_then(|v| v.as_str()),
-        "summary" => raw.get("summary").and_then(|v| v.as_str()),
+        // Short titles only: anything long or multi-line is not a label.
+        "summary" => raw
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .filter(|t| t.len() <= 200 && !t.contains('\n')),
         "custom-title" => raw.get("customTitle").and_then(|v| v.as_str()),
         _ => None,
     }

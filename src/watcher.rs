@@ -114,9 +114,18 @@ impl SessionWatcher {
             if self.engine.has_pending() && last_change.elapsed() >= DEBOUNCE {
                 self.engine.flush();
             }
-            if let Some(only) = &self.options.discover {
-                if last_discover.elapsed() >= DISCOVER_EVERY {
-                    last_discover = Instant::now();
+            if last_discover.elapsed() >= DISCOVER_EVERY {
+                last_discover = Instant::now();
+                // Configured roots that did not exist at start-up (nothing
+                // could be watched there) are picked up once they appear.
+                for root in self.engine.roots().to_vec() {
+                    if root.path.is_dir() && !watched.iter().any(|w| root.path.starts_with(w)) {
+                        info!("Watch root {} now exists", root.path.display());
+                        self.engine.scan_root(&root, true);
+                        watch_root(&mut watcher, &mut watched, &root.path);
+                    }
+                }
+                if let Some(only) = &self.options.discover {
                     for root in sources::default_roots() {
                         if let (Some(only), Some(src)) = (only, root.source) {
                             if !only.contains(&src) {

@@ -58,6 +58,7 @@ pub struct Tracer {
     pub store: SessionStore,
     pub db: Db,
     pub roots: SharedRoots,
+    pub server_key: Option<Arc<Vec<u8>>>,
 }
 
 impl Tracer {
@@ -124,11 +125,20 @@ impl Tracer {
                 }
             })?;
 
+        let server_key = match load_or_create_server_key() {
+            Ok(k) => Some(Arc::new(k)),
+            Err(e) => {
+                warn!("No server key ({e}); the desktop app will not attach to this server");
+                None
+            }
+        };
+
         Ok(Self {
             tx,
             store,
             db: database,
             roots,
+            server_key,
         })
     }
 
@@ -139,6 +149,7 @@ impl Tracer {
             store: self.store.clone(),
             db: self.db.clone(),
             roots: self.roots.clone(),
+            server_key: self.server_key.clone(),
         }
     }
 
@@ -225,17 +236,105 @@ pub async fn bind_local(port: u16) -> std::io::Result<TcpListener> {
     TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await
 }
 
+/// A claude-trace-rs server found answering on a port.
+#[derive(Debug, Clone)]
+pub struct ProbeResult {
+    pub version: String,
+    /// It proved knowledge of this user's server key, so it is ours and not
+    /// another user's (or any other) process that happens to hold the port.
+    pub verified: bool,
+}
+
 /// Is a claude-trace-rs server already answering on `port`? Used by the
 /// desktop app to attach to a running background service instead of starting
-/// a second watcher on the same database. Returns the server's version.
-pub async fn probe_existing(port: u16) -> Option<String> {
-    let v = get_local_json(port, "/health").await?;
-    (v.get("app").and_then(|a| a.as_str()) == Some("claude-trace-rs")).then(|| {
-        v.get("version")
+/// a second watcher on the same database.
+pub async fn probe_existing(port: u16) -> Option<ProbeResult> {
+    let key = read_server_key();
+    let challenge = random_hex(16);
+    let v = get_local_json(port, &format!("/health?challenge={challenge}")).await?;
+    if v.get("app").and_then(|a| a.as_str()) != Some("claude-trace-rs") {
+        return None;
+    }
+    let verified = match (key, v.get("proof").and_then(|p| p.as_str())) {
+        (Some(key), Some(proof)) => {
+            constant_time_eq(health_proof(&key, &challenge).as_bytes(), proof.as_bytes())
+        }
+        _ => false,
+    };
+    Some(ProbeResult {
+        version: v
+            .get("version")
             .and_then(|x| x.as_str())
             .unwrap_or("?")
-            .to_owned()
+            .to_owned(),
+        verified,
     })
+}
+
+/// Where the per-user server key lives (next to the default database).
+pub fn server_key_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("rs", "claude-trace", "claude-trace-rs")
+        .map(|d| d.data_dir().join("server.key"))
+}
+
+fn read_server_key() -> Option<Vec<u8>> {
+    let raw = std::fs::read_to_string(server_key_path()?).ok()?;
+    let key = raw.trim();
+    (key.len() >= 32).then(|| key.as_bytes().to_vec())
+}
+
+/// Read the per-user server key, creating it (readable by this user only)
+/// on first use.
+pub fn load_or_create_server_key() -> std::io::Result<Vec<u8>> {
+    if let Some(k) = read_server_key() {
+        return Ok(k);
+    }
+    let path = server_key_path()
+        .ok_or_else(|| std::io::Error::other("no data directory for this user"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let key = random_hex(32);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(&path) {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(key.as_bytes())?;
+            Ok(key.into_bytes())
+        }
+        // Another process created it first; use theirs.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_server_key().ok_or(e),
+        Err(e) => Err(e),
+    }
+}
+
+/// HMAC-SHA256 of a health challenge under the server key, hex encoded.
+pub fn health_proof(key: &[u8], challenge: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC takes any key length");
+    mac.update(b"claude-trace-rs health v1:");
+    mac.update(challenge.as_bytes());
+    hex(&mac.finalize().into_bytes())
+}
+
+fn random_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    getrandom::getrandom(&mut buf).expect("OS random number generator");
+    hex(&buf)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Minimal HTTP/1.1 GET of a small JSON endpoint on the loopback server.
@@ -266,4 +365,23 @@ pub async fn get_local_json(port: u16, path: &str) -> Option<serde_json::Value> 
         return None;
     }
     serde_json::from_str(body.trim()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_proof_depends_on_key_and_challenge() {
+        let a = health_proof(b"key-one-key-one-key-one-key-one!", "00ff");
+        assert_eq!(a.len(), 64);
+        assert_eq!(a, health_proof(b"key-one-key-one-key-one-key-one!", "00ff"));
+        assert_ne!(a, health_proof(b"key-two-key-two-key-two-key-two!", "00ff"));
+        assert_ne!(a, health_proof(b"key-one-key-one-key-one-key-one!", "00fe"));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert_eq!(random_hex(16).len(), 32);
+        assert_ne!(random_hex(16), random_hex(16));
+    }
 }

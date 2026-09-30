@@ -117,20 +117,29 @@ async fn start_backend(app: AppHandle, ctx: Arc<Ctx>) {
     let settings = ctx.settings();
     set_status(&app, "Looking for a running tracer…");
     let backend = match runtime::probe_existing(settings.port).await {
-        Some(version) => {
+        // Only a server that proves it holds this user's key gets the window
+        // (and with it the app's commands).
+        Some(found) if found.verified => {
             info!(
-                "Attaching to claude-trace-rs {version} already serving on port {}",
-                settings.port
+                "Attaching to claude-trace-rs {} already serving on port {}",
+                found.version, settings.port
             );
             backend::Backend {
                 mode: Mode::Attached,
                 port: settings.port,
                 db_path: backend::db_path(&settings),
-                server_version: version,
+                server_version: found.version,
                 tracer: None,
             }
         }
-        None => {
+        found => {
+            if let Some(f) = found {
+                warn!(
+                    "A claude-trace-rs {} server on port {} could not prove it belongs to \
+                     this user; starting a separate tracer instead",
+                    f.version, settings.port
+                );
+            }
             set_status(&app, "Starting the tracer…");
             match backend::start_embedded(&settings).await {
                 Ok(b) => b,

@@ -130,7 +130,7 @@ impl Activity {
     /// Feed one event. Returns any notices it triggers.
     pub fn on_event(&mut self, ev: &TraceEvent, now: Instant) -> Vec<Notice> {
         let mut out = Vec::new();
-        if !is_fresh(ev) {
+        if ev.replayed || !is_fresh(ev) {
             return out;
         }
         self.roll_day();
@@ -362,6 +362,15 @@ mod tests {
         assert!(a.tick(t0 + Duration::from_secs(10)).is_empty());
         let n = a.tick(t0 + Duration::from_secs(40));
         assert!(matches!(n[0], Notice::TurnFinished { idle: true, .. }));
+    }
+
+    #[test]
+    fn events_marked_as_replayed_never_notify() {
+        let mut a = Activity::new(Duration::from_secs(30), Some(0.0001));
+        let mut ev = user("s7", "from the start-up scan");
+        ev.replayed = true;
+        assert!(a.on_event(&ev, Instant::now()).is_empty());
+        assert_eq!(a.active_sessions(Instant::now()), 0);
     }
 
     #[test]

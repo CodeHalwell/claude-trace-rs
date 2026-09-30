@@ -49,6 +49,11 @@ directories = "5"
 # Kimi and Cursor name session directories after an MD5 of the working
 # directory; hashing known paths maps them back.
 md-5 = "0.10"
+# The desktop app checks that a server it attaches to belongs to the same
+# user: an HMAC over a random challenge, keyed by a per-user secret file.
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -68,6 +68,12 @@ pub struct TraceEvent {
     /// the ingestion engine to count repeated usage once. Transient.
     #[serde(skip)]
     pub usage_key: Option<String>,
+    /// Emitted while replaying history (the start-up scan, a catch-up after
+    /// a restart, a newly discovered agent folder) rather than as it
+    /// happened. Live consumers such as notifications ignore these. Not
+    /// persisted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replayed: bool,
 }
 
 /// Backward-compat default: traces recorded before the multi-agent upgrade
@@ -138,6 +144,7 @@ impl TraceEvent {
             title: en.title,
             turn_end: en.turn_end,
             usage_key: en.usage_key,
+            replayed: false,
             entry: raw,
         }
     }

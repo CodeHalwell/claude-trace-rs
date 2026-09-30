@@ -128,13 +128,28 @@ fn deliver(app: &AppHandle, ctx: &Ctx, notices: Vec<Notice>) {
             Notice::BudgetExceeded {
                 spent_usd,
                 budget_usd,
-            } => (
-                "Daily budget reached".to_owned(),
-                format!("Estimated spend today is ${spent_usd:.2} (budget ${budget_usd:.2})."),
-            ),
+            } => {
+                let body =
+                    format!("Estimated spend today is ${spent_usd:.2} (budget ${budget_usd:.2}).");
+                if !may_interrupt {
+                    // The dashboard is in front: say it there rather than
+                    // with a system notification, but still say it (the
+                    // alert fires once a day).
+                    toast_in_window(app, &format!("Daily budget reached. {body}"));
+                    continue;
+                }
+                ("Daily budget reached".to_owned(), body)
+            }
             _ => continue,
         };
         show(app, &title, &body);
+    }
+}
+
+fn toast_in_window(app: &AppHandle, text: &str) {
+    if let Some(w) = app.get_webview_window("main") {
+        let arg = serde_json::to_string(text).unwrap_or_default();
+        let _ = w.eval(format!("typeof toast === 'function' && toast({arg})"));
     }
 }
 

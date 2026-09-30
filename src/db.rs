@@ -17,6 +17,7 @@
 //! the data rather than the device.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -148,6 +149,7 @@ impl Db {
             "ALTER TABLE events ADD COLUMN source TEXT NOT NULL DEFAULT 'claude-code'",
             "ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'claude-code'",
             "ALTER TABLE sessions ADD COLUMN first_prompt TEXT",
+            "ALTER TABLE events ADD COLUMN usage_key TEXT",
         ] {
             if let Err(e) = conn.execute_batch(ddl) {
                 // "duplicate column name" means the migration already ran.
@@ -158,7 +160,9 @@ impl Db {
         }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_events_source ON events(source);
-             CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);",
+             CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+             CREATE INDEX IF NOT EXISTS idx_events_usage_key ON events(usage_key)
+                WHERE usage_key IS NOT NULL;",
         )?;
         Ok(())
     }
@@ -180,31 +184,49 @@ impl Db {
     /// the raw entry lets those updates through while keeping re-reads of
     /// unchanged data free.
     pub fn upsert_event(&self, ev: &TraceEvent) -> anyhow::Result<Upsert> {
-        let conn = self.conn.lock().expect("db poisoned");
-        if Self::insert_or_ignore(&conn, ev)? {
+        let mut conn = self.conn.lock().expect("db poisoned");
+        // One transaction, so a failed write never loses the stored version.
+        let tx = conn.transaction()?;
+        if Self::insert_or_ignore(&tx, ev)? {
+            tx.commit()?;
             return Ok(Upsert::Inserted);
         }
-        let stored: Option<String> = conn
+        let stored: Option<(String, Option<String>)> = tx
             .query_row(
-                "SELECT event_json FROM events WHERE session_id = ?1 AND line_index = ?2",
+                "SELECT event_json, usage_key FROM events WHERE session_id = ?1 AND line_index = ?2",
                 params![ev.session_id, ev.line_index as i64],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some(stored) = stored else {
+        let Some((stored, stored_key)) = stored else {
             return Ok(Upsert::Inserted);
         };
         let mut old: TraceEvent = serde_json::from_str(&stored)?;
-        if old.entry == ev.entry && old.source == ev.source {
+        if old.entry == ev.entry && old.source == ev.source && stored_key == ev.usage_key {
             return Ok(Upsert::Unchanged);
         }
-        conn.execute(
+        tx.execute(
             "DELETE FROM events WHERE session_id = ?1 AND line_index = ?2",
             params![ev.session_id, ev.line_index as i64],
         )?;
-        Self::insert_or_ignore(&conn, ev)?;
+        Self::insert_or_ignore(&tx, ev)?;
+        tx.commit()?;
         old.hydrate();
         Ok(Upsert::Updated(Box::new(old)))
+    }
+
+    /// The record that owns a response's usage (see
+    /// [`TraceEvent::usage_key`]), so repeated usage is counted once even
+    /// across restarts.
+    pub fn usage_owner(&self, key: &str) -> anyhow::Result<Option<(String, usize)>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT session_id, line_index FROM events WHERE usage_key = ?1 LIMIT 1",
+                params![key],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as usize)),
+            )
+            .optional()?)
     }
 
     /// Delete one event, returning it if it existed.
@@ -246,8 +268,8 @@ impl Db {
                (session_id, line_index, event_type, observed_at, timestamp, model,
                 cost_usd, cost_estimated, input_tokens, output_tokens,
                 cache_read_tokens, cache_creation_tokens, summary, search_text,
-                tool_uses, event_json, source)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                tool_uses, event_json, source, usage_key)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 ev.session_id,
                 ev.line_index as i64,
@@ -266,6 +288,7 @@ impl Db {
                 tool_uses,
                 event_json,
                 ev.source,
+                ev.usage_key,
             ],
         )?;
         Ok(changed > 0)
@@ -634,8 +657,10 @@ impl Db {
     pub fn cost_since(&self, since: &str) -> anyhow::Result<f64> {
         let conn = self.conn.lock().expect("db poisoned");
         Ok(conn.query_row(
+            // Compare instants, not strings: records carry assorted UTC
+            // offsets, and `01:00+02:00` sorts after `00:00Z` as text.
             "SELECT COALESCE(SUM(cost_usd), 0.0) FROM events
-             WHERE COALESCE(timestamp, observed_at) >= ?1",
+             WHERE julianday(COALESCE(timestamp, observed_at)) >= julianday(?1)",
             params![since],
             |r| r.get(0),
         )?)
@@ -702,6 +727,57 @@ impl Db {
                 c.cursor
             ],
         )?;
+        Ok(())
+    }
+
+    /// Record hashes saved for a unit by [`Db::save_doc_hashes`].
+    pub fn doc_hashes(&self, path: &str) -> anyhow::Result<HashMap<String, Vec<u64>>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut stmt =
+            conn.prepare("SELECT session_id, hashes FROM ingest_docs WHERE path = ?1")?;
+        let rows = stmt.query_map(params![path], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (sid, blob) = row?;
+            let hashes = blob
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().expect("8-byte chunk")))
+                .collect();
+            out.insert(sid, hashes);
+        }
+        Ok(out)
+    }
+
+    /// Save the record hashes of the sessions that changed in a unit, and
+    /// drop those of sessions that disappeared from it.
+    pub fn save_doc_hashes(
+        &self,
+        path: &str,
+        changed: &[(&str, &[u64])],
+        removed: &[&str],
+    ) -> anyhow::Result<()> {
+        if changed.is_empty() && removed.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().expect("db poisoned");
+        let tx = conn.transaction()?;
+        for (sid, hashes) in changed {
+            let blob: Vec<u8> = hashes.iter().flat_map(|h| h.to_le_bytes()).collect();
+            tx.execute(
+                "INSERT INTO ingest_docs (path, session_id, hashes) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path, session_id) DO UPDATE SET hashes = excluded.hashes",
+                params![path, sid, blob],
+            )?;
+        }
+        for sid in removed {
+            tx.execute(
+                "DELETE FROM ingest_docs WHERE path = ?1 AND session_id = ?2",
+                params![path, sid],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -811,6 +887,7 @@ fn stored_event_json(ev: &TraceEvent) -> anyhow::Result<String> {
     let mut v = serde_json::to_value(ev)?;
     if let Some(obj) = v.as_object_mut() {
         obj.remove("message");
+        obj.remove("replayed");
     }
     Ok(serde_json::to_string(&v)?)
 }
@@ -897,6 +974,16 @@ CREATE TABLE IF NOT EXISTS ingest_files (
     cursor      TEXT
 );
 
+-- Record hashes per session from the last parse of a document, store or
+-- database, so a restart diffs against what was actually seen: history that
+-- was deliberately skipped stays skipped, and only real changes are emitted.
+CREATE TABLE IF NOT EXISTS ingest_docs (
+    path       TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    hashes     BLOB NOT NULL,
+    PRIMARY KEY (path, session_id)
+);
+
 CREATE TABLE IF NOT EXISTS session_meta (
     id         TEXT PRIMARY KEY,
     bookmarked INTEGER NOT NULL DEFAULT 0,
@@ -961,19 +1048,56 @@ mod tests {
     #[test]
     fn cost_since_filters_by_timestamp() {
         let db = Db::open_in_memory().unwrap();
-        let usage = |ts: &str, line| {
+        let usage = |ts: &str, line, cost: f64| {
             ev(
                 "a",
                 line,
                 "assistant",
-                json!({ "timestamp": ts, "costUSD": 1.5, "message": { "content": "x" } }),
+                json!({ "timestamp": ts, "costUSD": cost, "message": { "content": "x" } }),
             )
         };
-        db.insert_event(&usage("2026-09-28T23:59:00Z", 0)).unwrap();
-        db.insert_event(&usage("2026-09-29T08:00:00.123Z", 1))
-            .unwrap();
+        let rows = [
+            ("2026-09-28T23:59:00Z", 1.0),     // before midnight
+            ("2026-09-29T08:00:00.123Z", 2.0), // after
+            // Offsets are compared as instants, not text:
+            ("2026-09-29T01:00:00+02:00", 4.0), // 23:00Z the day before
+            ("2026-09-28T20:00:00.5-07:00", 8.0), // 03:00Z today
+        ];
+        for (i, (ts, cost)) in rows.iter().enumerate() {
+            db.insert_event(&usage(ts, i, *cost)).unwrap();
+        }
         let today = db.cost_since("2026-09-29T00:00:00Z").unwrap();
-        assert!((today - 1.5).abs() < 1e-9, "{today}");
+        assert!((today - 10.0).abs() < 1e-9, "{today}");
+    }
+
+    #[test]
+    fn upsert_replaces_changed_records_and_keeps_usage_owner() {
+        let db = Db::open_in_memory().unwrap();
+        let mut e = ev("a", 0, "user", json!({ "content": "draft" }));
+        e.usage_key = Some("k1".into());
+        assert!(matches!(db.upsert_event(&e).unwrap(), Upsert::Inserted));
+        assert!(matches!(db.upsert_event(&e).unwrap(), Upsert::Unchanged));
+        let mut changed = ev("a", 0, "user", json!({ "content": "final" }));
+        changed.usage_key = Some("k1".into());
+        assert!(matches!(
+            db.upsert_event(&changed).unwrap(),
+            Upsert::Updated(_)
+        ));
+        assert_eq!(db.usage_owner("k1").unwrap(), Some(("a".to_owned(), 0)));
+        let page = db.session_events("a", None, None, 10, 0).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.events[0]["entry"]["content"], json!("final"));
+    }
+
+    #[test]
+    fn doc_hashes_roundtrip_and_delete() {
+        let db = Db::open_in_memory().unwrap();
+        db.save_doc_hashes("/x", &[("s1", &[1, u64::MAX]), ("s2", &[7])], &[])
+            .unwrap();
+        let h = db.doc_hashes("/x").unwrap();
+        assert_eq!(h["s1"], vec![1, u64::MAX]);
+        db.save_doc_hashes("/x", &[], &["s1"]).unwrap();
+        assert_eq!(db.doc_hashes("/x").unwrap().len(), 1);
     }
 
     #[test]

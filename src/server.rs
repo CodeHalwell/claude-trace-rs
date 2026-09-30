@@ -35,6 +35,9 @@ pub struct AppState {
     pub db: Db,
     /// Live list of watched roots (grows when new agents are discovered).
     pub roots: SharedRoots,
+    /// Per-user secret used to answer `/health?challenge=…`, so clients can
+    /// tell this server from another user's process on the same port.
+    pub server_key: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl AppState {
@@ -133,9 +136,18 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
     Html(dashboard_html(state.port))
 }
 
-async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+#[derive(Debug, Deserialize)]
+struct HealthQuery {
+    /// Random hex nonce from a client that wants proof of ownership.
+    challenge: Option<String>,
+}
+
+async fn health_handler(
+    Query(q): Query<HealthQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     let roots = state.watch_roots();
-    Json(json!({
+    let mut body = json!({
         "status": "ok",
         "app": "claude-trace-rs",
         "version": crate::VERSION,
@@ -143,7 +155,13 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         "watch_roots": roots,
         "sessions": state.store.sessions().len(),
         "total_events": state.store.total_events(),
-    }))
+    });
+    if let (Some(key), Some(c)) = (&state.server_key, &q.challenge) {
+        if (16..=128).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_hexdigit()) {
+            body["proof"] = json!(crate::runtime::health_proof(key, c));
+        }
+    }
+    Json(body)
 }
 
 async fn api_sessions(State(state): State<AppState>) -> impl IntoResponse {

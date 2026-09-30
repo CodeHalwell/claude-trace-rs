@@ -171,7 +171,7 @@ The builds are not code-signed yet, so the first launch needs one extra step: on
 
 ### How it runs
 
-On start-up the app looks for a claude-trace-rs server on its port (7779 by default). If the background service (`claude-trace-rs service install`) or a `claude-trace-rs serve` is already running there, the app **attaches** to it — one tracer, one database. Otherwise it starts its own tracer in-process, sharing the CLI's database, so history recorded by either is visible in both. The first run imports everything already on disk; later runs catch up from where they left off.
+On start-up the app looks for a claude-trace-rs server on its port (7779 by default). If the background service (`claude-trace-rs service install`) or a `claude-trace-rs serve` is already running there, the app **attaches** to it — one tracer, one database. The server has to prove it is yours first (an HMAC of a random challenge, keyed by a per-user `server.key` in the data directory); anything else on the port is ignored. Otherwise it starts its own tracer in-process, sharing the CLI's database, so history recorded by either is visible in both. The first run imports everything already on disk; later runs catch up from where they left off.
 
 | | Linux | macOS | Windows |
 | - | ----- | ----- | ------- |
@@ -412,7 +412,7 @@ Events are keyed by `(session_id, line_index)`: a record that changes (a documen
 - Binds **only** to `127.0.0.1` — never to all interfaces.
 - Requests are rejected with `403` unless the `Host` header is a loopback name (DNS-rebinding defence), and WebSocket upgrades and `/api/*` requests are rejected when the `Origin` is anything other than exactly `http(s)://127.0.0.1` / `localhost` / `[::1]` (with any port). No-Origin requests (curl, server-to-server) pass through.
 - CORS allow-origin is the same exact loopback check, not `Any`.
-- The desktop app grants its dashboard only the app's own commands, only on the port its tracer uses; links leave the app for your browser, and "open folder" never runs a file.
+- The desktop app grants its dashboard only the app's own commands, only on the port its tracer uses, and only attaches to a server that proves it holds your per-user key; links leave the app for your browser, and "open folder" never runs a file.
 - No telemetry, no outbound calls.
 
 ## Development

@@ -23,8 +23,7 @@
 //! catches up on whatever was written while the tracer was not running.
 
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap, HashSet},
-    hash::{Hash, Hasher},
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
@@ -59,6 +58,11 @@ pub struct FileState {
     pub cursor: Option<String>,
     /// Adapter state carried across a JSONL file's records.
     pub carry: serde_json::Map<String, serde_json::Value>,
+    /// Sessions whose records this JSONL file has produced.
+    pub sessions: HashSet<String>,
+    /// Record count before the file was truncated or replaced; records from
+    /// the new end up to here are retracted once it has been re-read.
+    pub retract_from: Option<usize>,
 }
 
 /// Counters from one engine pass, for logging and the CLI.
@@ -81,6 +85,8 @@ pub struct Engine {
     /// See [`Db::checkpoint_horizon`]; read once, before this run's own
     /// checkpoints move it.
     horizon: Option<Option<i64>>,
+    /// Set while seeding, so emitted events are marked as replayed history.
+    replaying: bool,
     stats: Stats,
 }
 
@@ -98,6 +104,7 @@ impl Engine {
             pending: HashSet::new(),
             usage_owners: HashMap::new(),
             horizon: None,
+            replaying: false,
             stats: Stats::default(),
         }
     }
@@ -133,6 +140,7 @@ impl Engine {
     pub fn scan(&mut self, backfill: bool) -> Stats {
         // Pin the horizon before this scan saves any checkpoints.
         self.written_while_stopped(i64::MIN);
+        self.replaying = true;
         // Roots can nest (an explicit `--watch-root ~/.codex` above the
         // auto-discovered `~/.codex/sessions`). Walk the most specific root
         // first so it claims its own files; later roots skip anything already
@@ -148,6 +156,7 @@ impl Engine {
             }
         }
         self.flush();
+        self.replaying = false;
         self.stats
     }
 
@@ -156,10 +165,12 @@ impl Engine {
         let mut units = Vec::new();
         let mut seen: HashSet<PathBuf> = self.states.keys().cloned().collect();
         walk(&root.path, root, &mut units, &mut seen);
+        self.replaying = true;
         for (path, source, kind) in units {
             self.seed_unit(&path, root, source, kind, backfill);
         }
         self.flush();
+        self.replaying = false;
     }
 
     /// React to a filesystem change. JSONL is tailed immediately; other kinds
@@ -237,7 +248,17 @@ impl Engine {
                         self.save_checkpoint(path, source);
                     }
                     _ => {
-                        self.states.insert(path.to_path_buf(), FileState::default());
+                        // Shorter than when we last read it: truncated or
+                        // replaced while stopped.
+                        let retract_from =
+                            checkpoint.filter(|c| c.offset > len).map(|c| c.line_count);
+                        self.states.insert(
+                            path.to_path_buf(),
+                            FileState {
+                                retract_from,
+                                ..Default::default()
+                            },
+                        );
                         self.process_jsonl(path, root, source);
                     }
                 }
@@ -258,14 +279,24 @@ impl Engine {
                 } else {
                     self.checkpoint(&unit)
                 };
-                // Emit on seed when backfilling or when we have processed this
-                // unit before (its checkpoint means the database already holds
-                // earlier records, so re-parsing only surfaces what changed).
-                // A brand-new unit without backfill is parsed silently so only
-                // later changes stream in.
+                // A unit parsed by an earlier run is diffed against the record
+                // hashes it saved, so only what changed since is emitted (and
+                // history that run deliberately skipped stays skipped). A
+                // brand-new unit is parsed silently, so only later changes
+                // stream in, unless backfilling or it was written while we
+                // were stopped. A backfill starts from nothing and replays all.
+                let restored = match (&checkpoint, backfill, self.store.db()) {
+                    (Some(_), false, Some(db)) => {
+                        db.doc_hashes(&unit.to_string_lossy()).unwrap_or_default()
+                    }
+                    _ => HashMap::new(),
+                };
                 let emit = backfill
-                    || checkpoint.is_some()
+                    || !restored.is_empty()
                     || self.written_while_stopped(file_meta(&unit).1);
+                if !restored.is_empty() {
+                    self.states.entry(unit.clone()).or_default().docs = restored;
+                }
                 if let Some(c) = &checkpoint {
                     let st = self.states.entry(unit.clone()).or_default();
                     st.cursor = c.cursor.clone();
@@ -293,6 +324,7 @@ impl Engine {
     fn process_jsonl(&mut self, path: &Path, root: &WatchRoot, root_detected: AgentSource) {
         let session_fallback = sources::session_id_for_path(root_detected, path);
         let mut emitted: Vec<TraceEvent> = Vec::new();
+        let mut retract: Vec<(String, usize)> = Vec::new();
         {
             let state = self.states.entry(path.to_owned()).or_default();
             let mut file = match std::fs::File::open(path) {
@@ -310,6 +342,7 @@ impl Engine {
                         state.offset,
                         meta.len()
                     );
+                    state.retract_from = Some(state.line_count);
                     state.offset = 0;
                     state.line_count = 0;
                 }
@@ -373,7 +406,9 @@ impl Engine {
                         } else {
                             sources::session_id_for_path(source, path)
                         };
-                        emitted.push(TraceEvent::from_raw_as(&fallback, idx, val, source));
+                        let ev = TraceEvent::from_raw_as(&fallback, idx, val, source);
+                        state.sessions.insert(ev.session_id.clone());
+                        emitted.push(ev);
                     }
                     Err(e) => {
                         warn!("Read error in {}: {e}", path.display());
@@ -384,10 +419,21 @@ impl Engine {
             let (len, mtime_ms) = file_meta(path);
             state.len = len;
             state.mtime_ms = mtime_ms;
+            // Records past the new end of a truncated file no longer exist.
+            if let Some(old) = state.retract_from.take() {
+                for sid in &state.sessions {
+                    for idx in state.line_count..old {
+                        retract.push((sid.clone(), idx));
+                    }
+                }
+            }
         }
-        let changed = !emitted.is_empty();
+        let changed = !emitted.is_empty() || !retract.is_empty();
         for ev in emitted {
             self.emit(ev);
+        }
+        for (sid, idx) in retract {
+            self.store.remove(&sid, idx);
         }
         if changed || self.store.db().is_some() {
             let src = self
@@ -493,15 +539,40 @@ impl Engine {
 
         let mut to_emit: Vec<TraceEvent> = Vec::new();
         let mut to_remove: Vec<(String, usize)> = Vec::new();
+        let mut changed_sessions: Vec<String> = Vec::new();
+        let mut vanished: Vec<String> = Vec::new();
         {
             let st = self.states.entry(unit.to_path_buf()).or_default();
             st.len = len;
             st.mtime_ms = mtime_ms;
             st.cursor = cursor;
             st.source = Some(source);
+            // A document holds all of its sessions, so one that is no longer
+            // there was deleted (a multi-session log rewritten). Databases
+            // only return the sessions that changed, and an empty parse of a
+            // document is more likely mid-write than deliberate.
+            if kind == FileKind::Document && !docs.is_empty() {
+                let present: HashSet<&str> = docs.iter().map(|d| d.session_id.as_str()).collect();
+                vanished = st
+                    .docs
+                    .keys()
+                    .filter(|k| !present.contains(k.as_str()))
+                    .cloned()
+                    .collect();
+                for sid in &vanished {
+                    if let Some(prev) = st.docs.remove(sid) {
+                        if emit {
+                            to_remove.extend((0..prev.len()).map(|i| (sid.clone(), i)));
+                        }
+                    }
+                }
+            }
             for doc in docs {
                 let hashes: Vec<u64> = doc.records.iter().map(hash_value).collect();
                 let prev = st.docs.get(&doc.session_id).cloned().unwrap_or_default();
+                if prev != hashes {
+                    changed_sessions.push(doc.session_id.clone());
+                }
                 if emit {
                     for (idx, (rec, h)) in doc.records.into_iter().zip(&hashes).enumerate() {
                         if prev.get(idx) == Some(h) {
@@ -526,6 +597,16 @@ impl Engine {
             self.store.remove(&sid, idx);
         }
         self.save_checkpoint(unit, source);
+        if let (Some(db), Some(st)) = (self.store.db(), self.states.get(unit)) {
+            let changed: Vec<(&str, &[u64])> = changed_sessions
+                .iter()
+                .filter_map(|sid| st.docs.get(sid).map(|h| (sid.as_str(), h.as_slice())))
+                .collect();
+            let removed: Vec<&str> = vanished.iter().map(String::as_str).collect();
+            if let Err(e) = db.save_doc_hashes(&unit.to_string_lossy(), &changed, &removed) {
+                debug!("Could not save record hashes for {}: {e}", unit.display());
+            }
+        }
         self.stats.units = self.states.len();
     }
 
@@ -534,16 +615,27 @@ impl Engine {
     // ------------------------------------------------------------------
 
     fn emit(&mut self, mut ev: TraceEvent) {
-        if let Some(key) = ev.usage_key.take() {
+        ev.replayed = self.replaying;
+        if let Some(key) = ev.usage_key.clone() {
             let me = (ev.session_id.clone(), ev.line_index);
             if self.usage_owners.len() > 200_000 {
                 self.usage_owners.clear();
             }
-            let owner = self.usage_owners.entry(key).or_insert_with(|| me.clone());
-            if *owner != me {
+            if !self.usage_owners.contains_key(&key) {
+                // The owner may have been recorded before a restart.
+                let stored = self
+                    .store
+                    .db()
+                    .and_then(|db| db.usage_owner(&key).ok().flatten());
+                self.usage_owners
+                    .insert(key.clone(), stored.unwrap_or_else(|| me.clone()));
+            }
+            if self.usage_owners.get(&key) != Some(&me) {
                 // Another record already reported this response's usage.
                 ev.usage = None;
                 ev.cost_usd = 0.0;
+                // Only the owner carries the key, so lookups find it.
+                ev.usage_key = None;
             }
         }
         if self.store.ingest(&ev).changed() {
@@ -634,12 +726,13 @@ pub fn most_specific_root<'a>(roots: &'a [WatchRoot], path: &Path) -> Option<&'a
         .max_by_key(|r| r.path.as_os_str().len())
 }
 
+/// Content hash of a record. Stable across runs and toolchains, since hashes
+/// are persisted (`DefaultHasher` is not). serde_json's map is ordered, so the
+/// serialisation is canonical for identical content.
 fn hash_value(v: &serde_json::Value) -> u64 {
-    let mut h = DefaultHasher::new();
-    // serde_json's map is ordered (BTreeMap without preserve_order), so the
-    // serialisation is canonical for identical content.
-    v.to_string().hash(&mut h);
-    h.finish()
+    use md5::{Digest, Md5};
+    let digest = Md5::digest(serde_json::to_vec(v).unwrap_or_default());
+    u64::from_le_bytes(digest[..8].try_into().expect("md5 is 16 bytes"))
 }
 
 fn file_meta(path: &Path) -> (u64, i64) {
@@ -1051,5 +1144,159 @@ mod tests {
         let s = store.session("ses_1").unwrap();
         assert_eq!(s.event_count, 2);
         assert!((s.cost_usd - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn truncated_jsonl_retracts_records_past_the_new_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.jsonl");
+        let line =
+            |t: &str| format!("{{\"type\":\"user\",\"sessionId\":\"s\",\"content\":\"{t}\"}}\n");
+        append(&p, &(line("one") + &line("two") + &line("three")));
+        let (mut e, store, _rx) = engine(vec![root(dir.path(), None)]);
+        e.scan(true);
+        assert_eq!(store.session("s").unwrap().event_count, 3);
+        // Replaced by a shorter file.
+        std::fs::write(&p, line("uno")).unwrap();
+        e.path_changed(&p);
+        let s = store.session("s").unwrap();
+        assert_eq!(s.event_count, 1, "stale records past the new end remain");
+        assert_eq!(store.session_events("s").len(), 1);
+    }
+
+    const AIDER_TWO: &str = "# aider chat started at 2026-09-01 10:00:00\n\n#### first question\n\nFirst answer.\n\n# aider chat started at 2026-09-02 11:00:00\n\n#### second question\n\nSecond answer.\n";
+
+    #[test]
+    fn sessions_removed_from_a_document_are_retracted() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".aider.chat.history.md");
+        std::fs::write(&p, AIDER_TWO).unwrap();
+        let (mut e, store, _rx) = engine(vec![root(dir.path(), Some(AgentSource::Aider))]);
+        e.scan(true);
+        assert_eq!(store.sessions().len(), 2);
+        let second = AIDER_TWO
+            .split_at(
+                AIDER_TWO
+                    .find("# aider chat started at 2026-09-02")
+                    .unwrap(),
+            )
+            .1;
+        std::fs::write(&p, second).unwrap();
+        e.path_changed(&p);
+        e.flush();
+        let live: Vec<_> = store
+            .sessions()
+            .into_iter()
+            .filter(|s| s.event_count > 0)
+            .collect();
+        assert_eq!(live.len(), 1, "the removed session still has events");
+    }
+
+    #[test]
+    fn silently_seeded_documents_stay_skipped_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let p = logs.join(".aider.chat.history.md");
+        std::fs::write(&p, AIDER_TWO).unwrap();
+        let db = Db::open(&dir.path().join("trace.db")).unwrap();
+
+        // First run without backfill: existing history is not imported.
+        let store = SessionStore::with_db(db.clone());
+        let mut e = Engine::new(
+            vec![root(&logs, Some(AgentSource::Aider))],
+            store.clone(),
+            None,
+        );
+        e.scan(false);
+        assert_eq!(store.total_events(), 0);
+        drop(e);
+
+        // Written while stopped: one more turn in the second session.
+        append(&p, "\n#### third question\n\nThird answer.\n");
+
+        let store2 = SessionStore::with_db(db.clone());
+        let mut e2 = Engine::new(
+            vec![root(&logs, Some(AgentSource::Aider))],
+            store2.clone(),
+            None,
+        );
+        e2.scan(false);
+        let stored: usize = db
+            .query_sessions(&Default::default())
+            .unwrap()
+            .iter()
+            .map(|s| s.event_count)
+            .sum();
+        assert!(stored > 0, "the new turn was not caught up");
+        assert!(
+            db.search_events("first question", 10, None)
+                .unwrap()
+                .is_empty(),
+            "history skipped on the first run was imported on restart"
+        );
+        assert!(!db
+            .search_events("third question", 10, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn repeated_usage_is_counted_once_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let p = logs.join("s.jsonl");
+        let line = |block: &str| {
+            format!(
+                "{{\"type\":\"assistant\",\"sessionId\":\"s\",\"message\":{{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"content\":[{block}],\"usage\":{{\"input_tokens\":1000,\"output_tokens\":10}}}}}}\n"
+            )
+        };
+        append(&p, &line(r#"{"type":"thinking","thinking":"hm"}"#));
+        let db = Db::open(&dir.path().join("trace.db")).unwrap();
+        let store = SessionStore::with_db(db.clone());
+        let mut e = Engine::new(
+            vec![root(&logs, Some(AgentSource::ClaudeCode))],
+            store.clone(),
+            None,
+        );
+        e.scan(true);
+        drop(e);
+
+        // The rest of the same response arrives while stopped.
+        append(&p, &line(r#"{"type":"text","text":"done"}"#));
+        let store2 = SessionStore::with_db(db.clone());
+        store2.seed_sessions(db.load_sessions().unwrap());
+        let mut e2 = Engine::new(
+            vec![root(&logs, Some(AgentSource::ClaudeCode))],
+            store2.clone(),
+            None,
+        );
+        e2.scan(false);
+        let s = store2.session("s").unwrap();
+        assert_eq!(s.event_count, 2);
+        assert_eq!(
+            s.input_tokens, 1000,
+            "usage counted twice across the restart"
+        );
+    }
+
+    #[test]
+    fn seeding_marks_events_as_replayed_and_live_ones_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.jsonl");
+        append(
+            &p,
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"content\":\"old\"}\n",
+        );
+        let (mut e, _store, mut rx) = engine(vec![root(dir.path(), None)]);
+        e.scan(true);
+        assert!(rx.try_recv().unwrap().replayed);
+        append(
+            &p,
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"content\":\"new\"}\n",
+        );
+        e.path_changed(&p);
+        assert!(!rx.try_recv().unwrap().replayed);
     }
 }
