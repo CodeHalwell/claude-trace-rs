@@ -21,6 +21,8 @@ use crate::{
 
 /// How long a document/database must be quiet before it is re-parsed.
 const DEBOUNCE: Duration = Duration::from_millis(300);
+/// Longest a queued unit waits when its writer never pauses.
+const MAX_DEBOUNCE: Duration = Duration::from_secs(2);
 /// How often to look for agent directories that did not exist at start-up.
 const DISCOVER_EVERY: Duration = Duration::from_secs(30);
 
@@ -95,24 +97,31 @@ impl SessionWatcher {
             watch_root(&mut watcher, &mut watched, &root.path);
         }
 
+        // Debounce only on changes to queued units: JSONL appends and
+        // unrelated files elsewhere under a root must not hold them back.
         let mut last_change = Instant::now();
+        let mut pending_since: Option<Instant> = None;
         let mut last_discover = Instant::now();
         loop {
             match fs_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(Ok(event)) => {
                     if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
                         for path in event.paths {
-                            self.engine.path_changed(&path);
+                            if self.engine.path_changed(&path) {
+                                last_change = Instant::now();
+                                pending_since.get_or_insert(last_change);
+                            }
                         }
-                        last_change = Instant::now();
                     }
                 }
                 Ok(Err(e)) => error!("Filesystem watch error: {e}"),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if self.engine.has_pending() && last_change.elapsed() >= DEBOUNCE {
+            let overdue = pending_since.is_some_and(|t| t.elapsed() >= MAX_DEBOUNCE);
+            if self.engine.has_pending() && (last_change.elapsed() >= DEBOUNCE || overdue) {
                 self.engine.flush();
+                pending_since = None;
             }
             if last_discover.elapsed() >= DISCOVER_EVERY {
                 last_discover = Instant::now();

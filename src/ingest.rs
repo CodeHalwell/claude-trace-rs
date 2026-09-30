@@ -176,24 +176,33 @@ impl Engine {
     /// React to a filesystem change. JSONL is tailed immediately; other kinds
     /// are queued for [`Engine::flush`] so bursts of writes (a document being
     /// rewritten, a database committing) are processed once.
-    pub fn path_changed(&mut self, path: &Path) {
+    ///
+    /// Returns whether the change queued (or re-touched) a debounced unit,
+    /// so the caller restarts the debounce only for those.
+    pub fn path_changed(&mut self, path: &Path) -> bool {
         let Some(root) = most_specific_root(&self.roots, path).cloned() else {
-            return;
+            return false;
         };
         let Some((source, kind)) = sources::classify(root.source, path) else {
-            return;
+            return false;
         };
         match kind {
-            FileKind::Jsonl => self.process_jsonl(path, &root, source),
+            FileKind::Jsonl => {
+                self.process_jsonl(path, &root, source);
+                false
+            }
             FileKind::Document | FileKind::Sqlite => {
                 let unit = sources::unit_path(source, kind, path);
                 self.pending.insert((unit, source, kind));
+                true
             }
-            FileKind::StoreMember => {
-                if let Some(unit) = sources::store_unit(source, path) {
+            FileKind::StoreMember => match sources::store_unit(source, path) {
+                Some(unit) => {
                     self.pending.insert((unit, source, kind));
+                    true
                 }
-            }
+                None => false,
+            },
         }
     }
 
@@ -237,10 +246,12 @@ impl Engine {
                         self.process_jsonl(path, root, source);
                     }
                     None if !backfill && !self.written_while_stopped(mtime_ms) => {
-                        // Never seen before and not backfilling: start at EOF.
-                        let line_count = count_nonempty_lines(path);
+                        // Never seen before and not backfilling: start at the
+                        // end of the last complete record, so one still being
+                        // written is read once its writer finishes it.
+                        let (offset, line_count) = complete_prefix(path);
                         let st = self.states.entry(path.to_path_buf()).or_default();
-                        st.offset = len;
+                        st.offset = offset;
                         st.line_count = line_count;
                         st.len = len;
                         st.mtime_ms = mtime_ms;
@@ -299,7 +310,11 @@ impl Engine {
                 }
                 if let Some(c) = &checkpoint {
                     let st = self.states.entry(unit.clone()).or_default();
-                    st.cursor = c.cursor.clone();
+                    // A backfill reads databases in full; the saved cursor
+                    // would skip the history it is meant to import.
+                    if !backfill {
+                        st.cursor = c.cursor.clone();
+                    }
                     if !backfill && kind != FileKind::StoreMember {
                         let (len, mtime_ms) = file_meta(&unit);
                         if len == c.len && mtime_ms == c.mtime_ms {
@@ -759,15 +774,29 @@ fn sqlite_meta(path: &Path) -> (u64, i64) {
     (len.wrapping_add(wlen), mtime.max(wmtime))
 }
 
-fn count_nonempty_lines(path: &Path) -> usize {
+/// Byte offset just past the last newline-terminated line, and how many
+/// non-empty complete lines precede it (the next record's index), matching
+/// what tailing would have consumed.
+fn complete_prefix(path: &Path) -> (u64, usize) {
     let Ok(f) = std::fs::File::open(path) else {
-        return 0;
+        return (0, 0);
     };
-    BufReader::new(f)
-        .lines()
-        .map_while(Result::ok)
-        .filter(|l| !l.trim().is_empty())
-        .count()
+    let mut reader = BufReader::new(f);
+    let mut buf = Vec::new();
+    let (mut offset, mut count) = (0u64, 0usize);
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(n) if n > 0 && buf.last() == Some(&b'\n') => {
+                offset += n as u64;
+                if !String::from_utf8_lossy(&buf).trim().is_empty() {
+                    count += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    (offset, count)
 }
 
 #[cfg(test)]
@@ -1298,5 +1327,81 @@ mod tests {
         );
         e.path_changed(&p);
         assert!(!rx.try_recv().unwrap().replayed);
+    }
+
+    #[test]
+    fn silent_seed_keeps_a_record_still_being_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.jsonl");
+        append(
+            &p,
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"content\":\"old\"}\n{\"type\":\"user\",",
+        );
+        let (mut e, store, _rx) = engine(vec![root(dir.path(), None)]);
+        e.scan(false);
+        assert_eq!(store.total_events(), 0);
+        // The writer finishes the record it was in the middle of.
+        append(&p, "\"sessionId\":\"s\",\"content\":\"live\"}\n");
+        e.path_changed(&p);
+        let evs = store.session_events("s");
+        assert_eq!(evs.len(), 1, "the half-written record was lost");
+        assert_eq!(evs[0].line_index, 1);
+        assert_eq!(evs[0].entry["content"], "live");
+    }
+
+    #[test]
+    fn backfill_reads_databases_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("x.db");
+        let db = Db::open(&dir.path().join("trace.db")).unwrap();
+        db.save_checkpoint(&FileCheckpoint {
+            path: unit.to_string_lossy().to_string(),
+            source: "goose".into(),
+            offset: 0,
+            line_count: 0,
+            len: 1,
+            mtime_ms: 1,
+            cursor: Some("99|2026-01-01".into()),
+        })
+        .unwrap();
+        let store = SessionStore::with_db(db);
+        let r = root(dir.path(), Some(AgentSource::Goose));
+        let mut e = Engine::new(vec![r.clone()], store.clone(), None);
+        e.seed_unit(&unit, &r, AgentSource::Goose, FileKind::Sqlite, true);
+        assert_eq!(e.states.get(&unit).and_then(|s| s.cursor.clone()), None);
+        let mut e2 = Engine::new(vec![r.clone()], store, None);
+        e2.seed_unit(&unit, &r, AgentSource::Goose, FileKind::Sqlite, false);
+        assert!(e2
+            .states
+            .get(&unit)
+            .and_then(|s| s.cursor.clone())
+            .is_some());
+    }
+
+    #[test]
+    fn only_debounced_units_report_a_pending_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::create_dir_all(&docs).unwrap();
+        let j = logs.join("s.jsonl");
+        append(
+            &j,
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"content\":\"hi\"}\n",
+        );
+        let d = docs.join(".aider.chat.history.md");
+        std::fs::write(&d, AIDER_TWO).unwrap();
+        let (mut e, _store, _rx) = engine(vec![
+            root(&logs, None),
+            root(&docs, Some(AgentSource::Aider)),
+        ]);
+        assert!(
+            !e.path_changed(&j),
+            "JSONL is tailed at once, not debounced"
+        );
+        assert!(!e.path_changed(&logs.join("notes.txt")));
+        assert!(e.path_changed(&d));
+        assert!(e.has_pending());
     }
 }
