@@ -368,6 +368,19 @@ impl Db {
         Ok(())
     }
 
+    /// Overwrite a session's labels after they were re-derived from its
+    /// remaining records ([`Db::upsert_session`] keeps the stored first
+    /// prompt and title).
+    pub fn set_session_labels(&self, s: &SessionStats) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute(
+            "UPDATE sessions SET first_prompt = ?2, title = ?3, last_entry_timestamp = ?4
+             WHERE id = ?1",
+            params![s.id, s.first_prompt, s.title, s.last_entry_timestamp],
+        )?;
+        Ok(())
+    }
+
     /// Load every session's aggregates — used to seed the in-memory store at
     /// startup so historical sessions appear immediately.
     pub fn load_sessions(&self) -> anyhow::Result<Vec<SessionStats>> {
@@ -698,6 +711,34 @@ impl Db {
             }
         }
         Ok(out)
+    }
+
+    /// The first of a session's stored events, in line order (or newest
+    /// first), that `pred` accepts. Rows are decoded one at a time, so a
+    /// match near the start costs little however long the session is.
+    pub fn find_session_event(
+        &self,
+        session_id: &str,
+        newest_first: bool,
+        mut pred: impl FnMut(&mut TraceEvent) -> bool,
+    ) -> anyhow::Result<Option<TraceEvent>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let sql = if newest_first {
+            "SELECT event_json FROM events WHERE session_id = ?1 ORDER BY line_index DESC"
+        } else {
+            "SELECT event_json FROM events WHERE session_id = ?1 ORDER BY line_index ASC"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query(params![session_id])?;
+        while let Some(row) = rows.next()? {
+            let json: String = row.get(0)?;
+            if let Ok(mut ev) = serde_json::from_str::<TraceEvent>(&json) {
+                if pred(&mut ev) {
+                    return Ok(Some(ev));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// The saved read position for a file, if any.

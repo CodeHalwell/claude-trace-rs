@@ -299,9 +299,8 @@ async fn api_session_export(
     let Some(stats) = state.store.session(&id) else {
         return (StatusCode::NOT_FOUND, "Unknown session").into_response();
     };
-    let events = full_events(&state, &id);
     let filename = format!("{}.{}", short_filename(&id), q.format.extension());
-    stream_response(vec![(stats, events)], q.format, q.format.mime(), &filename)
+    stream_response(state, vec![stats], q.format, q.format.mime(), &filename)
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,54 +337,54 @@ async fn api_export_many(
         return (StatusCode::NOT_FOUND, "No matching sessions").into_response();
     }
 
-    let pairs: Vec<_> = stats_filtered
-        .into_iter()
-        .map(|s| {
-            let evs = full_events(&state, &s.id);
-            (s, evs)
-        })
-        .collect();
     let filename = format!(
         "agent-trace-{}.{}",
         chrono::Utc::now().format("%Y%m%dT%H%M%S"),
         q.format.extension()
     );
-    stream_response(pairs, q.format, q.format.mime(), &filename)
+    stream_response(state, stats_filtered, q.format, q.format.mime(), &filename)
 }
 
-/// Build a streaming download response. We pre-clone each (stats, events) pair
-/// out of the locked store so we never hold a mutex across await points, but
-/// we keep peak memory bounded to one session at a time by lazily rendering
-/// chunks from a `Stream` rather than concatenating the whole export into a
-/// single `String` first.
+/// Build a streaming download response. Each session's full history is
+/// loaded and rendered only when the stream reaches it, on a blocking
+/// thread, so peak memory is one session however many are exported, and
+/// no lock is held across an await.
 fn stream_response(
-    pairs: Vec<(crate::state::SessionStats, Vec<TraceEvent>)>,
+    state: AppState,
+    sessions: Vec<crate::state::SessionStats>,
     format: ExportFormat,
     mime: &'static str,
     filename: &str,
 ) -> Response {
     use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+    use futures_util::StreamExt;
 
-    let total = pairs.len();
+    let total = sessions.len();
     let is_markdown = matches!(format, ExportFormat::Markdown);
-    let chunks = pairs
-        .into_iter()
-        .enumerate()
-        .flat_map(move |(i, (stats, events))| {
-            let exp = SessionExport {
-                stats: &stats,
-                events: events.as_slice(),
-            };
-            let body = export::render_session(&exp, format);
-            let mut out: Vec<Result<Bytes, Infallible>> = Vec::with_capacity(2);
-            out.push(Ok(Bytes::from(body)));
+    let chunks = stream::iter(sessions.into_iter().enumerate()).then(move |(i, stats)| {
+        let state = state.clone();
+        async move {
+            let rendered = tokio::task::spawn_blocking(move || {
+                let events = full_events(&state, &stats.id);
+                let exp = SessionExport {
+                    stats: &stats,
+                    events: events.as_slice(),
+                };
+                export::render_session(&exp, format)
+            })
+            .await;
+            let mut body = rendered.unwrap_or_else(|e| {
+                warn!("Could not render a session for export: {e}");
+                String::new()
+            });
             if is_markdown && i + 1 < total {
-                out.push(Ok(Bytes::from_static(b"\n\n---\n\n")));
+                body.push_str("\n\n---\n\n");
             }
-            out
-        });
+            Ok::<Bytes, Infallible>(Bytes::from(body))
+        }
+    });
 
-    let body = Body::from_stream(stream::iter(chunks));
+    let body = Body::from_stream(chunks);
     let headers = [
         (CONTENT_TYPE, HeaderValue::from_static(mime)),
         (
@@ -727,6 +726,45 @@ async fn reject_cross_origin_api(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn exports_load_each_session_only_when_streamed() {
+        let db = Db::open_in_memory().unwrap();
+        let store = SessionStore::with_db(db.clone());
+        let ev = |line: usize, text: &str| {
+            TraceEvent::from_raw(
+                "s",
+                line,
+                serde_json::json!({ "type": "user", "sessionId": "s",
+                                    "message": { "role": "user", "content": text } }),
+            )
+        };
+        store.ingest(&ev(0, "before the export started"));
+        let state = AppState {
+            tx: broadcast::channel(8).0,
+            port: 0,
+            store: store.clone(),
+            db,
+            roots: Default::default(),
+            server_key: None,
+        };
+        let sessions = store.sessions();
+        let response = stream_response(
+            state,
+            sessions,
+            ExportFormat::Jsonl,
+            ExportFormat::Jsonl.mime(),
+            "x.jsonl",
+        );
+        // Nothing has been read yet: a record written now is still exported.
+        store.ingest(&ev(1, "written while streaming"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("before the export started"));
+        assert!(text.contains("written while streaming"), "{text}");
+    }
 
     #[test]
     fn loopback_origins_are_matched_exactly() {
