@@ -105,9 +105,16 @@ impl SessionWatcher {
         loop {
             match fs_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(Ok(event)) => {
-                    if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+                    let removed = matches!(event.kind, EventKind::Remove(_));
+                    if removed || matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_))
+                    {
                         for path in event.paths {
-                            if self.engine.path_changed(&path) {
+                            let queued = if removed {
+                                self.engine.path_removed(&path)
+                            } else {
+                                self.engine.path_changed(&path)
+                            };
+                            if queued {
                                 last_change = Instant::now();
                                 pending_since.get_or_insert(last_change);
                             }

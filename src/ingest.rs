@@ -209,6 +209,29 @@ impl Engine {
         }
     }
 
+    /// React to a file being deleted. Only members of multi-file stores are
+    /// acted on: their unit is rebuilt without them. A deleted log or
+    /// document keeps its history (agents prune old sessions; the trace is
+    /// the record that outlives them).
+    ///
+    /// Returns whether a debounced unit was queued, as for
+    /// [`Engine::path_changed`].
+    pub fn path_removed(&mut self, path: &Path) -> bool {
+        let Some(root) = most_specific_root(&self.roots, path) else {
+            return false;
+        };
+        let Some((source, FileKind::StoreMember)) = sources::classify(root.source, path) else {
+            return false;
+        };
+        match sources::store_unit(source, path) {
+            Some(unit) => {
+                self.pending.insert((unit, source, FileKind::StoreMember));
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Process every queued document / store / database unit.
     pub fn flush(&mut self) {
         let pending: Vec<_> = self.pending.drain().collect();
@@ -529,22 +552,16 @@ impl Engine {
             FileKind::Sqlite => sqlite_meta(unit),
             _ => file_meta(unit),
         };
-        let (prev_len, prev_mtime, cursor) = {
-            let st = self.states.entry(unit.to_path_buf()).or_default();
-            (st.len, st.mtime_ms, st.cursor.clone())
-        };
-        // Documents are skipped when untouched. Databases are always
-        // re-queried: a write can leave size and mtime unchanged, and the
-        // cursor keeps the query cheap.
-        if kind == FileKind::Document
-            && prev_len == len
-            && prev_mtime == mtime_ms
-            && self.states.get(unit).is_some_and(|s| !s.docs.is_empty())
-        {
-            return; // No change since the last parse.
-        }
-
-        let mut cursor = cursor;
+        // Every unit is read in full when asked: a rewrite can leave size and
+        // mtime unchanged (coarse timestamps), and the record hashes already
+        // keep an unchanged unit from emitting anything. Units untouched
+        // since the last run are skipped by `seed_unit` instead.
+        let mut cursor = self
+            .states
+            .entry(unit.to_path_buf())
+            .or_default()
+            .cursor
+            .clone();
         let docs: Option<Vec<SessionDoc>> = match kind {
             FileKind::Document => match std::fs::read(unit) {
                 Ok(bytes) => {
@@ -606,7 +623,7 @@ impl Engine {
         let mut to_emit: Vec<TraceEvent> = Vec::new();
         let mut to_remove: Vec<(String, usize)> = Vec::new();
         let mut changed_sessions: Vec<String> = Vec::new();
-        let mut vanished: Vec<String> = Vec::new();
+        let mut vanished: Vec<(String, usize)> = Vec::new();
         {
             let st = self.states.entry(unit.to_path_buf()).or_default();
             st.len = len;
@@ -614,22 +631,21 @@ impl Engine {
             st.cursor = cursor;
             st.source = Some(source);
             // A document holds all of its sessions, so one that is no longer
-            // there was deleted (a multi-session log rewritten). Databases
-            // only return the sessions that changed, and an empty parse of a
-            // document is more likely mid-write than deliberate.
-            if kind == FileKind::Document && !docs.is_empty() {
+            // there was deleted (a multi-session log rewritten, a transcript
+            // superseded by another source). Databases only return the
+            // sessions that changed, and an empty file is more likely caught
+            // between truncation and rewrite than emptied on purpose.
+            if kind == FileKind::Document && (len > 0 || !docs.is_empty()) {
                 let present: HashSet<&str> = docs.iter().map(|d| d.session_id.as_str()).collect();
-                vanished = st
+                let gone: Vec<String> = st
                     .docs
                     .keys()
                     .filter(|k| !present.contains(k.as_str()))
                     .cloned()
                     .collect();
-                for sid in &vanished {
-                    if let Some(prev) = st.docs.remove(sid) {
-                        if emit {
-                            to_remove.extend((0..prev.len()).map(|i| (sid.clone(), i)));
-                        }
+                for sid in gone {
+                    if let Some(prev) = st.docs.remove(&sid) {
+                        vanished.push((sid, prev.len()));
                     }
                 }
             }
@@ -656,6 +672,14 @@ impl Engine {
                 st.docs.insert(doc.session_id, hashes);
             }
         }
+        if emit {
+            for (sid, n) in &vanished {
+                // Keep what another unit still provides under the same
+                // session (a Cursor transcript gives way to its store.db).
+                let kept = self.held_elsewhere(unit, sid);
+                to_remove.extend((kept..*n).map(|i| (sid.clone(), i)));
+            }
+        }
         self.retract(to_remove);
         for ev in to_emit {
             self.emit(ev);
@@ -666,12 +690,30 @@ impl Engine {
                 .iter()
                 .filter_map(|sid| st.docs.get(sid).map(|h| (sid.as_str(), h.as_slice())))
                 .collect();
-            let removed: Vec<&str> = vanished.iter().map(String::as_str).collect();
+            let removed: Vec<&str> = vanished.iter().map(|(sid, _)| sid.as_str()).collect();
             if let Err(e) = db.save_doc_hashes(&unit.to_string_lossy(), &changed, &removed) {
                 debug!("Could not save record hashes for {}: {e}", unit.display());
             }
         }
         self.stats.units = self.states.len();
+    }
+
+    /// How many leading records of session `sid` a unit other than `unit`
+    /// holds, in this run or (through the saved hashes) an earlier one.
+    fn held_elsewhere(&self, unit: &Path, sid: &str) -> usize {
+        let here = self
+            .states
+            .iter()
+            .filter(|(p, _)| p.as_path() != unit)
+            .filter_map(|(_, s)| s.docs.get(sid).map(Vec::len))
+            .max()
+            .unwrap_or(0);
+        let saved = self
+            .store
+            .db()
+            .and_then(|db| db.doc_len_elsewhere(&unit.to_string_lossy(), sid).ok())
+            .unwrap_or(0);
+        here.max(saved)
     }
 
     // ------------------------------------------------------------------
@@ -1691,5 +1733,154 @@ mod tests {
         e2.scan(false);
         assert!(store2.session("a").is_none());
         assert_eq!(store2.session("b").map(|s| s.event_count), Some(2));
+    }
+
+    #[test]
+    fn a_same_size_rewrite_within_the_timestamp_granularity_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = dir.path().join("tasks/t");
+        std::fs::create_dir_all(&task).unwrap();
+        let p = task.join("api_conversation_history.json");
+        std::fs::write(&p, r#"[{"role":"user","content":"aaa"}]"#).unwrap();
+        let (mut e, store, _rx) = engine(vec![root(dir.path(), Some(AgentSource::Cline))]);
+        e.scan(true);
+        std::fs::write(&p, r#"[{"role":"user","content":"bbb"}]"#).unwrap();
+        // A filesystem with coarse timestamps: size and mtime look unchanged.
+        let (len, mtime_ms) = file_meta(&p);
+        let st = e.states.get_mut(&p).unwrap();
+        st.len = len;
+        st.mtime_ms = mtime_ms;
+        e.path_changed(&p);
+        e.flush();
+        let evs = store.session_events("t");
+        assert_eq!(evs.len(), 1);
+        assert!(
+            evs[0].entry.to_string().contains("bbb"),
+            "the rewrite was skipped"
+        );
+    }
+
+    #[test]
+    fn a_document_that_no_longer_holds_a_session_retracts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".aider.chat.history.md");
+        std::fs::write(&p, AIDER_TWO).unwrap();
+        let (mut e, store, _rx) = engine(vec![root(dir.path(), Some(AgentSource::Aider))]);
+        e.scan(true);
+        let events = store.total_events();
+        assert!(events > 0);
+        // Emptied: more likely caught mid-rewrite, so nothing is retracted.
+        std::fs::write(&p, "").unwrap();
+        e.path_changed(&p);
+        e.flush();
+        assert_eq!(store.total_events(), events);
+        // Rewritten with content that holds no sessions: they are gone.
+        std::fs::write(&p, "Nothing here yet.\n").unwrap();
+        e.path_changed(&p);
+        e.flush();
+        assert_eq!(store.total_events(), 0, "the sessions' records remain");
+    }
+
+    #[test]
+    fn records_another_unit_still_holds_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".aider.chat.history.md");
+        std::fs::write(&p, AIDER_TWO).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let store = SessionStore::with_db(db.clone());
+        let mut e = Engine::new(
+            vec![root(dir.path(), Some(AgentSource::Aider))],
+            store.clone(),
+            None,
+        );
+        e.scan(true);
+        let mut ids: Vec<String> = store.sessions().into_iter().map(|s| s.id).collect();
+        ids.sort();
+        assert_eq!(ids.len(), 2);
+        for id in &ids {
+            assert!(store.session(id).unwrap().event_count >= 2);
+        }
+        // The same sessions also come from elsewhere: the first from a unit
+        // read in this run, the second from one read in an earlier run.
+        e.states
+            .entry(dir.path().join("other-1"))
+            .or_default()
+            .docs
+            .insert(ids[0].clone(), vec![0]);
+        db.save_doc_hashes(
+            &dir.path().join("other-2").to_string_lossy(),
+            &[(ids[1].as_str(), &[0])],
+            &[],
+        )
+        .unwrap();
+        std::fs::write(&p, "Nothing here yet.\n").unwrap();
+        e.path_changed(&p);
+        e.flush();
+        for id in &ids {
+            assert_eq!(
+                store.session(id).map(|s| s.event_count),
+                Some(1),
+                "only the records nothing else holds are retracted"
+            );
+        }
+    }
+
+    #[test]
+    fn deleted_store_members_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = dir.path().join("storage");
+        for d in ["session/proj1", "message/ses_1", "part/msg_1", "part/msg_2"] {
+            std::fs::create_dir_all(st.join(d)).unwrap();
+        }
+        std::fs::write(
+            st.join("session/proj1/ses_1.json"),
+            r#"{"id":"ses_1","directory":"/p","title":"T","version":"1.1.0"}"#,
+        )
+        .unwrap();
+        for (mid, role, text) in [("msg_1", "user", "hey"), ("msg_2", "user", "again")] {
+            std::fs::write(
+                st.join(format!("message/ses_1/{mid}.json")),
+                format!(
+                    r#"{{"id":"{mid}","sessionID":"ses_1","role":"{role}","time":{{"created":1}}}}"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                st.join(format!("part/{mid}/prt_{mid}.json")),
+                format!(r#"{{"id":"prt_{mid}","sessionID":"ses_1","messageID":"{mid}","type":"text","text":"{text}"}}"#),
+            )
+            .unwrap();
+        }
+        let (mut e, store, _rx) = engine(vec![root(dir.path(), Some(AgentSource::OpenCode))]);
+        e.scan(true);
+        assert_eq!(store.session("ses_1").unwrap().event_count, 2);
+
+        // A part deleted: its message is rebuilt without it.
+        let part = st.join("part/msg_2/prt_msg_2.json");
+        std::fs::remove_file(&part).unwrap();
+        assert!(e.path_removed(&part));
+        e.flush();
+        let evs = store.session_events("ses_1");
+        assert_eq!(evs.len(), 2);
+        assert!(
+            !evs[1].entry.to_string().contains("again"),
+            "the deleted part remains"
+        );
+
+        // A message deleted: its record is retracted.
+        let msg = st.join("message/ses_1/msg_2.json");
+        std::fs::remove_file(&msg).unwrap();
+        assert!(e.path_removed(&msg));
+        e.flush();
+        assert_eq!(store.session("ses_1").unwrap().event_count, 1);
+
+        // Deleting a log keeps its history.
+        let log = dir.path().join("s.jsonl");
+        append(
+            &log,
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"content\":\"x\"}\n",
+        );
+        std::fs::remove_file(&log).unwrap();
+        assert!(!e.path_removed(&log));
     }
 }

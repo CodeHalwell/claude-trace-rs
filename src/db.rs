@@ -776,6 +776,18 @@ impl Db {
         Ok(out)
     }
 
+    /// The most records any unit other than `path` holds for `session_id`.
+    pub fn doc_len_elsewhere(&self, path: &str, session_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let bytes: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(length(hashes)), 0) FROM ingest_docs
+             WHERE session_id = ?1 AND path <> ?2",
+            params![session_id, path],
+            |r| r.get(0),
+        )?;
+        Ok(bytes as usize / 8)
+    }
+
     /// Save the record hashes of the sessions that changed in a unit, and
     /// drop those of sessions that disappeared from it.
     pub fn save_doc_hashes(
@@ -1123,6 +1135,11 @@ mod tests {
             .unwrap();
         let h = db.doc_hashes("/x").unwrap();
         assert_eq!(h["s1"], vec![1, u64::MAX]);
+        db.save_doc_hashes("/y", &[("s2", &[7, 8, 9])], &[])
+            .unwrap();
+        assert_eq!(db.doc_len_elsewhere("/x", "s2").unwrap(), 3);
+        assert_eq!(db.doc_len_elsewhere("/y", "s2").unwrap(), 1);
+        assert_eq!(db.doc_len_elsewhere("/y", "none").unwrap(), 0);
         db.save_doc_hashes("/x", &[], &["s1"]).unwrap();
         assert_eq!(db.doc_hashes("/x").unwrap().len(), 1);
     }

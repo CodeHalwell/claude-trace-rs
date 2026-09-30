@@ -94,13 +94,29 @@ pub fn store_unit(path: &Path) -> Option<PathBuf> {
     let sid = match kind {
         "session" => path.file_stem()?.to_str()?.to_owned(),
         "message" => path.parent()?.file_name()?.to_str()?.to_owned(),
-        "part" => {
-            let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-            v.get("sessionID")?.as_str()?.to_owned()
-        }
+        "part" => match std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v.get("sessionID")?.as_str().map(str::to_owned))
+        {
+            Some(sid) => sid,
+            // Deleted (or mid-write): the part folder is named after its
+            // message, which says which session it belongs to.
+            None => session_of_message(storage, path.parent()?.file_name()?.to_str()?)?,
+        },
         _ => return None,
     };
     Some(storage.join("message").join(sid))
+}
+
+/// The session whose `message/<sid>/` folder holds message `mid`.
+fn session_of_message(storage: &Path, mid: &str) -> Option<String> {
+    let file = format!("{mid}.json");
+    std::fs::read_dir(storage.join("message"))
+        .ok()?
+        .flatten()
+        .find(|d| d.path().join(&file).is_file())
+        .map(|d| d.file_name().to_string_lossy().into_owned())
 }
 
 pub fn load_store_unit(unit: &Path) -> Option<Vec<SessionDoc>> {
@@ -660,6 +676,11 @@ mod tests {
         );
         let docs = load_store_unit(&unit).unwrap();
         assert_eq!(docs[0].session_id, "ses_1");
+        // A deleted part still resolves through its message.
+        let parked = dir.path().join("prt_1.json");
+        std::fs::rename(&part, &parked).unwrap();
+        assert_eq!(store_unit(&part).unwrap(), unit);
+        std::fs::rename(&parked, &part).unwrap();
         assert_eq!(
             enrich(&docs[0].records[0]).message.unwrap().plain_text(),
             "hey"
