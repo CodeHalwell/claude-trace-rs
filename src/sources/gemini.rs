@@ -64,6 +64,13 @@ pub fn matches_file(path: &Path) -> bool {
         && !name.contains(".unreadable-")
 }
 
+/// A Gemini CLI session file by name alone (`chats/session-*.json[l]`), for
+/// roots that were not recognised as a Gemini directory.
+pub fn is_session_file(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    name.starts_with("session-") && matches_file(path)
+}
+
 pub fn skip_dir(dir: &Path) -> bool {
     matches!(
         dir.file_name().and_then(|n| n.to_str()),

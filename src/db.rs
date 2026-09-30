@@ -73,6 +73,9 @@ pub struct FileCheckpoint {
     pub mtime_ms: i64,
     /// Adapter-defined incremental cursor (e.g. a SQLite watermark).
     pub cursor: Option<String>,
+    /// Sessions whose records a JSONL file produced, so records can be
+    /// retracted if the file is truncated or replaced while stopped.
+    pub sessions: Vec<String>,
 }
 
 /// Page of events for one session, plus the unfiltered total for pagination.
@@ -150,6 +153,7 @@ impl Db {
             "ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'claude-code'",
             "ALTER TABLE sessions ADD COLUMN first_prompt TEXT",
             "ALTER TABLE events ADD COLUMN usage_key TEXT",
+            "ALTER TABLE ingest_files ADD COLUMN sessions TEXT",
         ] {
             if let Err(e) = conn.execute_batch(ddl) {
                 // "duplicate column name" means the migration already ran.
@@ -689,7 +693,7 @@ impl Db {
         let conn = self.conn.lock().expect("db poisoned");
         Ok(conn
             .query_row(
-                "SELECT path, source, byte_offset, line_count, len, mtime_ms, cursor
+                "SELECT path, source, byte_offset, line_count, len, mtime_ms, cursor, sessions
                  FROM ingest_files WHERE path = ?1",
                 params![path],
                 |r| {
@@ -701,6 +705,10 @@ impl Db {
                         len: r.get::<_, i64>(4)? as u64,
                         mtime_ms: r.get(5)?,
                         cursor: r.get(6)?,
+                        sessions: r
+                            .get::<_, Option<String>>(7)?
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_default(),
                     })
                 },
             )
@@ -711,12 +719,14 @@ impl Db {
     pub fn save_checkpoint(&self, c: &FileCheckpoint) -> anyhow::Result<()> {
         let conn = self.conn.lock().expect("db poisoned");
         conn.execute(
-            "INSERT INTO ingest_files (path, source, byte_offset, line_count, len, mtime_ms, cursor)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)
+            "INSERT INTO ingest_files
+                (path, source, byte_offset, line_count, len, mtime_ms, cursor, sessions)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT(path) DO UPDATE SET
                 source=excluded.source, byte_offset=excluded.byte_offset,
                 line_count=excluded.line_count, len=excluded.len,
-                mtime_ms=excluded.mtime_ms, cursor=excluded.cursor",
+                mtime_ms=excluded.mtime_ms, cursor=excluded.cursor,
+                sessions=excluded.sessions",
             params![
                 c.path,
                 c.source,
@@ -724,7 +734,9 @@ impl Db {
                 c.line_count as i64,
                 c.len as i64,
                 c.mtime_ms,
-                c.cursor
+                c.cursor,
+                (!c.sessions.is_empty())
+                    .then(|| serde_json::to_string(&c.sessions).unwrap_or_default()),
             ],
         )?;
         Ok(())

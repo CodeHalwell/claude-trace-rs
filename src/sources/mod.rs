@@ -486,6 +486,12 @@ pub fn classify(root_source: Option<AgentSource>, path: &Path) -> Option<(AgentS
             return Some((src, k));
         }
     }
+    // Gemini CLI's patch logs are JSONL but rewritten through `$set` and
+    // `$rewindTo` records, so they must be replayed as documents, never
+    // tailed as append-only logs.
+    if gemini::is_session_file(path) {
+        return Some((AgentSource::Gemini, FileKind::Document));
+    }
     match path.extension().and_then(|e| e.to_str()) {
         Some("jsonl") => Some((AgentSource::Unknown, FileKind::Jsonl)),
         _ => None,
@@ -975,6 +981,24 @@ pub fn summarise_message(event_type: &str, msg: Option<&Message>, tools: &[Strin
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn gemini_patch_logs_are_documents_under_any_root() {
+        let p = Path::new("/data/exported/app/chats/session-2026-09-29T14-03-4f1c9a2e.jsonl");
+        assert_eq!(
+            classify(None, p),
+            Some((AgentSource::Gemini, FileKind::Document))
+        );
+        let other = Path::new("/data/exported/app/chats/4f1c9a2e.jsonl");
+        assert_ne!(
+            classify(None, other).map(|c| c.0),
+            Some(AgentSource::Gemini)
+        );
+        assert_eq!(
+            classify(None, Path::new("/data/x/abc.jsonl")),
+            Some((AgentSource::Unknown, FileKind::Jsonl))
+        );
+    }
 
     #[test]
     fn source_ids_roundtrip() {

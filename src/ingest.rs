@@ -242,6 +242,7 @@ impl Engine {
                         let st = self.states.entry(path.to_path_buf()).or_default();
                         st.offset = c.offset;
                         st.line_count = c.line_count;
+                        st.sessions = c.sessions.iter().cloned().collect();
                         st.source = AgentSource::parse(&c.source);
                         self.process_jsonl(path, root, source);
                     }
@@ -261,12 +262,19 @@ impl Engine {
                     _ => {
                         // Shorter than when we last read it: truncated or
                         // replaced while stopped.
-                        let retract_from =
-                            checkpoint.filter(|c| c.offset > len).map(|c| c.line_count);
+                        // The sessions come from the checkpoint: the new
+                        // contents may be empty or another session entirely.
+                        let (retract_from, sessions) = match checkpoint {
+                            Some(c) if c.offset > len => {
+                                (Some(c.line_count), c.sessions.into_iter().collect())
+                            }
+                            _ => (None, HashSet::new()),
+                        };
                         self.states.insert(
                             path.to_path_buf(),
                             FileState {
                                 retract_from,
+                                sessions,
                                 ..Default::default()
                             },
                         );
@@ -434,11 +442,20 @@ impl Engine {
             let (len, mtime_ms) = file_meta(path);
             state.len = len;
             state.mtime_ms = mtime_ms;
-            // Records past the new end of a truncated file no longer exist.
+            // After a truncation or replacement, every record the file used
+            // to hold that this re-read did not produce again is gone: those
+            // past the new end, and all of a session the new contents no
+            // longer contain.
             if let Some(old) = state.retract_from.take() {
+                let kept: HashSet<(&str, usize)> = emitted
+                    .iter()
+                    .map(|e| (e.session_id.as_str(), e.line_index))
+                    .collect();
                 for sid in &state.sessions {
-                    for idx in state.line_count..old {
-                        retract.push((sid.clone(), idx));
+                    for idx in 0..old {
+                        if !kept.contains(&(sid.as_str(), idx)) {
+                            retract.push((sid.clone(), idx));
+                        }
                     }
                 }
             }
@@ -692,6 +709,11 @@ impl Engine {
             len: st.len,
             mtime_ms: st.mtime_ms,
             cursor: st.cursor.clone(),
+            sessions: {
+                let mut v: Vec<String> = st.sessions.iter().cloned().collect();
+                v.sort();
+                v
+            },
         };
         if let Err(e) = db.save_checkpoint(&c) {
             debug!("Could not save checkpoint for {}: {e}", path.display());
@@ -1362,6 +1384,7 @@ mod tests {
             len: 1,
             mtime_ms: 1,
             cursor: Some("99|2026-01-01".into()),
+            sessions: Vec::new(),
         })
         .unwrap();
         let store = SessionStore::with_db(db);
@@ -1403,5 +1426,35 @@ mod tests {
         assert!(!e.path_changed(&logs.join("notes.txt")));
         assert!(e.path_changed(&d));
         assert!(e.has_pending());
+    }
+
+    #[test]
+    fn a_log_replaced_while_stopped_retracts_its_old_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let p = logs.join("s.jsonl");
+        let line = |sid: &str, t: &str| {
+            format!("{{\"type\":\"user\",\"sessionId\":\"{sid}\",\"content\":\"{t}\"}}\n")
+        };
+        append(&p, &(line("old", "one") + &line("old", "two")));
+        let db = Db::open(&dir.path().join("trace.db")).unwrap();
+        let store = SessionStore::with_db(db.clone());
+        let mut e = Engine::new(vec![root(&logs, None)], store, None);
+        e.scan(true);
+        drop(e);
+
+        // While stopped the file is replaced by a shorter, different session.
+        std::fs::write(&p, line("new", "x")).unwrap();
+        let store2 = SessionStore::with_db(db.clone());
+        store2.seed_sessions(db.load_sessions().unwrap());
+        let mut e2 = Engine::new(vec![root(&logs, None)], store2.clone(), None);
+        e2.scan(false);
+        assert_eq!(
+            db.session_events("old", None, None, 10, 0).unwrap().total,
+            0
+        );
+        assert_eq!(store2.session("old").map(|s| s.event_count), Some(0));
+        assert_eq!(store2.session("new").map(|s| s.event_count), Some(1));
     }
 }
