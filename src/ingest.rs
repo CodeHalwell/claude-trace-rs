@@ -243,6 +243,16 @@ impl Engine {
                         st.offset = c.offset;
                         st.line_count = c.line_count;
                         st.sessions = c.sessions.iter().cloned().collect();
+                        // Adapter state from the records already consumed
+                        // (e.g. Codex's current model, which later usage
+                        // records do not repeat).
+                        if let Some(carry) = c
+                            .cursor
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str(s).ok())
+                        {
+                            st.carry = carry;
+                        }
                         st.source = AgentSource::parse(&c.source);
                         self.process_jsonl(path, root, source);
                     }
@@ -648,7 +658,12 @@ impl Engine {
 
     fn emit(&mut self, mut ev: TraceEvent) {
         ev.replayed = self.replaying;
-        if let Some(key) = ev.usage_key.clone() {
+        if let Some(key) = ev.usage_key.take() {
+            let key = match key.strip_prefix(sources::SESSION_SCOPED) {
+                Some(rest) => format!("{}|{rest}", ev.session_id),
+                None => key,
+            };
+            ev.usage_key = Some(key.clone());
             let me = (ev.session_id.clone(), ev.line_index);
             if self.usage_owners.len() > 200_000 {
                 self.usage_owners.clear();
@@ -708,7 +723,11 @@ impl Engine {
             line_count: st.line_count,
             len: st.len,
             mtime_ms: st.mtime_ms,
-            cursor: st.cursor.clone(),
+            // Databases keep their read cursor here; JSONL files, which have
+            // none, keep the adapter state carried across their records.
+            cursor: st.cursor.clone().or_else(|| {
+                (!st.carry.is_empty()).then(|| serde_json::to_string(&st.carry).unwrap_or_default())
+            }),
             sessions: {
                 let mut v: Vec<String> = st.sessions.iter().cloned().collect();
                 v.sort();
@@ -1456,5 +1475,60 @@ mod tests {
         );
         assert_eq!(store2.session("old").map(|s| s.event_count), Some(0));
         assert_eq!(store2.session("new").map(|s| s.event_count), Some(1));
+    }
+
+    fn codex_rollout(dir: &Path, uuid: &str, records: &[&str]) -> PathBuf {
+        let p = dir.join(format!("rollout-2026-09-30T10-00-00-{uuid}.jsonl"));
+        append(
+            &p,
+            &records.iter().map(|r| format!("{r}\n")).collect::<String>(),
+        );
+        p
+    }
+
+    const CODEX_CTX: &str = r#"{"timestamp":"2026-09-30T10:00:01Z","type":"turn_context","payload":{"model":"o4-mini","cwd":"/w"}}"#;
+    const CODEX_TOKENS: &str = r#"{"timestamp":"2026-09-30T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010},"last_token_usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}}"#;
+
+    #[test]
+    fn codex_sessions_with_equal_running_totals_both_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = "0199a1b2-0000-7000-8000-00000000000a";
+        let b = "0199a1b2-0000-7000-8000-00000000000b";
+        codex_rollout(dir.path(), a, &[CODEX_CTX, CODEX_TOKENS]);
+        codex_rollout(dir.path(), b, &[CODEX_CTX, CODEX_TOKENS]);
+        let (mut e, store, _rx) = engine(vec![root(dir.path(), Some(AgentSource::Codex))]);
+        e.scan(true);
+        let sessions = store.sessions();
+        assert_eq!(sessions.len(), 2);
+        for s in sessions {
+            assert_eq!(
+                s.input_tokens, 1000,
+                "{} lost its usage to the other session",
+                s.id
+            );
+        }
+    }
+
+    #[test]
+    fn codex_model_is_carried_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let p = codex_rollout(&logs, "0199a1b2-0000-7000-8000-00000000000c", &[CODEX_CTX]);
+        let db = Db::open(&dir.path().join("trace.db")).unwrap();
+        let r = root(&logs, Some(AgentSource::Codex));
+        let mut e = Engine::new(vec![r.clone()], SessionStore::with_db(db.clone()), None);
+        e.scan(true);
+        drop(e);
+
+        // The next response's usage arrives while stopped; it does not name
+        // the model, which was set by the earlier turn_context.
+        append(&p, &format!("{CODEX_TOKENS}\n"));
+        let (tx, mut rx) = broadcast::channel(16);
+        let store2 = SessionStore::with_db(db.clone());
+        let mut e2 = Engine::new(vec![r], store2, Some(tx));
+        e2.scan(false);
+        let ev = rx.try_recv().expect("the new record");
+        assert_eq!(ev.model.as_deref(), Some("o4-mini"));
     }
 }

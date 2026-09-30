@@ -455,6 +455,11 @@ pub struct SessionDoc {
     pub records: Vec<Value>,
 }
 
+/// Prefix for usage keys that only identify a response within its session
+/// (a running total, which two sessions can reach independently). The
+/// engine scopes them to the session before de-duplicating.
+pub const SESSION_SCOPED: &str = "session-scoped:";
+
 /// Decide whether `path` is a session file and how to read it. With a
 /// forced root source only that agent's matcher is consulted; otherwise
 /// the path is matched against every agent, falling back to generic JSONL.
@@ -812,7 +817,8 @@ pub struct Enrichment {
     pub title: Option<String>,
     pub turn_end: bool,
     /// Identity of the API response this usage belongs to; records sharing
-    /// a key repeat the same usage and must be counted once.
+    /// a key repeat the same usage and must be counted once. Keys are global
+    /// (an API message id) unless prefixed with [`SESSION_SCOPED`].
     pub usage_key: Option<String>,
 }
 

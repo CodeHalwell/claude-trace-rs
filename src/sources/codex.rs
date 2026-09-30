@@ -555,13 +555,15 @@ fn enrich_event_msg(payload: &Value, e: &mut Enrichment) {
     }
 }
 
-/// A stable key from the thread's cumulative usage.
+/// A stable key from the thread's cumulative usage. Only unique within the
+/// thread, so it is marked for the engine to scope to the session.
 fn cumulative_key(total: Option<&Value>) -> Option<String> {
     let t = total?;
     let g = |k: &str| t.get(k).and_then(Value::as_u64).unwrap_or(0);
     (g("total_tokens") + g("input_tokens") + g("output_tokens") > 0).then(|| {
         format!(
-            "codex-total:{}:{}:{}:{}",
+            "{}codex-total:{}:{}:{}:{}",
+            crate::sources::SESSION_SCOPED,
             g("input_tokens"),
             g("cached_input_tokens"),
             g("output_tokens"),

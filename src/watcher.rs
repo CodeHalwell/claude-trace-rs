@@ -165,12 +165,18 @@ impl SessionWatcher {
     }
 }
 
+/// Watch `path` once. It only counts as watched after registration
+/// succeeds, so a failure (permissions, an inotify limit) is retried on the
+/// next discovery pass rather than silently leaving the root unwatched.
 fn watch_root(watcher: &mut RecommendedWatcher, watched: &mut HashSet<PathBuf>, path: &Path) {
-    if !path.is_dir() || !watched.insert(path.to_path_buf()) {
+    if !path.is_dir() || watched.contains(path) {
         return;
     }
     match watcher.watch(path, RecursiveMode::Recursive) {
-        Ok(()) => info!("Watching {} for changes", path.display()),
-        Err(e) => warn!("Could not watch {}: {e}", path.display()),
+        Ok(()) => {
+            watched.insert(path.to_path_buf());
+            info!("Watching {} for changes", path.display());
+        }
+        Err(e) => warn!("Could not watch {} (will retry): {e}", path.display()),
     }
 }
