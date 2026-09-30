@@ -76,6 +76,9 @@ pub struct FileCheckpoint {
     /// Sessions whose records a JSONL file produced, so records can be
     /// retracted if the file is truncated or replaced while stopped.
     pub sessions: Vec<String>,
+    /// Signature of a JSONL file's first bytes (`len:hash`), to recognise a
+    /// replacement that is not shorter than what was already read.
+    pub head: Option<String>,
 }
 
 /// Page of events for one session, plus the unfiltered total for pagination.
@@ -154,6 +157,7 @@ impl Db {
             "ALTER TABLE sessions ADD COLUMN first_prompt TEXT",
             "ALTER TABLE events ADD COLUMN usage_key TEXT",
             "ALTER TABLE ingest_files ADD COLUMN sessions TEXT",
+            "ALTER TABLE ingest_files ADD COLUMN head TEXT",
         ] {
             if let Err(e) = conn.execute_batch(ddl) {
                 // "duplicate column name" means the migration already ran.
@@ -701,7 +705,7 @@ impl Db {
         let conn = self.conn.lock().expect("db poisoned");
         Ok(conn
             .query_row(
-                "SELECT path, source, byte_offset, line_count, len, mtime_ms, cursor, sessions
+                "SELECT path, source, byte_offset, line_count, len, mtime_ms, cursor, sessions, head
                  FROM ingest_files WHERE path = ?1",
                 params![path],
                 |r| {
@@ -717,6 +721,7 @@ impl Db {
                             .get::<_, Option<String>>(7)?
                             .and_then(|s| serde_json::from_str(&s).ok())
                             .unwrap_or_default(),
+                        head: r.get(8)?,
                     })
                 },
             )
@@ -728,13 +733,13 @@ impl Db {
         let conn = self.conn.lock().expect("db poisoned");
         conn.execute(
             "INSERT INTO ingest_files
-                (path, source, byte_offset, line_count, len, mtime_ms, cursor, sessions)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                (path, source, byte_offset, line_count, len, mtime_ms, cursor, sessions, head)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
              ON CONFLICT(path) DO UPDATE SET
                 source=excluded.source, byte_offset=excluded.byte_offset,
                 line_count=excluded.line_count, len=excluded.len,
                 mtime_ms=excluded.mtime_ms, cursor=excluded.cursor,
-                sessions=excluded.sessions",
+                sessions=excluded.sessions, head=excluded.head",
             params![
                 c.path,
                 c.source,
@@ -745,6 +750,7 @@ impl Db {
                 c.cursor,
                 (!c.sessions.is_empty())
                     .then(|| serde_json::to_string(&c.sessions).unwrap_or_default()),
+                c.head,
             ],
         )?;
         Ok(())

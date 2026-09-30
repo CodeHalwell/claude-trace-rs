@@ -63,6 +63,9 @@ pub struct FileState {
     /// Record count before the file was truncated or replaced; records from
     /// the new end up to here are retracted once it has been re-read.
     pub retract_from: Option<usize>,
+    /// Length and hash of the file's first bytes when last read (JSONL), to
+    /// notice a replacement even when the new file is not shorter.
+    pub head: Option<(u64, u64)>,
 }
 
 /// Counters from one engine pass, for logging and the CLI.
@@ -243,6 +246,7 @@ impl Engine {
                         st.offset = c.offset;
                         st.line_count = c.line_count;
                         st.sessions = c.sessions.iter().cloned().collect();
+                        st.head = c.head.as_deref().and_then(parse_head);
                         // Adapter state from the records already consumed
                         // (e.g. Codex's current model, which later usage
                         // records do not repeat).
@@ -264,6 +268,9 @@ impl Engine {
                         let st = self.states.entry(path.to_path_buf()).or_default();
                         st.offset = offset;
                         st.line_count = line_count;
+                        st.head = std::fs::File::open(path)
+                            .ok()
+                            .and_then(|mut f| head_of(&mut f, offset));
                         st.len = len;
                         st.mtime_ms = mtime_ms;
                         st.source = (source != AgentSource::Unknown).then_some(source);
@@ -368,9 +375,16 @@ impl Engine {
                 }
             };
             if let Ok(meta) = file.metadata() {
-                if meta.len() < state.offset {
+                // Shorter than what we already read, or starting differently
+                // (replaced by a file at least as large): read it afresh.
+                let shorter = meta.len() < state.offset;
+                let different_head = !shorter
+                    && state.head.is_some_and(|(len, sig)| {
+                        head_signature(&mut file, len).is_some_and(|now| now != sig)
+                    });
+                if shorter || different_head {
                     warn!(
-                        "File {} was truncated or replaced (was {} bytes, now {}); resetting",
+                        "File {} was truncated or replaced (read {} bytes, now {}); resetting",
                         path.display(),
                         state.offset,
                         meta.len()
@@ -378,6 +392,8 @@ impl Engine {
                     state.retract_from = Some(state.line_count);
                     state.offset = 0;
                     state.line_count = 0;
+                    state.head = None;
+                    state.carry.clear();
                 }
             }
             if file.seek(SeekFrom::Start(state.offset)).is_err() {
@@ -452,6 +468,14 @@ impl Engine {
             let (len, mtime_ms) = file_meta(path);
             state.len = len;
             state.mtime_ms = mtime_ms;
+            if state
+                .head
+                .map_or(true, |(l, _)| l < HEAD_BYTES.min(state.offset))
+            {
+                if let Ok(mut f) = std::fs::File::open(path) {
+                    state.head = head_of(&mut f, state.offset);
+                }
+            }
             // After a truncation or replacement, every record the file used
             // to hold that this re-read did not produce again is gone: those
             // past the new end, and all of a session the new contents no
@@ -755,6 +779,7 @@ impl Engine {
                 v.sort();
                 v
             },
+            head: st.head.map(|(len, sig)| format!("{len}:{sig:016x}")),
         };
         if let Err(e) = db.save_checkpoint(&c) {
             debug!("Could not save checkpoint for {}: {e}", path.display());
@@ -835,6 +860,33 @@ fn sqlite_meta(path: &Path) -> (u64, i64) {
     wal.push("-wal");
     let (wlen, wmtime) = file_meta(Path::new(&wal));
     (len.wrapping_add(wlen), mtime.max(wmtime))
+}
+
+/// How much of a JSONL file's start is fingerprinted to recognise it.
+const HEAD_BYTES: u64 = 4096;
+
+/// Hash of the first `len` bytes of `file`, or `None` if it is shorter.
+fn head_signature(file: &mut std::fs::File, len: u64) -> Option<u64> {
+    use md5::{Digest, Md5};
+    use std::io::Read;
+    let mut buf = vec![0u8; len as usize];
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.read_exact(&mut buf).ok()?;
+    let d = Md5::digest(&buf);
+    Some(u64::from_le_bytes(
+        d[..8].try_into().expect("md5 is 16 bytes"),
+    ))
+}
+
+/// The head signature for a file read up to `offset`.
+fn head_of(file: &mut std::fs::File, offset: u64) -> Option<(u64, u64)> {
+    let len = HEAD_BYTES.min(offset);
+    (len > 0).then(|| head_signature(file, len).map(|s| (len, s)))?
+}
+
+fn parse_head(s: &str) -> Option<(u64, u64)> {
+    let (len, sig) = s.split_once(':')?;
+    Some((len.parse().ok()?, u64::from_str_radix(sig, 16).ok()?))
 }
 
 /// Byte offset just past the last newline-terminated line, and how many
@@ -1431,6 +1483,7 @@ mod tests {
             mtime_ms: 1,
             cursor: Some("99|2026-01-01".into()),
             sessions: Vec::new(),
+            head: None,
         })
         .unwrap();
         let store = SessionStore::with_db(db);
@@ -1583,5 +1636,60 @@ mod tests {
         // Live subscribers are told about the retracted records.
         let gone = drain(&mut rx).into_iter().filter(|e| e.removed).count();
         assert_eq!(gone, 2);
+    }
+
+    #[test]
+    fn a_replacement_that_is_not_shorter_is_read_afresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.jsonl");
+        let line = |sid: &str, t: &str| {
+            format!("{{\"type\":\"user\",\"sessionId\":\"{sid}\",\"content\":\"{t}\"}}\n")
+        };
+        append(&p, &(line("a", "one") + &line("a", "two")));
+        let (mut e, store, _rx) = engine(vec![root(dir.path(), None)]);
+        e.scan(true);
+        // Replaced (e.g. written elsewhere and renamed over) by a larger file.
+        std::fs::write(
+            &p,
+            line("b", "uno") + &line("b", "dos") + &line("b", "tres"),
+        )
+        .unwrap();
+        e.path_changed(&p);
+        assert!(
+            store.session("a").is_none(),
+            "the old session's records remain"
+        );
+        let b = store.session("b").expect("the new session");
+        assert_eq!(
+            b.event_count, 3,
+            "the new file was read from the old offset"
+        );
+    }
+
+    #[test]
+    fn a_larger_replacement_while_stopped_is_read_afresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let p = logs.join("s.jsonl");
+        let line = |sid: &str, t: &str| {
+            format!("{{\"type\":\"user\",\"sessionId\":\"{sid}\",\"content\":\"{t}\"}}\n")
+        };
+        append(&p, &line("a", "one"));
+        let db = Db::open(&dir.path().join("trace.db")).unwrap();
+        let mut e = Engine::new(
+            vec![root(&logs, None)],
+            SessionStore::with_db(db.clone()),
+            None,
+        );
+        e.scan(true);
+        drop(e);
+        std::fs::write(&p, line("b", "uno") + &line("b", "dos")).unwrap();
+        let store2 = SessionStore::with_db(db.clone());
+        store2.seed_sessions(db.load_sessions().unwrap());
+        let mut e2 = Engine::new(vec![root(&logs, None)], store2.clone(), None);
+        e2.scan(false);
+        assert!(store2.session("a").is_none());
+        assert_eq!(store2.session("b").map(|s| s.event_count), Some(2));
     }
 }

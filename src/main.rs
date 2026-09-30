@@ -179,6 +179,9 @@ async fn main() -> anyhow::Result<()> {
         p
     });
     let only = cli.only.as_deref().map(parse_only).transpose()?;
+    // Keep looking for newly installed agents unless the user opted out of
+    // the default agent directories.
+    let discover = (!cli.no_default_roots).then(|| only.clone());
     let roots = runtime::resolve_roots(&cli.watch_root, forced_source, only, cli.no_default_roots);
 
     match cli.cmd.unwrap_or(Cmd::Serve(ServeArgs::default())) {
@@ -192,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
             cli.no_default_roots,
             args,
         ),
-        Cmd::Serve(args) => run_serve(roots, args).await,
+        Cmd::Serve(args) => run_serve(roots, discover, args).await,
         Cmd::Export(args) => run_export(&roots, args),
         Cmd::List => run_list(&roots),
         Cmd::Agents(args) => run_agents(args),
@@ -220,14 +223,18 @@ fn parse_only(ids: &[String]) -> anyhow::Result<std::collections::HashSet<source
     Ok(out)
 }
 
-async fn run_serve(roots: Vec<sources::WatchRoot>, args: ServeArgs) -> anyhow::Result<()> {
+async fn run_serve(
+    roots: Vec<sources::WatchRoot>,
+    discover: Option<Option<std::collections::HashSet<sources::AgentSource>>>,
+    args: ServeArgs,
+) -> anyhow::Result<()> {
     anyhow::ensure!(!roots.is_empty(), "No watch roots to serve");
     let tracer = runtime::Tracer::start(runtime::TracerConfig {
         roots,
         db_path: args.db.as_deref().map(expand_tilde),
         backfill: args.backfill,
         channel_capacity: args.channel_capacity,
-        discover: None,
+        discover,
         create_missing_roots: true,
     })?;
 
