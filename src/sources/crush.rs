@@ -61,10 +61,19 @@ pub fn classify(path: &Path) -> Option<FileKind> {
 
 pub fn read_sqlite(path: &Path, cursor: &mut Option<String>) -> anyhow::Result<Vec<SessionDoc>> {
     let conn = open_readonly(path)?;
-    let since: i64 = cursor
+    let mut since: i64 = cursor
         .as_deref()
         .and_then(|c| c.parse().ok())
         .unwrap_or(i64::MIN);
+    // A database restored from a backup or recreated holds nothing as new as
+    // the saved watermark: read it afresh.
+    let newest: Option<i64> = conn
+        .query_row("SELECT MAX(updated_at) FROM messages", [], |r| r.get(0))
+        .ok()
+        .flatten();
+    if newest.unwrap_or(i64::MIN) < since {
+        since = i64::MIN;
+    }
     // The project directory is the parent of `.crush`.
     let cwd = path
         .parent()
@@ -287,5 +296,17 @@ mod tests {
         assert_eq!(recs[2].tool_results, vec!["toolu_01"]);
         assert_eq!(recs[3].cost_usd, Some(0.0831));
         assert_eq!(cursor.as_deref(), Some("1759154598"));
+
+        // Recreated: every row is older than the watermark.
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DELETE FROM messages;
+             INSERT INTO messages VALUES ('n1','s1','user','[{\"type\":\"text\",\"data\":{\"text\":\"again\"}}]','',NULL,1700000000,1700000000,NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        let docs = read_sqlite(&db, &mut cursor).unwrap();
+        assert_eq!(docs.len(), 1, "the replaced database was not re-read");
+        assert_eq!(cursor.as_deref(), Some("1700000000"));
     }
 }

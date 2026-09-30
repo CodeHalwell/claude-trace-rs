@@ -144,14 +144,39 @@ pub fn read_sqlite(path: &Path, cursor: &mut Option<String>) -> anyhow::Result<V
             r.get(0)
         })
         .unwrap_or(0);
+    let scols = columns(&conn, "sessions");
+    let has_updated = scols.contains("updated_at");
+    let max_updated: Option<String> = if has_updated {
+        conn.query_row("SELECT MAX(updated_at) FROM sessions", [], |r| r.get(0))
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    // A database restored from a backup or recreated starts below the saved
+    // watermark: read it afresh.
+    let went_back = max_id < since
+        || match (&since_updated, &max_updated) {
+            (Some(seen), Some(now)) => conn
+                .query_row(
+                    "SELECT julianday(?1) < julianday(?2)",
+                    params![now, seen],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(false),
+            _ => false,
+        };
+    let (since, since_updated) = if went_back {
+        (0, None)
+    } else {
+        (since, since_updated)
+    };
     let mut changed: Vec<String> = Vec::new();
     {
         let mut stmt = conn.prepare("SELECT DISTINCT session_id FROM messages WHERE id > ?1")?;
         let rows = stmt.query_map(params![since], |r| r.get::<_, String>(0))?;
         changed.extend(rows.flatten());
     }
-    let scols = columns(&conn, "sessions");
-    let has_updated = scols.contains("updated_at");
     if let (true, Some(watermark)) = (has_updated, &since_updated) {
         // Deletions (compaction) insert nothing, so the id check misses
         // them; they bump the session's updated_at. Comparing with the last
@@ -168,13 +193,6 @@ pub fn read_sqlite(path: &Path, cursor: &mut Option<String>) -> anyhow::Result<V
             }
         }
     }
-    let max_updated: Option<String> = if has_updated {
-        conn.query_row("SELECT MAX(updated_at) FROM sessions", [], |r| r.get(0))
-            .ok()
-            .flatten()
-    } else {
-        None
-    };
     let mcols = columns(&conn, "messages");
     let col = |cols: &std::collections::BTreeSet<String>, c: &str| {
         if cols.contains(c) {
@@ -481,6 +499,44 @@ mod tests {
         let docs = read_sqlite(&db, &mut cursor).unwrap();
         assert_eq!(docs.len(), 1, "the compacted session was not re-read");
         assert_eq!(docs[0].records.len(), 1);
+    }
+
+    #[test]
+    fn a_database_restored_from_a_backup_is_read_afresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
+        let schema = r#"
+            CREATE TABLE sessions (id TEXT PRIMARY KEY, working_dir TEXT, updated_at TIMESTAMP);
+            CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT, session_id TEXT,
+              role TEXT, content_json TEXT, created_timestamp INTEGER, metadata_json TEXT);"#;
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(schema).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO sessions VALUES ('s1', '/p', '2026-01-02 00:00:00');
+               INSERT INTO messages (message_id, session_id, role, content_json) VALUES
+                 ('m1','s1','user','[{"type":"text","text":"one"}]'),
+                 ('m2','s1','assistant','[{"type":"text","text":"two"}]'),
+                 ('m3','s1','user','[{"type":"text","text":"three"}]');"#,
+        )
+        .unwrap();
+        drop(conn);
+        let mut cursor = None;
+        read_sqlite(&db, &mut cursor).unwrap();
+        // Replaced by an older copy: fewer rows, an earlier update time.
+        std::fs::remove_file(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(schema).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO sessions VALUES ('s1', '/p', '2026-01-01 00:00:00');
+               INSERT INTO messages (message_id, session_id, role, content_json) VALUES
+                 ('m1','s1','user','[{"type":"text","text":"one"}]');"#,
+        )
+        .unwrap();
+        drop(conn);
+        let docs = read_sqlite(&db, &mut cursor).unwrap();
+        assert_eq!(docs.len(), 1, "the replaced database was not re-read");
+        assert_eq!(docs[0].records.len(), 1);
+        assert!(cursor.as_deref().unwrap().starts_with("1|"));
     }
 
     #[test]

@@ -212,10 +212,15 @@ pub fn read_sqlite(path: &Path, cursor: &mut Option<String>) -> anyhow::Result<V
     if !has_table(&conn, "session") || !has_table(&conn, "message") {
         return Ok(Vec::new());
     }
-    let since: i64 = cursor
+    let mut since: i64 = cursor
         .as_deref()
         .and_then(|c| c.parse().ok())
         .unwrap_or(i64::MIN);
+    // A database restored from a backup or recreated holds nothing as new as
+    // the saved watermark: read it afresh.
+    if newest_update(&conn) < since {
+        since = i64::MIN;
+    }
     let mut changed: HashMap<String, i64> = HashMap::new();
     let mut note = |sid: String, t: i64| {
         let e = changed.entry(sid).or_insert(t);
@@ -250,6 +255,22 @@ pub fn read_sqlite(path: &Path, cursor: &mut Option<String>) -> anyhow::Result<V
         *cursor = Some(max_seen.to_string());
     }
     Ok(docs)
+}
+
+/// The latest `time_updated` in the database.
+fn newest_update(conn: &Connection) -> i64 {
+    ["session", "message", "part"]
+        .iter()
+        .filter(|t| has_table(conn, t))
+        .filter_map(|t| {
+            conn.query_row(&format!("SELECT MAX(time_updated) FROM {t}"), [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .ok()
+            .flatten()
+        })
+        .max()
+        .unwrap_or(i64::MIN)
 }
 
 fn load_session(conn: &Connection, sid: &str) -> anyhow::Result<Option<SessionDoc>> {
@@ -630,17 +651,31 @@ mod tests {
         // Nothing changed since the cursor except the boundary session.
         let again = read_sqlite(&db, &mut cursor).unwrap();
         assert_eq!(again.len(), 1, "boundary row re-read (>=) but harmless");
+        // Older rows are not re-read.
         let conn = Connection::open(&db).unwrap();
-        conn.execute("UPDATE message SET time_updated = 900 WHERE id='msg_2'", [])
-            .unwrap();
-        conn.execute("UPDATE part SET time_updated = 900", [])
-            .unwrap();
-        conn.execute("UPDATE session SET time_updated = 900", [])
-            .unwrap();
-        conn.execute("UPDATE message SET time_updated = 900", [])
-            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO session VALUES ('ses_0','p','',NULL,'/p','Old','1.18.33',500,500);
+             INSERT INTO message VALUES ('msg_0','ses_0',500,500,'{\"role\":\"user\",\"time\":{\"created\":500}}');",
+        )
+        .unwrap();
         drop(conn);
-        assert!(read_sqlite(&db, &mut cursor).unwrap().is_empty());
+        let again = read_sqlite(&db, &mut cursor).unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].session_id, "ses_1");
+
+        // Restored from an older backup: everything in it is below the
+        // watermark, so it is read in full.
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DELETE FROM part WHERE id = 'prt_2';
+             DELETE FROM message WHERE id = 'msg_2';
+             UPDATE session SET time_updated = 1001 WHERE id = 'ses_1';",
+        )
+        .unwrap();
+        drop(conn);
+        let restored = read_sqlite(&db, &mut cursor).unwrap();
+        assert_eq!(restored.len(), 2, "the replaced database was not re-read");
+        assert_eq!(cursor.as_deref(), Some("1001"));
     }
 
     #[test]

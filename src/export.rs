@@ -140,20 +140,22 @@ fn transcript<'a>(events: &'a [TraceEvent]) -> (Vec<String>, Vec<Turn<'a>>) {
         }
         // Some agents (Gemini CLI, OpenCode) store a tool's result on the
         // same record as the call. Every training format expects results on
-        // the following user turn, so split them out.
-        let (content, results): (Vec<Block>, Vec<Block>) = if msg.role == Role::Assistant {
-            msg.content
-                .iter()
-                .cloned()
-                .partition(|b| !matches!(b, Block::ToolResult { .. }))
-        } else {
-            (msg.content.clone(), Vec::new())
-        };
-        let mut usage = ev.usage.clone();
-        for (role, blocks) in [(msg.role, content), (Role::User, results)] {
-            if blocks.is_empty() {
-                continue;
+        // the following user turn, so split the record into alternating
+        // turns, keeping the blocks in order (call, result, the reply after).
+        let mut segments: Vec<(Role, Vec<Block>)> = Vec::new();
+        for b in &msg.content {
+            let role = if msg.role == Role::Assistant && matches!(b, Block::ToolResult { .. }) {
+                Role::User
+            } else {
+                msg.role
+            };
+            match segments.last_mut() {
+                Some((r, blocks)) if *r == role => blocks.push(b.clone()),
+                _ => segments.push((role, vec![b.clone()])),
             }
+        }
+        let mut usage = ev.usage.clone();
+        for (role, blocks) in segments {
             let u = if role == Role::Assistant {
                 usage.take()
             } else {
@@ -747,6 +749,63 @@ mod tests {
         assert_eq!(msgs[2]["role"], "user");
         let user_content = msgs[2]["content"].as_array().unwrap();
         assert_eq!(user_content[0]["type"], "tool_result");
+    }
+
+    #[test]
+    fn embedded_tool_results_keep_their_place_in_the_conversation() {
+        let s = stats();
+        let events = vec![
+            ev("user", json!({ "content": "hello" })),
+            ev(
+                "assistant",
+                json!({
+                    "content": [
+                        { "type": "tool_use", "id": "t1", "name": "Read", "input": {} },
+                        { "type": "tool_result", "tool_use_id": "t1", "content": "one" },
+                        { "type": "tool_use", "id": "t2", "name": "Read", "input": {} },
+                        { "type": "tool_result", "tool_use_id": "t2", "content": "two" },
+                        { "type": "text", "text": "done" }
+                    ]
+                }),
+            ),
+        ];
+        let out = render_session(
+            &SessionExport {
+                stats: &s,
+                events: &events,
+            },
+            ExportFormat::Messages,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let shape: Vec<(String, String)> = parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                let types: Vec<&str> = m["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|b| b["type"].as_str().unwrap())
+                    .collect();
+                (m["role"].as_str().unwrap().to_owned(), types.join(","))
+            })
+            .collect();
+        let expect = [
+            ("user", "text"),
+            ("assistant", "tool_use"),
+            ("user", "tool_result"),
+            ("assistant", "tool_use"),
+            ("user", "tool_result"),
+            ("assistant", "text"),
+        ];
+        assert_eq!(
+            shape,
+            expect
+                .iter()
+                .map(|(r, t)| (r.to_string(), t.to_string()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

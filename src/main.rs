@@ -178,7 +178,11 @@ async fn main() -> anyhow::Result<()> {
         }
         p
     });
-    let only = cli.only.as_deref().map(parse_only).transpose()?;
+    let only = cli
+        .only
+        .as_deref()
+        .map(|ids| parse_agent_ids(ids, "--only"))
+        .transpose()?;
     // Keep looking for newly installed agents unless the user opted out of
     // the default agent directories.
     let discover = (!cli.no_default_roots).then(|| only.clone());
@@ -204,7 +208,10 @@ async fn main() -> anyhow::Result<()> {
 
 /// Parse `--only`, rejecting ids that name no agent: silently dropping a
 /// typo would trace fewer agents than asked for (or none).
-fn parse_only(ids: &[String]) -> anyhow::Result<std::collections::HashSet<sources::AgentSource>> {
+fn parse_agent_ids(
+    ids: &[String],
+    flag: &str,
+) -> anyhow::Result<std::collections::HashSet<sources::AgentSource>> {
     let mut out = std::collections::HashSet::new();
     let mut unknown = Vec::new();
     for id in ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -217,7 +224,7 @@ fn parse_only(ids: &[String]) -> anyhow::Result<std::collections::HashSet<source
     }
     anyhow::ensure!(
         unknown.is_empty(),
-        "unknown agent id(s) in --only: {} (run `claude-trace-rs agents` for the list)",
+        "unknown agent id(s) in {flag}: {} (run `claude-trace-rs agents` for the list)",
         unknown.join(", ")
     );
     Ok(out)
@@ -257,6 +264,13 @@ async fn run_serve(
 fn run_export(roots: &[sources::WatchRoot], args: ExportArgs) -> anyhow::Result<()> {
     use std::io::Write as _;
 
+    // Checked before loading, which can take a while.
+    let want_source: Option<std::collections::HashSet<String>> = args
+        .from_source
+        .map(|v| parse_agent_ids(&v, "--from"))
+        .transpose()?
+        .map(|ids| ids.into_iter().map(|s| s.as_str().to_owned()).collect());
+
     let store = state::SessionStore::new();
     let n = loader::ingest_roots(roots, &store)?;
     info!(
@@ -266,12 +280,6 @@ fn run_export(roots: &[sources::WatchRoot], args: ExportArgs) -> anyhow::Result<
     );
 
     let want: std::collections::HashSet<String> = args.session.into_iter().collect();
-    let want_source: Option<std::collections::HashSet<String>> = args.from_source.map(|v| {
-        v.iter()
-            .filter_map(|s| sources::AgentSource::parse(s))
-            .map(|s| s.as_str().to_owned())
-            .collect()
-    });
     let sessions: Vec<_> = store
         .sessions()
         .into_iter()
@@ -519,11 +527,12 @@ mod tests {
     }
 
     #[test]
-    fn only_rejects_unknown_agent_ids() {
-        let ok = super::parse_only(&["codex".into(), " claude ".into()]).unwrap();
+    fn agent_id_lists_reject_unknown_ids() {
+        let ok = super::parse_agent_ids(&["codex".into(), " claude ".into()], "--only").unwrap();
         assert!(ok.contains(&AgentSource::Codex) && ok.contains(&AgentSource::ClaudeCode));
-        let err = super::parse_only(&["codex".into(), "codx".into()]).unwrap_err();
+        let err = super::parse_agent_ids(&["codex".into(), "codx".into()], "--from").unwrap_err();
         assert!(err.to_string().contains("codx"), "{err}");
+        assert!(err.to_string().contains("--from"), "{err}");
     }
 
     #[test]

@@ -66,6 +66,9 @@ pub struct FileState {
     /// Length and hash of the file's first bytes when last read (JSONL), to
     /// notice a replacement even when the new file is not shorter.
     pub head: Option<(u64, u64)>,
+    /// Offset and hash of the bytes just before it, once past the head: an
+    /// in-place rewrite that keeps the start of the file changes these.
+    pub mark: Option<(u64, u64)>,
 }
 
 /// Counters from one engine pass, for logging and the CLI.
@@ -269,7 +272,7 @@ impl Engine {
                         st.offset = c.offset;
                         st.line_count = c.line_count;
                         st.sessions = c.sessions.iter().cloned().collect();
-                        st.head = c.head.as_deref().and_then(parse_head);
+                        (st.head, st.mark) = parse_signatures(c.head.as_deref());
                         // Adapter state from the records already consumed
                         // (e.g. Codex's current model, which later usage
                         // records do not repeat).
@@ -291,9 +294,10 @@ impl Engine {
                         let st = self.states.entry(path.to_path_buf()).or_default();
                         st.offset = offset;
                         st.line_count = line_count;
-                        st.head = std::fs::File::open(path)
-                            .ok()
-                            .and_then(|mut f| head_of(&mut f, offset));
+                        if let Ok(mut f) = std::fs::File::open(path) {
+                            st.head = head_of(&mut f, offset);
+                            st.mark = mark_of(&mut f, offset);
+                        }
                         st.len = len;
                         st.mtime_ms = mtime_ms;
                         st.source = (source != AgentSource::Unknown).then_some(source);
@@ -403,9 +407,15 @@ impl Engine {
                 let shorter = meta.len() < state.offset;
                 let different_head = !shorter
                     && state.head.is_some_and(|(len, sig)| {
-                        head_signature(&mut file, len).is_some_and(|now| now != sig)
+                        window_signature(&mut file, 0, len).is_some_and(|now| now != sig)
                     });
-                if shorter || different_head {
+                let different_mark = !shorter
+                    && !different_head
+                    && state.mark.is_some_and(|(end, sig)| {
+                        window_signature(&mut file, end - HEAD_BYTES, HEAD_BYTES)
+                            .is_some_and(|now| now != sig)
+                    });
+                if shorter || different_head || different_mark {
                     warn!(
                         "File {} was truncated or replaced (read {} bytes, now {}); resetting",
                         path.display(),
@@ -416,6 +426,7 @@ impl Engine {
                     state.offset = 0;
                     state.line_count = 0;
                     state.head = None;
+                    state.mark = None;
                     state.carry.clear();
                 }
             }
@@ -491,12 +502,19 @@ impl Engine {
             let (len, mtime_ms) = file_meta(path);
             state.len = len;
             state.mtime_ms = mtime_ms;
-            if state
+            let head_due = state
                 .head
-                .map_or(true, |(l, _)| l < HEAD_BYTES.min(state.offset))
-            {
+                .map_or(true, |(l, _)| l < HEAD_BYTES.min(state.offset));
+            let mark_due = state.offset > HEAD_BYTES
+                && state.mark.map_or(true, |(end, _)| end != state.offset);
+            if head_due || mark_due {
                 if let Ok(mut f) = std::fs::File::open(path) {
-                    state.head = head_of(&mut f, state.offset);
+                    if head_due {
+                        state.head = head_of(&mut f, state.offset);
+                    }
+                    if mark_due {
+                        state.mark = mark_of(&mut f, state.offset);
+                    }
                 }
             }
             // After a truncation or replacement, every record the file used
@@ -821,7 +839,15 @@ impl Engine {
                 v.sort();
                 v
             },
-            head: st.head.map(|(len, sig)| format!("{len}:{sig:016x}")),
+            // "<len>:<hash>" for the head, then ";<offset>:<hash>" for the
+            // mark once there is one.
+            head: st.head.map(|(len, sig)| {
+                let mut v = format!("{len}:{sig:016x}");
+                if let Some((end, sig)) = st.mark {
+                    v.push_str(&format!(";{end}:{sig:016x}"));
+                }
+                v
+            }),
         };
         if let Err(e) = db.save_checkpoint(&c) {
             debug!("Could not save checkpoint for {}: {e}", path.display());
@@ -907,12 +933,15 @@ fn sqlite_meta(path: &Path) -> (u64, i64) {
 /// How much of a JSONL file's start is fingerprinted to recognise it.
 const HEAD_BYTES: u64 = 4096;
 
-/// Hash of the first `len` bytes of `file`, or `None` if it is shorter.
-fn head_signature(file: &mut std::fs::File, len: u64) -> Option<u64> {
+/// A length or offset, and the hash of the bytes it delimits.
+type Signature = (u64, u64);
+
+/// Hash of `len` bytes of `file` from `start`, or `None` if it is shorter.
+fn window_signature(file: &mut std::fs::File, start: u64, len: u64) -> Option<u64> {
     use md5::{Digest, Md5};
     use std::io::Read;
     let mut buf = vec![0u8; len as usize];
-    file.seek(SeekFrom::Start(0)).ok()?;
+    file.seek(SeekFrom::Start(start)).ok()?;
     file.read_exact(&mut buf).ok()?;
     let d = Md5::digest(&buf);
     Some(u64::from_le_bytes(
@@ -923,12 +952,30 @@ fn head_signature(file: &mut std::fs::File, len: u64) -> Option<u64> {
 /// The head signature for a file read up to `offset`.
 fn head_of(file: &mut std::fs::File, offset: u64) -> Option<(u64, u64)> {
     let len = HEAD_BYTES.min(offset);
-    (len > 0).then(|| head_signature(file, len).map(|s| (len, s)))?
+    (len > 0).then(|| window_signature(file, 0, len).map(|s| (len, s)))?
 }
 
-fn parse_head(s: &str) -> Option<(u64, u64)> {
-    let (len, sig) = s.split_once(':')?;
-    Some((len.parse().ok()?, u64::from_str_radix(sig, 16).ok()?))
+/// The mark for a file read up to `offset`: the bytes just before it, when
+/// they lie past the head.
+fn mark_of(file: &mut std::fs::File, offset: u64) -> Option<Signature> {
+    (offset > HEAD_BYTES)
+        .then(|| window_signature(file, offset - HEAD_BYTES, HEAD_BYTES).map(|s| (offset, s)))?
+}
+
+fn parse_pair(s: &str) -> Option<Signature> {
+    let (n, sig) = s.split_once(':')?;
+    Some((n.parse().ok()?, u64::from_str_radix(sig, 16).ok()?))
+}
+
+/// The head and mark saved in a checkpoint.
+fn parse_signatures(s: Option<&str>) -> (Option<Signature>, Option<Signature>) {
+    let mut parts = s.unwrap_or_default().split(';');
+    let head = parts.next().and_then(parse_pair);
+    let mark = parts
+        .next()
+        .and_then(parse_pair)
+        .filter(|(end, _)| *end > HEAD_BYTES);
+    (head, mark)
 }
 
 /// Byte offset just past the last newline-terminated line, and how many
@@ -1882,5 +1929,65 @@ mod tests {
         );
         std::fs::remove_file(&log).unwrap();
         assert!(!e.path_removed(&log));
+    }
+
+    #[test]
+    fn a_rewrite_past_the_head_is_read_afresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let p = logs.join("s.jsonl");
+        let line = |i: usize, t: &str| {
+            format!("{{\"type\":\"user\",\"sessionId\":\"s\",\"content\":\"{t} {i:04}\"}}\n")
+        };
+        let body = |t150: &str| -> String {
+            (0..160)
+                .map(|i| line(i, if i == 150 { t150 } else { "same" }))
+                .collect()
+        };
+        std::fs::write(&p, body("before")).unwrap();
+        assert!(std::fs::metadata(&p).unwrap().len() > 2 * HEAD_BYTES);
+        let db = Db::open(&dir.path().join("trace.db")).unwrap();
+        let store = SessionStore::with_db(db.clone());
+        let mut e = Engine::new(vec![root(&logs, None)], store.clone(), None);
+        e.scan(true);
+        // Rewritten in place: same length, same first 4 KiB, a record near
+        // the end changed.
+        std::fs::write(&p, body("after_")).unwrap();
+        e.path_changed(&p);
+        let text = |store: &SessionStore| {
+            store
+                .session_events("s")
+                .iter()
+                .find(|e| e.line_index == 150)
+                .map(|e| e.entry.to_string())
+                .unwrap_or_default()
+        };
+        assert!(
+            text(&store).contains("after_"),
+            "the rewrite was taken as an append"
+        );
+
+        // The mark survives a restart.
+        drop(e);
+        std::fs::write(&p, body("again_")).unwrap();
+        let store2 = SessionStore::with_db(db.clone());
+        store2.seed_sessions(db.load_sessions().unwrap());
+        let mut e2 = Engine::new(vec![root(&logs, None)], store2.clone(), None);
+        e2.scan(false);
+        assert!(text(&store2).contains("again_"));
+        assert_eq!(store2.session("s").unwrap().event_count, 160);
+    }
+
+    #[test]
+    fn signatures_roundtrip_through_the_checkpoint_text() {
+        assert_eq!(parse_signatures(None), (None, None));
+        assert_eq!(parse_signatures(Some("12:ff")), (Some((12, 255)), None));
+        assert_eq!(
+            parse_signatures(Some("4096:0a;9000:0b")),
+            (Some((4096, 10)), Some((9000, 11)))
+        );
+        // A mark inside the head is not a valid one.
+        assert_eq!(parse_signatures(Some("4096:0a;100:0b")).1, None);
     }
 }

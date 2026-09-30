@@ -6,7 +6,7 @@
 //! window system.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     time::{Duration, Instant},
 };
 
@@ -49,15 +49,24 @@ struct SessionActivity {
     last_event: Instant,
     last_role: Option<Role>,
     turn_started: Option<Instant>,
+    /// The record whose prompt started the current turn.
+    turn_line: Option<usize>,
     turn_cost: f64,
     preview: Option<String>,
-    /// Highest record index seen. Documents and databases re-emit a record
-    /// when it changes; a re-emitted earlier record is a revision, not a new
-    /// turn.
-    max_line: usize,
-    /// Last cost seen per record, so a revision adds only what changed (a
-    /// streamed record often gains its usage when it is finalised).
-    line_costs: HashMap<usize, f64>,
+    /// Highest record index seen, if any. Documents and databases re-emit a
+    /// record when it changes; a re-emitted earlier record is a revision,
+    /// not a new turn.
+    max_line: Option<usize>,
+    /// Every record seen: its role and last cost, so a revision adds only
+    /// what changed (a streamed record often gains its usage when it is
+    /// finalised) and a retraction can take it back.
+    lines: BTreeMap<usize, Line>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Line {
+    role: Option<Role>,
+    cost: f64,
 }
 
 #[derive(Debug)]
@@ -133,7 +142,11 @@ impl Activity {
     /// Feed one event. Returns any notices it triggers.
     pub fn on_event(&mut self, ev: &TraceEvent, now: Instant) -> Vec<Notice> {
         let mut out = Vec::new();
-        if ev.replayed || ev.removed {
+        if ev.removed {
+            self.retract(ev);
+            return out;
+        }
+        if ev.replayed {
             return out;
         }
         let is_new = !self.sessions.contains_key(&ev.session_id);
@@ -154,15 +167,25 @@ impl Activity {
                 last_event: now,
                 last_role: None,
                 turn_started: None,
+                turn_line: None,
                 turn_cost: 0.0,
                 preview: None,
-                max_line: ev.line_index,
-                line_costs: HashMap::new(),
+                max_line: None,
+                lines: BTreeMap::new(),
             });
-        let revision = !is_new && ev.line_index <= s.max_line;
-        s.max_line = s.max_line.max(ev.line_index);
-        let cost_delta = match s.line_costs.insert(ev.line_index, ev.cost_usd) {
-            Some(prev) => ev.cost_usd - prev,
+        let revision = s.max_line.is_some_and(|m| ev.line_index <= m);
+        s.max_line = Some(s.max_line.map_or(ev.line_index, |m| m.max(ev.line_index)));
+        let role = ev
+            .message
+            .as_ref()
+            .map(|m| m.role)
+            .filter(|r| *r != Role::System);
+        let line = Line {
+            role,
+            cost: ev.cost_usd,
+        };
+        let cost_delta = match s.lines.insert(ev.line_index, line) {
+            Some(prev) => ev.cost_usd - prev.cost,
             // A revision of a record from before we started following the
             // session: its cost is already in the day's total.
             None if revision => 0.0,
@@ -186,6 +209,7 @@ impl Activity {
         if let Some(msg) = &ev.message {
             if msg.role == Role::User && msg.has_text() && s.turn_started.is_none() && !revision {
                 s.turn_started = Some(now);
+                s.turn_line = Some(ev.line_index);
                 s.turn_cost = 0.0;
                 let text = msg.plain_text();
                 s.preview = Some(claude_trace_rs::sources::truncate(text.trim(), 90));
@@ -199,6 +223,7 @@ impl Activity {
 
         if ev.turn_end {
             if let Some(start) = s.turn_started.take() {
+                s.turn_line = None;
                 out.push(Notice::TurnFinished {
                     session_id: ev.session_id.clone(),
                     agent: s.agent.clone(),
@@ -228,6 +253,7 @@ impl Activity {
             if s.last_role == Some(Role::Assistant) && now.duration_since(s.last_event) >= self.idle
             {
                 s.turn_started = None;
+                s.turn_line = None;
                 out.push(Notice::TurnFinished {
                     session_id: id.clone(),
                     agent: s.agent.clone(),
@@ -243,6 +269,32 @@ impl Activity {
         self.sessions
             .retain(|_, s| now.duration_since(s.last_event) < Duration::from_secs(6 * 3600));
         out
+    }
+
+    /// A record was deleted at its source (a rewind, a compaction): take back
+    /// its cost, and let the session's state reflect the records that remain.
+    fn retract(&mut self, ev: &TraceEvent) {
+        let Some(s) = self.sessions.get_mut(&ev.session_id) else {
+            return;
+        };
+        let Some(line) = s.lines.remove(&ev.line_index) else {
+            return;
+        };
+        if s.turn_line.is_some_and(|t| ev.line_index >= t) {
+            s.turn_cost = (s.turn_cost - line.cost).max(0.0);
+        }
+        self.spent_today = (self.spent_today - line.cost).max(0.0);
+        if s.turn_line == Some(ev.line_index) {
+            // The prompt itself is gone, so the turn is too.
+            s.turn_started = None;
+            s.turn_line = None;
+            s.turn_cost = 0.0;
+            s.preview = None;
+        }
+        s.last_role = s.lines.values().rev().find_map(|l| l.role);
+        // Records written in place of the deleted ones are new, not
+        // revisions.
+        s.max_line = s.lines.keys().next_back().copied();
     }
 
     fn roll_day(&mut self) {
@@ -418,6 +470,52 @@ mod tests {
         ev.removed = true;
         assert!(a.on_event(&ev, Instant::now()).is_empty());
         assert_eq!(a.spent_today(), 0.0);
+    }
+
+    #[test]
+    fn a_retracted_reply_is_taken_back() {
+        let mut a = Activity::new(Duration::from_secs(30), None);
+        let t0 = Instant::now();
+        a.on_event(&user("s10", "try this"), t0);
+        let reply = assistant("s10", false);
+        a.on_event(&reply, t0);
+        assert!(a.spent_today() > 0.0);
+        // A rewind deletes the reply: nothing has answered the prompt now.
+        let mut gone = reply.clone();
+        gone.removed = true;
+        assert!(a.on_event(&gone, t0).is_empty());
+        assert_eq!(a.spent_today(), 0.0);
+        assert!(
+            a.tick(t0 + Duration::from_secs(60)).is_empty(),
+            "a deleted reply finished the turn"
+        );
+        // The reply written in its place counts, and ends the turn.
+        let mut again = assistant("s10", false);
+        again.line_index = reply.line_index;
+        a.on_event(&again, t0 + Duration::from_secs(61));
+        assert!((a.spent_today() - again.cost_usd).abs() < 1e-12);
+        match &a.tick(t0 + Duration::from_secs(120))[..] {
+            [Notice::TurnFinished { cost_usd, .. }] => {
+                assert!((cost_usd - again.cost_usd).abs() < 1e-12)
+            }
+            other => panic!("expected a finished turn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_retracted_prompt_cancels_its_turn() {
+        let mut a = Activity::new(Duration::from_secs(30), None);
+        let t0 = Instant::now();
+        let prompt = user("s11", "never mind");
+        a.on_event(&prompt, t0);
+        let reply = assistant("s11", false);
+        a.on_event(&reply, t0);
+        for ev in [&reply, &prompt] {
+            let mut gone = ev.clone();
+            gone.removed = true;
+            a.on_event(&gone, t0);
+        }
+        assert!(a.tick(t0 + Duration::from_secs(60)).is_empty());
     }
 
     #[test]
