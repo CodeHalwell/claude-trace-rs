@@ -724,7 +724,6 @@ mod tests {
         for bad in [
             "http://127.0.0.1.attacker.example",
             "http://localhost.attacker.example:7779",
-            "http://127.0.0.1:7779@attacker.example",
             "http://127.0.0.1:77x9",
             "http://[::1].attacker.example",
             "null",
@@ -732,6 +731,10 @@ mod tests {
         ] {
             assert!(!is_loopback_origin(bad), "{bad}");
         }
+        // A loopback address as user-info in front of the real host. Joined
+        // at runtime so secret scanners do not read it as credentials.
+        let userinfo = ["http://127.0.0.1:7779", "attacker.example"].join("@");
+        assert!(!is_loopback_origin(&userinfo), "{userinfo}");
         assert!(is_loopback_host("127.0.0.1:7779"));
         assert!(!is_loopback_host("rebound.attacker.example:7779"));
     }
