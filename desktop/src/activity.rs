@@ -13,8 +13,8 @@ use std::{
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use claude_trace_rs::{event::TraceEvent, message::Role, sources::AgentSource};
 
-/// Events older than this (by their own timestamp) are history being
-/// replayed — a backfill or catch-up — and never notify.
+/// A session we are not following yet only counts as live if its record is
+/// at most this old (replayed history is also marked explicitly).
 const FRESH: chrono::Duration = chrono::Duration::minutes(3);
 /// A session counts as active if it produced an event this recently.
 const ACTIVE_WINDOW: Duration = Duration::from_secs(120);
@@ -55,6 +55,9 @@ struct SessionActivity {
     /// when it changes; a re-emitted earlier record is a revision, not a new
     /// turn.
     max_line: usize,
+    /// Last cost seen per record, so a revision adds only what changed (a
+    /// streamed record often gains its usage when it is finalised).
+    line_costs: HashMap<usize, f64>,
 }
 
 #[derive(Debug)]
@@ -130,12 +133,18 @@ impl Activity {
     /// Feed one event. Returns any notices it triggers.
     pub fn on_event(&mut self, ev: &TraceEvent, now: Instant) -> Vec<Notice> {
         let mut out = Vec::new();
-        if ev.replayed || !is_fresh(ev) {
+        if ev.replayed {
+            return out;
+        }
+        let is_new = !self.sessions.contains_key(&ev.session_id);
+        // A record's own timestamp only decides whether a session we are not
+        // following yet is live. Once it is, in-place revisions keep their
+        // creation time however late they arrive, and still count.
+        if is_new && !is_fresh(ev) {
             return out;
         }
         self.roll_day();
 
-        let is_new = !self.sessions.contains_key(&ev.session_id);
         let s = self
             .sessions
             .entry(ev.session_id.clone())
@@ -148,9 +157,17 @@ impl Activity {
                 turn_cost: 0.0,
                 preview: None,
                 max_line: ev.line_index,
+                line_costs: HashMap::new(),
             });
         let revision = !is_new && ev.line_index <= s.max_line;
         s.max_line = s.max_line.max(ev.line_index);
+        let cost_delta = match s.line_costs.insert(ev.line_index, ev.cost_usd) {
+            Some(prev) => ev.cost_usd - prev,
+            // A revision of a record from before we started following the
+            // session: its cost is already in the day's total.
+            None if revision => 0.0,
+            None => ev.cost_usd,
+        };
         if s.project == "unknown project" {
             if let Some(cwd) = ev.cwd.as_deref() {
                 s.project = project_name(Some(cwd));
@@ -178,9 +195,7 @@ impl Activity {
             }
         }
         s.last_event = now;
-        if !revision {
-            s.turn_cost += ev.cost_usd;
-        }
+        s.turn_cost += cost_delta;
 
         if ev.turn_end {
             if let Some(start) = s.turn_started.take() {
@@ -196,9 +211,7 @@ impl Activity {
             }
         }
 
-        if !revision {
-            self.spent_today += ev.cost_usd;
-        }
+        self.spent_today += cost_delta;
         out.extend(self.check_budget());
         out
     }
@@ -371,6 +384,31 @@ mod tests {
         ev.replayed = true;
         assert!(a.on_event(&ev, Instant::now()).is_empty());
         assert_eq!(a.active_sessions(Instant::now()), 0);
+    }
+
+    #[test]
+    fn live_revisions_count_even_with_old_timestamps() {
+        let mut a = Activity::new(Duration::from_secs(30), None);
+        let t0 = Instant::now();
+        a.on_event(&user("s8", "long job"), t0);
+        // The reply is streamed into one record: first without usage...
+        let mut draft = assistant("s8", false);
+        draft.usage = None;
+        draft.cost_usd = 0.0;
+        a.on_event(&draft, t0);
+        // ...then finalised in place with its cost and an end-of-turn
+        // marker, long after the record's own timestamp.
+        let mut done = assistant("s8", true);
+        done.line_index = draft.line_index;
+        done.timestamp = Some("2020-01-01T00:00:00Z".into());
+        let n = a.on_event(&done, t0 + Duration::from_secs(600));
+        match &n[..] {
+            [Notice::TurnFinished { cost_usd, .. }] => {
+                assert!((cost_usd - done.cost_usd).abs() < 1e-12 && *cost_usd > 0.0)
+            }
+            other => panic!("expected a finished turn, got {other:?}"),
+        }
+        assert!((a.spent_today() - done.cost_usd).abs() < 1e-12);
     }
 
     #[test]

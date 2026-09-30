@@ -292,11 +292,47 @@ fn push_openai_user(messages: &mut Vec<Value>, content: &[Block]) {
             _ => {}
         }
     }
-    if !text_parts.is_empty() {
+    let image_parts: Vec<Value> = images
+        .iter()
+        .filter_map(|src| image_url(src))
+        .map(|url| json!({ "type": "image_url", "image_url": { "url": url } }))
+        .collect();
+    if !image_parts.is_empty() {
+        // Multimodal: OpenAI content parts, text first.
+        let mut parts: Vec<Value> = Vec::new();
+        if !text_parts.is_empty() {
+            parts.push(json!({ "type": "text", "text": text_parts.join("\n") }));
+        }
+        parts.extend(image_parts);
+        messages.push(json!({ "role": "user", "content": parts }));
+    } else if !text_parts.is_empty() {
         messages.push(json!({ "role": "user", "content": text_parts.join("\n") }));
     } else if !images.is_empty() {
+        // Images whose data the agent did not log.
         messages.push(json!({ "role": "user", "content": "[image]" }));
     }
+}
+
+/// An image block's source as a URL OpenAI accepts: an http(s) or data URL.
+/// Sources come in the shapes the agents log them: Anthropic
+/// `{type: base64, media_type, data}` / `{type: url, url}`, OpenAI
+/// `{url}` or a bare string, Gemini `{mimeType, data}`.
+fn image_url(source: &Value) -> Option<String> {
+    if let Some(s) = source.as_str() {
+        return (!s.is_empty()).then(|| s.to_owned());
+    }
+    if let Some(url) = source.get("url").and_then(Value::as_str) {
+        return (!url.is_empty()).then(|| url.to_owned());
+    }
+    let data = source.get("data").and_then(Value::as_str)?;
+    if data.is_empty() {
+        return None;
+    }
+    let media = ["media_type", "mimeType", "mime_type"]
+        .iter()
+        .find_map(|k| source.get(*k).and_then(Value::as_str))
+        .unwrap_or("image/png");
+    Some(format!("data:{media};base64,{data}"))
 }
 
 fn push_openai_assistant(messages: &mut Vec<Value>, t: &Turn<'_>) {
@@ -1000,5 +1036,41 @@ mod tests {
         let card = std::fs::read_to_string(dir.path().join("README.md")).unwrap();
         assert!(card.contains("Sessions: **1**"), "{card}");
         assert!(card.contains("input tokens: **100**"), "{card}");
+    }
+
+    #[test]
+    fn openai_export_keeps_images_as_content_parts() {
+        let s = stats();
+        let events = vec![ev(
+            "user",
+            json!({ "content": [
+                { "type": "text", "text": "what is this?" },
+                { "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": "QUJD" } },
+                { "type": "image", "source": { "type": "url", "url": "https://example.com/a.png" } }
+            ] }),
+        )];
+        let out = render_session(
+            &SessionExport {
+                stats: &s,
+                events: &events,
+            },
+            ExportFormat::Openai,
+        );
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let user = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "user")
+            .unwrap();
+        let parts = user["content"].as_array().expect("content parts");
+        assert_eq!(parts[0], json!({ "type": "text", "text": "what is this?" }));
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/jpeg;base64,QUJD");
+        assert_eq!(parts[2]["image_url"]["url"], "https://example.com/a.png");
+        assert_eq!(
+            image_url(&json!({ "mimeType": "image/webp", "data": "eA==" })).as_deref(),
+            Some("data:image/webp;base64,eA==")
+        );
+        assert_eq!(image_url(&json!(null)), None);
     }
 }

@@ -126,7 +126,17 @@ fn finish(id: String, session: Value, mut records: Vec<Value>) -> SessionDoc {
 
 pub fn read_sqlite(path: &Path, cursor: &mut Option<String>) -> anyhow::Result<Vec<SessionDoc>> {
     let conn = open_readonly(path)?;
-    let since: i64 = cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0);
+    // Cursor: "<max message id>|<max sessions.updated_at>".
+    let (since, since_updated) = match cursor.as_deref() {
+        Some(c) => {
+            let (id, updated) = c.split_once('|').unwrap_or((c, ""));
+            (
+                id.parse::<i64>().unwrap_or(0),
+                Some(updated.to_owned()).filter(|u| !u.is_empty()),
+            )
+        }
+        None => (0, None),
+    };
     // Message rowids only grow (rewrites re-insert), so the max id is a
     // reliable change marker; session metadata changes bump updated_at.
     let max_id: i64 = conn
@@ -140,13 +150,16 @@ pub fn read_sqlite(path: &Path, cursor: &mut Option<String>) -> anyhow::Result<V
         let rows = stmt.query_map(params![since], |r| r.get::<_, String>(0))?;
         changed.extend(rows.flatten());
     }
-    if since > 0 {
-        // Deletions (compaction) without inserts would go unnoticed by the id
-        // check; include sessions touched recently.
-        if let Ok(mut stmt) = conn
-            .prepare("SELECT id FROM sessions WHERE updated_at >= datetime('now', '-2 minutes')")
+    let scols = columns(&conn, "sessions");
+    let has_updated = scols.contains("updated_at");
+    if let (true, Some(watermark)) = (has_updated, &since_updated) {
+        // Deletions (compaction) insert nothing, so the id check misses
+        // them; they bump the session's updated_at. Comparing with the last
+        // seen value (not a wall-clock window) also covers downtime.
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT id FROM sessions WHERE julianday(updated_at) >= julianday(?1)")
         {
-            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            if let Ok(rows) = stmt.query_map(params![watermark], |r| r.get::<_, String>(0)) {
                 for id in rows.flatten() {
                     if !changed.contains(&id) {
                         changed.push(id);
@@ -155,7 +168,13 @@ pub fn read_sqlite(path: &Path, cursor: &mut Option<String>) -> anyhow::Result<V
             }
         }
     }
-    let scols = columns(&conn, "sessions");
+    let max_updated: Option<String> = if has_updated {
+        conn.query_row("SELECT MAX(updated_at) FROM sessions", [], |r| r.get(0))
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
     let mcols = columns(&conn, "messages");
     let col = |cols: &std::collections::BTreeSet<String>, c: &str| {
         if cols.contains(c) {
@@ -222,7 +241,7 @@ pub fn read_sqlite(path: &Path, cursor: &mut Option<String>) -> anyhow::Result<V
         let records: Vec<Value> = rows.flatten().collect();
         docs.push(finish(sid, session, records));
     }
-    *cursor = Some(max_id.to_string());
+    *cursor = Some(format!("{max_id}|{}", max_updated.unwrap_or_default()));
     Ok(docs)
 }
 
@@ -422,7 +441,7 @@ mod tests {
         drop(conn);
         let mut cursor = None;
         let docs = read_sqlite(&db, &mut cursor).unwrap();
-        assert_eq!(cursor.as_deref(), Some("3"));
+        assert!(cursor.as_deref().unwrap().starts_with("3|"));
         let recs: Vec<Enrichment> = docs[0].records.iter().map(enrich).collect();
         assert_eq!(recs.len(), 3, "per-message usage present, no totals record");
         assert_eq!(recs[0].cwd.as_deref(), Some("/home/u/proj"));
@@ -434,6 +453,34 @@ mod tests {
         // but unchanged content hashes the same, so nothing is re-emitted.
         let again = read_sqlite(&db, &mut cursor).unwrap();
         assert!(again.is_empty() || again[0].records == docs[0].records);
+    }
+
+    #[test]
+    fn deletions_while_stopped_are_seen_after_any_downtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(r#"
+            CREATE TABLE sessions (id TEXT PRIMARY KEY, working_dir TEXT, updated_at TIMESTAMP);
+            CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT, session_id TEXT,
+              role TEXT, content_json TEXT, created_timestamp INTEGER, metadata_json TEXT);
+            INSERT INTO sessions VALUES ('s1', '/p', '2026-01-01 00:00:00');
+            INSERT INTO messages (message_id, session_id, role, content_json) VALUES
+              ('m1','s1','user','[{"type":"text","text":"one"}]'),
+              ('m2','s1','assistant','[{"type":"text","text":"two"}]');
+        "#).unwrap();
+        let mut cursor = None;
+        assert_eq!(read_sqlite(&db, &mut cursor).unwrap()[0].records.len(), 2);
+        // Compaction a day later (well outside any recent-activity window):
+        // a delete and an updated_at bump, but no new message id.
+        conn.execute_batch(
+            "DELETE FROM messages WHERE message_id = 'm2';
+             UPDATE sessions SET updated_at = '2026-01-02 00:00:00' WHERE id = 's1';",
+        )
+        .unwrap();
+        let docs = read_sqlite(&db, &mut cursor).unwrap();
+        assert_eq!(docs.len(), 1, "the compacted session was not re-read");
+        assert_eq!(docs[0].records.len(), 1);
     }
 
     #[test]

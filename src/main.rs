@@ -178,12 +178,7 @@ async fn main() -> anyhow::Result<()> {
         }
         p
     });
-    let only: Option<std::collections::HashSet<sources::AgentSource>> =
-        cli.only.as_ref().map(|v| {
-            v.iter()
-                .filter_map(|s| sources::AgentSource::parse(s))
-                .collect()
-        });
+    let only = cli.only.as_deref().map(parse_only).transpose()?;
     let roots = runtime::resolve_roots(&cli.watch_root, forced_source, only, cli.no_default_roots);
 
     match cli.cmd.unwrap_or(Cmd::Serve(ServeArgs::default())) {
@@ -202,6 +197,27 @@ async fn main() -> anyhow::Result<()> {
         Cmd::List => run_list(&roots),
         Cmd::Agents(args) => run_agents(args),
     }
+}
+
+/// Parse `--only`, rejecting ids that name no agent: silently dropping a
+/// typo would trace fewer agents than asked for (or none).
+fn parse_only(ids: &[String]) -> anyhow::Result<std::collections::HashSet<sources::AgentSource>> {
+    let mut out = std::collections::HashSet::new();
+    let mut unknown = Vec::new();
+    for id in ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        match sources::AgentSource::parse(id) {
+            Some(s) => {
+                out.insert(s);
+            }
+            None => unknown.push(id.to_owned()),
+        }
+    }
+    anyhow::ensure!(
+        unknown.is_empty(),
+        "unknown agent id(s) in --only: {} (run `claude-trace-rs agents` for the list)",
+        unknown.join(", ")
+    );
+    Ok(out)
 }
 
 async fn run_serve(roots: Vec<sources::WatchRoot>, args: ServeArgs) -> anyhow::Result<()> {
@@ -493,6 +509,14 @@ mod tests {
         let roots = resolve_roots(&[], None, None, false);
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].source, Some(AgentSource::ClaudeCode));
+    }
+
+    #[test]
+    fn only_rejects_unknown_agent_ids() {
+        let ok = super::parse_only(&["codex".into(), " claude ".into()]).unwrap();
+        assert!(ok.contains(&AgentSource::Codex) && ok.contains(&AgentSource::ClaudeCode));
+        let err = super::parse_only(&["codex".into(), "codx".into()]).unwrap_err();
+        assert!(err.to_string().contains("codx"), "{err}");
     }
 
     #[test]
