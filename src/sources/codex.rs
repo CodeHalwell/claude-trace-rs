@@ -72,11 +72,11 @@ pub fn annotate(carry: &mut Map<String, Value>, rec: &mut Value) {
                 carry.insert("model".into(), m.clone());
             }
         }
-        "event_msg" => {
-            if payload.get("type").and_then(Value::as_str) == Some("thread_settings_applied") {
-                if let Some(m) = payload.pointer("/thread_settings/model") {
-                    carry.insert("model".into(), m.clone());
-                }
+        "event_msg"
+            if payload.get("type").and_then(Value::as_str) == Some("thread_settings_applied") =>
+        {
+            if let Some(m) = payload.pointer("/thread_settings/model") {
+                carry.insert("model".into(), m.clone());
             }
         }
         _ => {}
