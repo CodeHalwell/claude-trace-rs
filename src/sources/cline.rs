@@ -158,14 +158,16 @@ pub fn source_for_path(path: &Path) -> AgentSource {
     }
 }
 
-pub fn parse_document(path: &Path, body: &str) -> Option<Vec<SessionDoc>> {
+/// Parse a task's API history. `source` is the variant already chosen for
+/// it (forced by the root, or from the path): Roo and Kilo count usage
+/// differently from Cline.
+pub fn parse_document(source: AgentSource, path: &Path, body: &str) -> Option<Vec<SessionDoc>> {
     if is_sdk_messages(path) {
         return parse_sdk(path, body);
     }
     let arr: Vec<Value> = serde_json::from_str(body).ok()?;
     let task_dir = path.parent()?;
     let session_id = task_dir.file_name()?.to_str()?.to_owned();
-    let source = source_for_path(path);
     let meta = task_meta(task_dir, &session_id);
     let has_metrics = arr.iter().any(|m| m.get("metrics").is_some());
 
@@ -584,7 +586,7 @@ mod tests {
  {"role":"assistant","content":[{"type":"text","text":"Reading."},{"type":"tool_use","id":"t1","name":"read_file","input":{"path":"src/cli.rs"}}],"modelInfo":{"modelId":"claude-sonnet-4-5-20250929","providerId":"anthropic","mode":"act"},"metrics":{"tokens":{"prompt":223,"completion":212,"cached":14650},"cost":0.0583},"ts":1790604009871}]"#;
         let path = task.join(API_HISTORY);
         std::fs::write(&path, body).unwrap();
-        let docs = parse_document(&path, body).unwrap();
+        let docs = parse_document(AgentSource::Cline, &path, body).unwrap();
         assert_eq!(docs[0].session_id, "1790604003");
         assert_eq!(docs[0].records.len(), 2);
         let a = enrich(&docs[0].records[1], AgentSource::Cline);
@@ -611,7 +613,7 @@ mod tests {
         let path = task.join(API_HISTORY);
         std::fs::write(&path, body).unwrap();
         assert_eq!(source_for_path(&path), AgentSource::RooCode);
-        let docs = parse_document(&path, body).unwrap();
+        let docs = parse_document(AgentSource::RooCode, &path, body).unwrap();
         assert_eq!(docs[0].records.len(), 3, "usage totals appended");
         let u = enrich(&docs[0].records[0], AgentSource::RooCode);
         assert_eq!(u.cwd.as_deref(), Some("/work/app"));
@@ -641,7 +643,7 @@ mod tests {
            "metrics":{"inputTokens":14873,"outputTokens":212,"cacheReadTokens":0,"cacheWriteTokens":14650,"cost":0.0583}},
           {"id":"m3","role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","name":"read_files","content":"fn main(){}"}],"ts":1790604010100}]}"#;
         let path = sdir.join("1790_ab12c.messages.json");
-        let docs = parse_document(&path, body).unwrap();
+        let docs = parse_document(AgentSource::Cline, &path, body).unwrap();
         assert_eq!(docs[0].session_id, "1790_ab12c");
         let a = enrich(&docs[0].records[1], AgentSource::Cline);
         let u = a.usage.unwrap();
@@ -651,7 +653,8 @@ mod tests {
         let r = enrich(&docs[0].records[2], AgentSource::Cline);
         assert_eq!(r.tool_results, vec!["toolu_01"]);
         // A team/subagent transcript in the same directory is its own session.
-        let child = parse_document(&sdir.join("agent7.messages.json"), body).unwrap();
+        let child =
+            parse_document(AgentSource::Cline, &sdir.join("agent7.messages.json"), body).unwrap();
         assert_eq!(child[0].session_id, "1790_ab12c:agent7");
     }
 

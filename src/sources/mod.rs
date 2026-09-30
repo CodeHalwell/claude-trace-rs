@@ -594,7 +594,7 @@ pub fn parse_document(source: AgentSource, path: &Path, body: &str) -> Option<Ve
         AgentSource::Gemini => gemini::parse_document(path, body, false),
         AgentSource::Qwen => qwen::parse_document(path, body),
         AgentSource::Cline | AgentSource::RooCode | AgentSource::KiloCode => {
-            cline::parse_document(path, body)
+            cline::parse_document(source, path, body)
         }
         AgentSource::Aider => aider::parse_document(path, body),
         AgentSource::Continue => continue_dev::parse_document(path, body),

@@ -283,7 +283,9 @@ impl Engine {
                         {
                             st.carry = carry;
                         }
-                        st.source = AgentSource::parse(&c.source);
+                        // A source forced on the root now wins over the
+                        // one recorded when the file was last read.
+                        st.source = root.source.or_else(|| AgentSource::parse(&c.source));
                         self.process_jsonl(path, root, source);
                     }
                     None if !backfill && !self.written_while_stopped(mtime_ms) => {
@@ -1989,5 +1991,68 @@ mod tests {
         );
         // A mark inside the head is not a valid one.
         assert_eq!(parse_signatures(Some("4096:0a;100:0b")).1, None);
+    }
+
+    #[test]
+    fn a_forced_cline_variant_counts_usage_its_own_way() {
+        let dir = tempfile::tempdir().unwrap();
+        // A custom folder: nothing in the path says Roo.
+        let task = dir.path().join("exports/tasks/t1");
+        std::fs::create_dir_all(&task).unwrap();
+        std::fs::write(
+            task.join("ui_messages.json"),
+            r#"[{"ts":1,"type":"say","say":"api_req_started","text":"{\"tokensIn\":1500,\"tokensOut\":100,\"cacheWrites\":200,\"cacheReads\":1000,\"cost\":0.02}"}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            task.join("api_conversation_history.json"),
+            r#"[{"role":"user","content":"hi","ts":1},{"role":"assistant","content":"hello","ts":2}]"#,
+        )
+        .unwrap();
+        let (mut e, store, _rx) = engine(vec![root(dir.path(), Some(AgentSource::RooCode))]);
+        e.scan(true);
+        let s = store.session("t1").unwrap();
+        assert_eq!(s.source, "roo-code");
+        assert_eq!(s.input_tokens, 300, "Roo's tokensIn includes the cache");
+    }
+
+    #[test]
+    fn a_source_forced_after_a_restart_wins_over_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        // Auto-detected as Codex on the first run.
+        let p = codex_rollout(&logs, "0199a1b2-0000-7000-8000-00000000000d", &[CODEX_CTX]);
+        let db = Db::open(&dir.path().join("trace.db")).unwrap();
+        let mut e = Engine::new(
+            vec![root(&logs, None)],
+            SessionStore::with_db(db.clone()),
+            None,
+        );
+        e.scan(true);
+        assert_eq!(
+            db.checkpoint(&p.to_string_lossy()).unwrap().unwrap().source,
+            "codex"
+        );
+        drop(e);
+
+        // Restarted with the folder forced to Claude Code.
+        let (tx, mut rx) = broadcast::channel(64);
+        let store2 = SessionStore::with_db(db.clone());
+        store2.seed_sessions(db.load_sessions().unwrap());
+        let mut e2 = Engine::new(
+            vec![root(&logs, Some(AgentSource::ClaudeCode))],
+            store2,
+            Some(tx),
+        );
+        e2.scan(false);
+        append(
+            &p,
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        );
+        e2.path_changed(&p);
+        let live = drain(&mut rx);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].source, "claude-code");
     }
 }
