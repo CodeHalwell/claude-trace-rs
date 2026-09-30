@@ -6,7 +6,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::{db::Db, event::TraceEvent};
+use crate::{
+    db::{Db, Upsert},
+    event::TraceEvent,
+};
 
 /// Cap on how many events we retain per session in memory for client backfill.
 pub const PER_SESSION_RECENT_CAP: usize = 5_000;
@@ -49,8 +52,13 @@ pub struct SessionStats {
     /// Tool name → invocation count.
     pub tool_counts: HashMap<String, usize>,
 
-    /// AI-generated title from `ai-title` events, when present.
+    /// Session title reported by the agent (AI-generated titles, session
+    /// names), when present.
     pub title: Option<String>,
+    /// The first real user prompt of the session, truncated — a readable
+    /// label for agents that never title their sessions.
+    #[serde(default)]
+    pub first_prompt: Option<String>,
 
     /// Whether the user has bookmarked this session (persisted in the database).
     #[serde(default)]
@@ -93,6 +101,7 @@ impl Default for SessionStats {
             cost_usd: 0.0,
             tool_counts: HashMap::new(),
             title: None,
+            first_prompt: None,
             bookmarked: false,
             tags: Vec::new(),
         }
@@ -179,12 +188,143 @@ impl SessionStats {
         }
         self.cost_usd += ev.cost_usd;
 
-        // Capture AI-generated session title when emitted.
-        if ev.event_type == "ai-title" {
-            if let Some(t) = ev.entry.get("aiTitle").and_then(|v| v.as_str()) {
-                self.title = Some(t.to_owned());
+        if let Some(t) = &ev.title {
+            // Claude Code's `summary` records are older-style short titles
+            // (and can describe the conversation a resumed session came
+            // from): a fallback only, never over an AI or user-set title.
+            if ev.event_type != "summary" || self.title.is_none() {
+                self.title = Some(t.clone());
             }
         }
+        if self.first_prompt.is_none() {
+            self.first_prompt = first_prompt_of(ev);
+        }
+    }
+
+    /// Which labels taken from a single record `old` supplied and its
+    /// replacement `new` (none when it is removed) does not carry forward.
+    /// Those are re-derived from the records that remain.
+    fn stale_labels(&self, old: &TraceEvent, new: Option<&TraceEvent>) -> StaleLabels {
+        let prompt = first_prompt_of(old);
+        StaleLabels {
+            prompt: prompt.is_some()
+                && prompt == self.first_prompt
+                && new.map_or(true, |n| first_prompt_of(n) != self.first_prompt),
+            title: old.title.is_some()
+                && old.title == self.title
+                && new.map_or(true, |n| n.title != self.title),
+            // A replacement with a timestamp sets its own on ingest.
+            timestamp: old.timestamp.is_some()
+                && old.timestamp == self.last_entry_timestamp
+                && new.map_or(true, |n| n.timestamp.is_none()),
+        }
+    }
+
+    /// Undo [`SessionStats::ingest`] for an event that is being replaced or
+    /// removed, so in-place record updates never double count. Identity and
+    /// timing fields (cwd, first/last seen) are left alone; labels taken
+    /// from the record are handled by [`SessionStats::stale_labels`].
+    fn retract(&mut self, ev: &TraceEvent) {
+        self.event_count = self.event_count.saturating_sub(1);
+        match ev.event_type.as_str() {
+            "user" => self.user_count = self.user_count.saturating_sub(1),
+            "assistant" => self.assistant_count = self.assistant_count.saturating_sub(1),
+            "tool_use" if ev.tool_uses.is_empty() => {
+                self.tool_use_count = self.tool_use_count.saturating_sub(1);
+                if let Some(name) = ev.entry.get("name").and_then(|v| v.as_str()) {
+                    decrement(&mut self.tool_counts, name);
+                }
+            }
+            "tool_result" if ev.tool_results.is_empty() => {
+                self.tool_result_count = self.tool_result_count.saturating_sub(1);
+            }
+            "system" => self.system_count = self.system_count.saturating_sub(1),
+            _ => {}
+        }
+        for name in &ev.tool_uses {
+            self.tool_use_count = self.tool_use_count.saturating_sub(1);
+            decrement(&mut self.tool_counts, name);
+        }
+        self.tool_result_count = self.tool_result_count.saturating_sub(ev.tool_results.len());
+        if let Some(u) = &ev.usage {
+            self.input_tokens = self.input_tokens.saturating_sub(u.input);
+            self.output_tokens = self.output_tokens.saturating_sub(u.output);
+            self.cache_read_tokens = self.cache_read_tokens.saturating_sub(u.cache_read);
+            self.cache_creation_tokens =
+                self.cache_creation_tokens.saturating_sub(u.cache_creation);
+        }
+        self.cost_usd = (self.cost_usd - ev.cost_usd).max(0.0);
+    }
+}
+
+/// Session labels that came from a record that has changed or gone.
+#[derive(Debug, Default, Clone, Copy)]
+struct StaleLabels {
+    prompt: bool,
+    title: bool,
+    timestamp: bool,
+}
+
+impl StaleLabels {
+    fn any(self) -> bool {
+        self.prompt || self.title || self.timestamp
+    }
+}
+
+fn decrement(map: &mut HashMap<String, usize>, key: &str) {
+    if let Some(n) = map.get_mut(key) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            map.remove(key);
+        }
+    }
+}
+
+/// Text of a genuine user prompt, skipping tool results and the context
+/// blocks agents inject as user turns (environment info, command wrappers,
+/// instructions files).
+fn first_prompt_of(ev: &TraceEvent) -> Option<String> {
+    let msg = ev.message.as_ref()?;
+    if msg.role != crate::message::Role::User {
+        return None;
+    }
+    let text = msg.plain_text();
+    let t = text.trim();
+    if t.is_empty() || is_injected_context(t) {
+        return None;
+    }
+    Some(crate::sources::truncate(t, 160))
+}
+
+fn is_injected_context(t: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "<environment_context",
+        "<user_instructions",
+        "<command-",
+        "<local-command",
+        "<system-reminder",
+        "Caveat:",
+        "# AGENTS.md",
+        "<user_action",
+        "This session is being continued",
+    ];
+    PREFIXES.iter().any(|p| t.starts_with(p))
+}
+
+/// What [`SessionStore::ingest`] did with an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ingested {
+    /// A record not seen before.
+    New,
+    /// A record whose content changed in place (documents, databases).
+    Updated,
+    /// Already stored with identical content; nothing changed.
+    Unchanged,
+}
+
+impl Ingested {
+    pub fn changed(self) -> bool {
+        self != Ingested::Unchanged
     }
 }
 
@@ -266,41 +406,221 @@ impl SessionStore {
     /// never double-counts the in-memory aggregates. All writes happen while the
     /// in-memory lock is held, so the persisted aggregates can never be
     /// clobbered by an out-of-order snapshot.
-    pub fn ingest(&self, ev: &TraceEvent) {
+    pub fn ingest(&self, ev: &TraceEvent) -> Ingested {
         let mut g = self.inner.write().expect("session store poisoned");
 
-        if let Some(db) = &self.db {
-            match db.insert_event(ev) {
-                // Already persisted — it has already been counted; skip it.
-                Ok(false) => return,
-                Ok(true) => {}
-                Err(e) => warn!("Failed to persist event to database: {e}"),
+        // Find the previous version of this record, if any. With a database
+        // that is authoritative; without one, the in-memory ring buffer is the
+        // best we have (records evicted from it are treated as new).
+        let previous: Option<TraceEvent> = match &self.db {
+            Some(db) => match db.upsert_event(ev) {
+                Ok(Upsert::Inserted) => None,
+                Ok(Upsert::Unchanged) => return Ingested::Unchanged,
+                Ok(Upsert::Updated(old)) => Some(*old),
+                Err(e) => {
+                    warn!("Failed to persist event to database: {e}");
+                    None
+                }
+            },
+            None => {
+                let prior = g
+                    .per_session_events
+                    .get(&ev.session_id)
+                    .and_then(|q| q.iter().rev().find(|e| e.line_index == ev.line_index));
+                match prior {
+                    Some(p) if p.entry == ev.entry => return Ingested::Unchanged,
+                    Some(p) => Some(p.clone()),
+                    None => None,
+                }
             }
-        }
+        };
 
-        g.total_events += 1;
+        let outcome = if previous.is_some() {
+            Ingested::Updated
+        } else {
+            g.total_events += 1;
+            Ingested::New
+        };
 
         let stats = g.sessions.entry(ev.session_id.clone()).or_default();
-        stats.ingest(ev);
-        if let Some(db) = &self.db {
-            if let Err(e) = db.upsert_session(stats) {
-                warn!("Failed to persist session aggregates: {e}");
+        let stale = match &previous {
+            Some(old) => {
+                let stale = stats.stale_labels(old, Some(ev));
+                stats.retract(old);
+                stale
             }
-        }
+            None => StaleLabels::default(),
+        };
+        stats.ingest(ev);
 
         let per = g
             .per_session_events
             .entry(ev.session_id.clone())
             .or_default();
-        per.push_back(ev.clone());
+        if previous.is_some() {
+            if let Some(slot) = per.iter_mut().rev().find(|e| e.line_index == ev.line_index) {
+                *slot = ev.clone();
+            } else {
+                per.push_back(ev.clone());
+            }
+        } else {
+            per.push_back(ev.clone());
+        }
         while per.len() > PER_SESSION_RECENT_CAP {
             per.pop_front();
         }
 
-        g.global_events.push_back(ev.clone());
+        let replaced = previous.is_some()
+            && g.global_events
+                .iter_mut()
+                .rev()
+                .find(|e| e.line_index == ev.line_index && e.session_id == ev.session_id)
+                .map(|slot| *slot = ev.clone())
+                .is_some();
+        if !replaced {
+            g.global_events.push_back(ev.clone());
+        }
         while g.global_events.len() > GLOBAL_RECENT_CAP {
             g.global_events.pop_front();
         }
+        self.relabel(&mut g, &ev.session_id, stale);
+        self.persist_session(&g, &ev.session_id, stale);
+        outcome
+    }
+
+    /// Re-derive the labels a changed or removed record supplied from the
+    /// session's remaining records: the first prompt, the title (the latest
+    /// non-summary title, else the first summary) and the latest record
+    /// timestamp.
+    fn relabel(&self, g: &mut Inner, session_id: &str, stale: StaleLabels) {
+        if !stale.any() {
+            return;
+        }
+        let find = |newest_first: bool, pred: &mut dyn FnMut(&mut TraceEvent) -> bool| {
+            self.find_event(g, session_id, newest_first, pred)
+        };
+        let prompt = stale.prompt.then(|| {
+            find(false, &mut |e| {
+                e.hydrate();
+                first_prompt_of(e).is_some()
+            })
+            .and_then(|e| first_prompt_of(&e))
+        });
+        let title = stale.title.then(|| {
+            find(true, &mut |e| {
+                e.title.is_some() && e.event_type != "summary"
+            })
+            .or_else(|| find(false, &mut |e| e.title.is_some()))
+            .and_then(|e| e.title)
+        });
+        let timestamp = stale
+            .timestamp
+            .then(|| find(true, &mut |e| e.timestamp.is_some()).and_then(|e| e.timestamp));
+        if let Some(stats) = g.sessions.get_mut(session_id) {
+            if let Some(p) = prompt {
+                stats.first_prompt = p;
+            }
+            if let Some(t) = title {
+                stats.title = t;
+            }
+            if let Some(t) = timestamp {
+                stats.last_entry_timestamp = t;
+            }
+        }
+    }
+
+    /// The first of a session's records, in line order (or newest first),
+    /// that `pred` accepts: from the database when there is one, else from
+    /// the in-memory buffer.
+    fn find_event(
+        &self,
+        g: &Inner,
+        session_id: &str,
+        newest_first: bool,
+        pred: &mut dyn FnMut(&mut TraceEvent) -> bool,
+    ) -> Option<TraceEvent> {
+        if let Some(db) = &self.db {
+            return db
+                .find_session_event(session_id, newest_first, pred)
+                .unwrap_or_else(|e| {
+                    warn!("Failed to read session events: {e}");
+                    None
+                });
+        }
+        let mut evs: Vec<&TraceEvent> = g.per_session_events.get(session_id)?.iter().collect();
+        evs.sort_by_key(|e| e.line_index);
+        if newest_first {
+            evs.reverse();
+        }
+        evs.into_iter().find_map(|e| {
+            let mut e = e.clone();
+            pred(&mut e).then_some(e)
+        })
+    }
+
+    fn persist_session(&self, g: &Inner, session_id: &str, relabelled: StaleLabels) {
+        if let (Some(db), Some(stats)) = (&self.db, g.sessions.get(session_id)) {
+            let mut res = db.upsert_session(stats);
+            if res.is_ok() && relabelled.any() {
+                res = db.set_session_labels(stats);
+            }
+            if let Err(e) = res {
+                warn!("Failed to persist session aggregates: {e}");
+            }
+        }
+    }
+
+    /// Remove a record that disappeared from its source (a document rewritten
+    /// shorter, a rewind). Returns it if it existed. A session left with no
+    /// events is dropped altogether (its annotations are kept).
+    pub fn remove(&self, session_id: &str, line_index: usize) -> Option<TraceEvent> {
+        let mut g = self.inner.write().expect("session store poisoned");
+        let old: Option<TraceEvent> = match &self.db {
+            Some(db) => match db.delete_event(session_id, line_index) {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!("Failed to delete event from database: {e}");
+                    None
+                }
+            },
+            None => g
+                .per_session_events
+                .get(session_id)
+                .and_then(|q| q.iter().rev().find(|e| e.line_index == line_index).cloned()),
+        };
+        let mut old = old?;
+        old.hydrate();
+        g.total_events = g.total_events.saturating_sub(1);
+        let mut emptied = false;
+        let mut stale = StaleLabels::default();
+        if let Some(stats) = g.sessions.get_mut(session_id) {
+            stale = stats.stale_labels(&old, None);
+            stats.retract(&old);
+            emptied = stats.event_count == 0;
+        }
+        if emptied {
+            g.sessions.remove(session_id);
+            g.per_session_events.remove(session_id);
+            if let Some(db) = &self.db {
+                if let Err(e) = db.delete_session(session_id) {
+                    warn!("Failed to persist session aggregates: {e}");
+                }
+            }
+        } else {
+            if let Some(q) = g.per_session_events.get_mut(session_id) {
+                q.retain(|e| e.line_index != line_index);
+            }
+            self.relabel(&mut g, session_id, stale);
+            self.persist_session(&g, session_id, stale);
+        }
+        g.global_events
+            .retain(|e| !(e.session_id == session_id && e.line_index == line_index));
+        Some(old)
+    }
+
+    /// The attached database, if any.
+    pub fn db(&self) -> Option<&Db> {
+        self.db.as_ref()
     }
 
     /// Snapshot of all known sessions and the global event tail.
@@ -355,11 +675,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Each call gets a fresh line index: the store keys records on
+    /// (session, line), so reusing one would model an in-place update.
     fn ev(session: &str, kind: &str, body: serde_json::Value) -> TraceEvent {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static LINE: AtomicUsize = AtomicUsize::new(0);
         let mut val = body;
         val["type"] = json!(kind);
         val["sessionId"] = json!(session);
-        TraceEvent::from_raw("fallback", 0, val)
+        TraceEvent::from_raw("fallback", LINE.fetch_add(1, Ordering::Relaxed), val)
     }
 
     #[test]
@@ -390,6 +714,75 @@ mod tests {
         assert_eq!(a.input_tokens, 10);
         assert_eq!(a.output_tokens, 5);
         assert!(a.cost_usd > 0.0);
+    }
+
+    /// A record at a fixed line, so tests can revise or remove it.
+    fn at(session: &str, line: usize, body: serde_json::Value) -> TraceEvent {
+        let mut val = body;
+        val["sessionId"] = json!(session);
+        TraceEvent::from_raw("fallback", line, val)
+    }
+
+    fn labels_follow_the_records_that_supply_them(store: SessionStore) {
+        let prompt = |line, text: &str, ts: &str| {
+            at(
+                "s",
+                line,
+                json!({ "type": "user", "timestamp": ts,
+                        "message": { "role": "user", "content": text } }),
+            )
+        };
+        let title = |line, t: &str| at("s", line, json!({ "type": "ai-title", "aiTitle": t }));
+        store.ingest(&prompt(0, "first question", "2026-01-01T00:00:00Z"));
+        store.ingest(&title(1, "Early title"));
+        store.ingest(&prompt(2, "second question", "2026-01-01T00:01:00Z"));
+        store.ingest(&title(3, "Better title"));
+        store.ingest(&prompt(4, "third question", "2026-01-01T00:02:00Z"));
+        let s = store.session("s").unwrap();
+        assert_eq!(s.first_prompt.as_deref(), Some("first question"));
+        assert_eq!(s.title.as_deref(), Some("Better title"));
+        assert_eq!(
+            s.last_entry_timestamp.as_deref(),
+            Some("2026-01-01T00:02:00Z")
+        );
+
+        // The first prompt revised in place.
+        store.ingest(&prompt(
+            0,
+            "first question, reworded",
+            "2026-01-01T00:00:00Z",
+        ));
+        let s = store.session("s").unwrap();
+        assert_eq!(s.first_prompt.as_deref(), Some("first question, reworded"));
+
+        // The records behind each label removed.
+        store.remove("s", 0);
+        store.remove("s", 3);
+        store.remove("s", 4);
+        let s = store.session("s").unwrap();
+        assert_eq!(s.first_prompt.as_deref(), Some("second question"));
+        assert_eq!(s.title.as_deref(), Some("Early title"));
+        assert_eq!(
+            s.last_entry_timestamp.as_deref(),
+            Some("2026-01-01T00:01:00Z")
+        );
+        if let Some(db) = store.db() {
+            let saved = db.load_sessions().unwrap().remove(0);
+            assert_eq!(saved.first_prompt.as_deref(), Some("second question"));
+            assert_eq!(saved.title.as_deref(), Some("Early title"));
+        }
+    }
+
+    #[test]
+    fn labels_follow_their_records_in_memory() {
+        labels_follow_the_records_that_supply_them(SessionStore::new());
+    }
+
+    #[test]
+    fn labels_follow_their_records_in_the_database() {
+        labels_follow_the_records_that_supply_them(SessionStore::with_db(
+            Db::open_in_memory().unwrap(),
+        ));
     }
 
     #[test]

@@ -1,16 +1,28 @@
+[workspace]
+members = [".", "desktop"]
+# `cargo build` / `cargo install` at the root build only the CLI, so users
+# without the desktop toolchain (WebKitGTK on Linux) are unaffected. Build the
+# desktop app with `cargo build -p agent-trace-desktop` (or `--workspace`).
+default-members = ["."]
+
 [package]
 name = "claude-trace-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "Local-first real-time observability dashboard for Claude Code sessions."
+description = "Local-first observability, trace database and dataset exporter for coding agents: Claude Code, Codex, Gemini CLI, Copilot, Cursor, Cline, OpenCode, Aider and more."
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/CodeHalwell/claude-trace-rs"
 homepage = "https://github.com/CodeHalwell/claude-trace-rs"
-keywords = ["claude", "observability", "dashboard", "tracing", "cli"]
+keywords = ["claude", "codex", "observability", "coding-agents", "tracing"]
 categories = ["command-line-utilities", "development-tools", "visualization"]
 authors = ["CodeHalwell"]
 rust-version = "1.74"
+exclude = ["desktop/", ".github/"]
+
+[lib]
+name = "claude_trace_rs"
+path = "src/lib.rs"
 
 [[bin]]
 name = "claude-trace-rs"
@@ -34,6 +46,14 @@ futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # Cross-platform data/config directories for the on-disk database location.
 directories = "5"
+# Kimi and Cursor name session directories after an MD5 of the working
+# directory; hashing known paths maps them back.
+md-5 = "0.10"
+# The desktop app checks that a server it attaches to belongs to the same
+# user: an HMAC over a random challenge, keyed by a per-user secret file.
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
@@ -52,7 +72,8 @@ copyright = "2026 CodeHalwell"
 license-file = ["LICENSE", "0"]
 extended-description = """
 Local-first real-time observability dashboard and training-dataset exporter \
-for Claude Code sessions, with a built-in SQLite trace database."""
+for coding agents (Claude Code, Codex, Gemini CLI, Copilot, Cursor, Cline, \
+OpenCode, Aider and more), with a built-in SQLite trace database."""
 section = "devel"
 priority = "optional"
 assets = [

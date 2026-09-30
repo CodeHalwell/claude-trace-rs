@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Agent Trace",
+  "mainBinaryName": "agent-trace",
+  "version": "0.4.0",
+  "identifier": "io.github.codehalwell.agent-trace",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "DeveloperTool",
+    "publisher": "CodeHalwell",
+    "copyright": "MIT licensed",
+    "homepage": "https://github.com/CodeHalwell/claude-trace-rs",
+    "shortDescription": "Live dashboard, notifications and dataset export for coding agents",
+    "longDescription": "Agent Trace watches the session logs of Claude Code, Codex, Gemini CLI, Copilot CLI, Cursor, Cline, OpenCode, Aider and other coding agents, and shows them live in one dashboard with cost tracking, desktop notifications and training-dataset export.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "linux": {
+      "deb": {
+        "section": "devel"
+      },
+      "rpm": {
+        "release": "1"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    }
+  }
+}

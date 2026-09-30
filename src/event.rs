@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+use crate::message::Message;
 use crate::sources::{self, AgentSource};
 
 /// Canonical transport object for a single trace record from any supported
-/// coding agent (Claude Code, Codex, Copilot, Kimi, Cline, Cursor).
+/// coding agent (see [`crate::sources::AgentSource`] for the full list).
 ///
 /// We enrich the raw record with derived fields so the dashboard can render
 /// useful information without having to walk the (sometimes very large) raw
@@ -49,6 +50,35 @@ pub struct TraceEvent {
     pub cost_usd: f64,
     /// Whether the cost was estimated client-side (vs. provided by the agent).
     pub cost_estimated: bool,
+    /// The record as an agent-neutral transcript message, when it is part of
+    /// the conversation. Not persisted (it is re-derived from `entry` when an
+    /// event is read back from the database), so it never doubles storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<Message>,
+    /// A session title carried by this record (AI-generated titles, agent
+    /// session names).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// True when this record marks the end of an agent turn — the agent has
+    /// finished and is waiting on the user. Drives "agent finished"
+    /// notifications in the desktop app.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub turn_end: bool,
+    /// Identity of the API response this record's usage belongs to, used by
+    /// the ingestion engine to count repeated usage once. Transient.
+    #[serde(skip)]
+    pub usage_key: Option<String>,
+    /// Emitted while replaying history (the start-up scan, a catch-up after
+    /// a restart, a newly discovered agent folder) rather than as it
+    /// happened. Live consumers such as notifications ignore these. Not
+    /// persisted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replayed: bool,
+    /// A tombstone: this record was deleted at its source (a history rewind,
+    /// a truncated or replaced log) and has been retracted. Live consumers
+    /// drop it. Not persisted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
 }
 
 /// Backward-compat default: traces recorded before the multi-agent upgrade
@@ -89,14 +119,14 @@ impl TraceEvent {
             .session_id
             .unwrap_or_else(|| session_id_fallback.to_owned());
 
-        // Distinguish "cost the agent reported" from "cost we estimated":
-        // adapters return Some(_) for both, so detect explicit cost fields.
-        let explicit_cost = raw
-            .get("costUSD")
-            .or_else(|| raw.get("cost_usd"))
-            .or_else(|| raw.get("cost"))
-            .and_then(|v| v.as_f64())
-            .is_some();
+        // Distinguish "cost the agent reported" from "cost we estimated".
+        let explicit_cost = en.cost_explicit
+            || raw
+                .get("costUSD")
+                .or_else(|| raw.get("cost_usd"))
+                .or_else(|| raw.get("cost"))
+                .and_then(|v| v.as_f64())
+                .is_some();
 
         Self {
             session_id,
@@ -115,12 +145,33 @@ impl TraceEvent {
             usage: en.usage,
             cost_usd: en.cost_usd.unwrap_or(0.0),
             cost_estimated: !explicit_cost,
+            message: en.message,
+            title: en.title,
+            turn_end: en.turn_end,
+            usage_key: en.usage_key,
+            replayed: false,
+            removed: false,
             entry: raw,
         }
     }
 }
 
 impl TraceEvent {
+    /// The `(session_id, line_index)` identity used for de-duplication and
+    /// in-place updates.
+    pub fn key(&self) -> (&str, usize) {
+        (&self.session_id, self.line_index)
+    }
+
+    /// Re-derive the fields that are not persisted (the canonical message)
+    /// after reading an event back from storage.
+    pub fn hydrate(&mut self) {
+        if self.message.is_none() {
+            let source = AgentSource::parse(&self.source).unwrap_or(AgentSource::Unknown);
+            self.message = sources::enrich(source, &self.entry).message;
+        }
+    }
+
     /// Concatenated, plain-text representation of this event's textual content,
     /// used to populate the database's searchable column. Includes the summary
     /// plus any `text`/`thinking` blocks and string content found in the entry.
@@ -223,7 +274,8 @@ mod tests {
             }
         });
         let ev = TraceEvent::from_raw("s", 0, val);
-        assert!((ev.cost_usd - 75.0).abs() < 0.001, "got {}", ev.cost_usd);
+        // Opus 4.5+ is $25/Mtok output (Opus 4/4.1 were $75).
+        assert!((ev.cost_usd - 25.0).abs() < 0.001, "got {}", ev.cost_usd);
     }
 
     #[test]

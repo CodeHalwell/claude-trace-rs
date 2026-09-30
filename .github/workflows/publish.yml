@@ -22,7 +22,7 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           CRATE="$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c 'import sys,json;print(json.load(sys.stdin)["packages"][0]["version"])')"
+            | python3 -c 'import sys,json;print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="claude-trace-rs"))')"
           if [ "$TAG" != "$CRATE" ]; then
             echo "::error::Tag v$TAG does not match Cargo.toml version $CRATE"
             exit 1

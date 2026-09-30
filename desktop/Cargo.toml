@@ -1,0 +1,40 @@
+[package]
+name = "agent-trace-desktop"
+version = "0.4.0"
+edition = "2021"
+description = "Native desktop app for claude-trace-rs: tray, notifications and native exports around the coding-agent trace dashboard."
+license = "MIT"
+repository = "https://github.com/CodeHalwell/claude-trace-rs"
+authors = ["CodeHalwell"]
+publish = false
+rust-version = "1.90"
+
+[[bin]]
+name = "agent-trace"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+claude-trace-rs = { path = ".." }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+chrono = "0.4"
+
+[features]
+# Tauri uses this to switch between the dev server and bundled assets.
+custom-protocol = ["tauri/custom-protocol"]

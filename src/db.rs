@@ -17,6 +17,7 @@
 //! the data rather than the device.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -42,6 +43,42 @@ pub struct SessionFilter {
     pub sort: Option<String>,
     /// Maximum number of rows to return.
     pub limit: Option<usize>,
+}
+
+/// Result of [`Db::upsert_event`].
+#[derive(Debug)]
+pub enum Upsert {
+    /// A new `(session_id, line_index)` row was written.
+    Inserted,
+    /// The row existed with different content and was replaced; carries the
+    /// previous version so callers can retract its aggregates.
+    Updated(Box<TraceEvent>),
+    /// The row existed with identical content.
+    Unchanged,
+}
+
+/// Persisted read position for one ingested file or database, so a restart
+/// resumes where it left off instead of missing (or re-reading) records.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileCheckpoint {
+    pub path: String,
+    pub source: String,
+    /// Byte offset consumed so far (append-only JSONL).
+    pub offset: u64,
+    /// Non-empty lines consumed so far (the next record's line index).
+    pub line_count: usize,
+    /// File length when last processed.
+    pub len: u64,
+    /// Modification time (ms since the epoch) when last processed.
+    pub mtime_ms: i64,
+    /// Adapter-defined incremental cursor (e.g. a SQLite watermark).
+    pub cursor: Option<String>,
+    /// Sessions whose records a JSONL file produced, so records can be
+    /// retracted if the file is truncated or replaced while stopped.
+    pub sessions: Vec<String>,
+    /// Signature of a JSONL file's first bytes (`len:hash`), to recognise a
+    /// replacement that is not shorter than what was already read.
+    pub head: Option<String>,
 }
 
 /// Page of events for one session, plus the unfiltered total for pagination.
@@ -117,6 +154,10 @@ impl Db {
         for ddl in [
             "ALTER TABLE events ADD COLUMN source TEXT NOT NULL DEFAULT 'claude-code'",
             "ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'claude-code'",
+            "ALTER TABLE sessions ADD COLUMN first_prompt TEXT",
+            "ALTER TABLE events ADD COLUMN usage_key TEXT",
+            "ALTER TABLE ingest_files ADD COLUMN sessions TEXT",
+            "ALTER TABLE ingest_files ADD COLUMN head TEXT",
         ] {
             if let Err(e) = conn.execute_batch(ddl) {
                 // "duplicate column name" means the migration already ran.
@@ -127,7 +168,9 @@ impl Db {
         }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_events_source ON events(source);
-             CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);",
+             CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+             CREATE INDEX IF NOT EXISTS idx_events_usage_key ON events(usage_key)
+                WHERE usage_key IS NOT NULL;",
         )?;
         Ok(())
     }
@@ -137,7 +180,91 @@ impl Db {
     /// Returns `true` if a new row was inserted.
     pub fn insert_event(&self, ev: &TraceEvent) -> anyhow::Result<bool> {
         let conn = self.conn.lock().expect("db poisoned");
-        let event_json = serde_json::to_string(ev)?;
+        Self::insert_or_ignore(&conn, ev)
+    }
+
+    /// Persist an event, replacing a stored record whose content changed.
+    ///
+    /// Append-only logs never change a record once written, but whole-file
+    /// documents (Gemini CLI, Cline, …) and databases (OpenCode, Goose, …)
+    /// rewrite records in place as a turn streams in — a tool result lands on
+    /// an existing message, token counts are filled in at the end. Comparing
+    /// the raw entry lets those updates through while keeping re-reads of
+    /// unchanged data free.
+    pub fn upsert_event(&self, ev: &TraceEvent) -> anyhow::Result<Upsert> {
+        let mut conn = self.conn.lock().expect("db poisoned");
+        // One transaction, so a failed write never loses the stored version.
+        let tx = conn.transaction()?;
+        if Self::insert_or_ignore(&tx, ev)? {
+            tx.commit()?;
+            return Ok(Upsert::Inserted);
+        }
+        let stored: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT event_json, usage_key FROM events WHERE session_id = ?1 AND line_index = ?2",
+                params![ev.session_id, ev.line_index as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((stored, stored_key)) = stored else {
+            return Ok(Upsert::Inserted);
+        };
+        let mut old: TraceEvent = serde_json::from_str(&stored)?;
+        if old.entry == ev.entry && old.source == ev.source && stored_key == ev.usage_key {
+            return Ok(Upsert::Unchanged);
+        }
+        tx.execute(
+            "DELETE FROM events WHERE session_id = ?1 AND line_index = ?2",
+            params![ev.session_id, ev.line_index as i64],
+        )?;
+        Self::insert_or_ignore(&tx, ev)?;
+        tx.commit()?;
+        old.hydrate();
+        Ok(Upsert::Updated(Box::new(old)))
+    }
+
+    /// The record that owns a response's usage (see
+    /// [`TraceEvent::usage_key`]), so repeated usage is counted once even
+    /// across restarts.
+    pub fn usage_owner(&self, key: &str) -> anyhow::Result<Option<(String, usize)>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT session_id, line_index FROM events WHERE usage_key = ?1 LIMIT 1",
+                params![key],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as usize)),
+            )
+            .optional()?)
+    }
+
+    /// Delete one event, returning it if it existed.
+    pub fn delete_event(
+        &self,
+        session_id: &str,
+        line_index: usize,
+    ) -> anyhow::Result<Option<TraceEvent>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT event_json FROM events WHERE session_id = ?1 AND line_index = ?2",
+                params![session_id, line_index as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        conn.execute(
+            "DELETE FROM events WHERE session_id = ?1 AND line_index = ?2",
+            params![session_id, line_index as i64],
+        )?;
+        let mut ev: TraceEvent = serde_json::from_str(&stored)?;
+        ev.hydrate();
+        Ok(Some(ev))
+    }
+
+    fn insert_or_ignore(conn: &Connection, ev: &TraceEvent) -> anyhow::Result<bool> {
+        let event_json = stored_event_json(ev)?;
         let tool_uses = serde_json::to_string(&ev.tool_uses)?;
         let (input, output, cr, cc) = ev
             .usage
@@ -149,8 +276,8 @@ impl Db {
                (session_id, line_index, event_type, observed_at, timestamp, model,
                 cost_usd, cost_estimated, input_tokens, output_tokens,
                 cache_read_tokens, cache_creation_tokens, summary, search_text,
-                tool_uses, event_json, source)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                tool_uses, event_json, source, usage_key)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 ev.session_id,
                 ev.line_index as i64,
@@ -169,12 +296,21 @@ impl Db {
                 tool_uses,
                 event_json,
                 ev.source,
+                ev.usage_key,
             ],
         )?;
         Ok(changed > 0)
     }
 
     /// Insert (or update) the rolled-up aggregates for a session.
+    /// Drop a session's aggregate row (its last event was retracted).
+    /// Bookmarks, tags and notes in `session_meta` are kept.
+    pub fn delete_session(&self, id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     pub fn upsert_session(&self, s: &SessionStats) -> anyhow::Result<()> {
         let conn = self.conn.lock().expect("db poisoned");
         let tool_counts = serde_json::to_string(&s.tool_counts)?;
@@ -184,10 +320,11 @@ impl Db {
                 last_entry_timestamp, event_count, user_count, assistant_count,
                 tool_use_count, tool_result_count, system_count, input_tokens,
                 output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd,
-                tool_counts)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
+                tool_counts, first_prompt)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
              ON CONFLICT(id) DO UPDATE SET
                 source=excluded.source,
+                first_prompt=COALESCE(sessions.first_prompt, excluded.first_prompt),
                 cwd=excluded.cwd, git_branch=excluded.git_branch,
                 version=excluded.version, model=excluded.model,
                 title=COALESCE(excluded.title, sessions.title),
@@ -225,7 +362,21 @@ impl Db {
                 s.cache_creation_tokens as i64,
                 s.cost_usd,
                 tool_counts,
+                s.first_prompt,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Overwrite a session's labels after they were re-derived from its
+    /// remaining records ([`Db::upsert_session`] keeps the stored first
+    /// prompt and title).
+    pub fn set_session_labels(&self, s: &SessionStats) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute(
+            "UPDATE sessions SET first_prompt = ?2, title = ?3, last_entry_timestamp = ?4
+             WHERE id = ?1",
+            params![s.id, s.first_prompt, s.title, s.last_entry_timestamp],
         )?;
         Ok(())
     }
@@ -252,14 +403,15 @@ impl Db {
                     s.tool_result_count, s.system_count, s.input_tokens, s.output_tokens,
                     s.cache_read_tokens, s.cache_creation_tokens, s.cost_usd, s.tool_counts,
                     COALESCE(m.bookmarked,0), COALESCE(m.tags,'[]'), COALESCE(m.notes,''),
-                    s.source
+                    s.source, s.first_prompt
              FROM sessions s LEFT JOIN session_meta m ON m.id = s.id WHERE 1=1",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(q) = &f.search {
             sql.push_str(
                 " AND (lower(s.id) LIKE ?1 OR lower(s.title) LIKE ?1
-                       OR lower(s.cwd) LIKE ?1 OR lower(s.git_branch) LIKE ?1)",
+                       OR lower(s.cwd) LIKE ?1 OR lower(s.git_branch) LIKE ?1
+                       OR lower(s.first_prompt) LIKE ?1)",
             );
             args.push(Box::new(format!("%{}%", q.to_lowercase())));
         }
@@ -366,7 +518,7 @@ impl Db {
         let rows = stmt.query_map(arg_refs.as_slice(), |r| r.get::<_, String>(0))?;
         let mut events = Vec::new();
         for r in rows {
-            if let Ok(v) = serde_json::from_str::<Value>(&r?) {
+            if let Some(v) = hydrated_value(&r?) {
                 events.push(v);
             }
         }
@@ -397,7 +549,7 @@ impl Db {
                     r.get::<_, String>(0)
                 })?;
                 for r in rows {
-                    if let Ok(v) = serde_json::from_str::<Value>(&r?) {
+                    if let Some(v) = hydrated_value(&r?) {
                         out.push(v);
                     }
                 }
@@ -410,7 +562,7 @@ impl Db {
                 let rows =
                     stmt.query_map(params![pattern, limit as i64], |r| r.get::<_, String>(0))?;
                 for r in rows {
-                    if let Ok(v) = serde_json::from_str::<Value>(&r?) {
+                    if let Some(v) = hydrated_value(&r?) {
                         out.push(v);
                     }
                 }
@@ -529,6 +681,205 @@ impl Db {
         }))
     }
 
+    /// Total cost of events stamped at or after `since` (an RFC 3339 UTC
+    /// timestamp). Used to seed the desktop app's daily budget.
+    pub fn cost_since(&self, since: &str) -> anyhow::Result<f64> {
+        let conn = self.conn.lock().expect("db poisoned");
+        Ok(conn.query_row(
+            // Compare instants, not strings: records carry assorted UTC
+            // offsets, and `01:00+02:00` sorts after `00:00Z` as text.
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM events
+             WHERE julianday(COALESCE(timestamp, observed_at)) >= julianday(?1)",
+            params![since],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Every stored event for one session in order, hydrated — used to export
+    /// full histories that no longer fit the in-memory ring buffers.
+    pub fn all_session_events(&self, session_id: &str) -> anyhow::Result<Vec<TraceEvent>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT event_json FROM events WHERE session_id = ?1 ORDER BY line_index ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            if let Ok(mut ev) = serde_json::from_str::<TraceEvent>(&r?) {
+                ev.hydrate();
+                out.push(ev);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The first of a session's stored events, in line order (or newest
+    /// first), that `pred` accepts. Rows are decoded one at a time, so a
+    /// match near the start costs little however long the session is.
+    pub fn find_session_event(
+        &self,
+        session_id: &str,
+        newest_first: bool,
+        mut pred: impl FnMut(&mut TraceEvent) -> bool,
+    ) -> anyhow::Result<Option<TraceEvent>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let sql = if newest_first {
+            "SELECT event_json FROM events WHERE session_id = ?1 ORDER BY line_index DESC"
+        } else {
+            "SELECT event_json FROM events WHERE session_id = ?1 ORDER BY line_index ASC"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query(params![session_id])?;
+        while let Some(row) = rows.next()? {
+            let json: String = row.get(0)?;
+            if let Ok(mut ev) = serde_json::from_str::<TraceEvent>(&json) {
+                if pred(&mut ev) {
+                    return Ok(Some(ev));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The saved read position for a file, if any.
+    pub fn checkpoint(&self, path: &str) -> anyhow::Result<Option<FileCheckpoint>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT path, source, byte_offset, line_count, len, mtime_ms, cursor, sessions, head
+                 FROM ingest_files WHERE path = ?1",
+                params![path],
+                |r| {
+                    Ok(FileCheckpoint {
+                        path: r.get(0)?,
+                        source: r.get(1)?,
+                        offset: r.get::<_, i64>(2)? as u64,
+                        line_count: r.get::<_, i64>(3)? as usize,
+                        len: r.get::<_, i64>(4)? as u64,
+                        mtime_ms: r.get(5)?,
+                        cursor: r.get(6)?,
+                        sessions: r
+                            .get::<_, Option<String>>(7)?
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_default(),
+                        head: r.get(8)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Save a file's read position.
+    pub fn save_checkpoint(&self, c: &FileCheckpoint) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute(
+            "INSERT INTO ingest_files
+                (path, source, byte_offset, line_count, len, mtime_ms, cursor, sessions, head)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(path) DO UPDATE SET
+                source=excluded.source, byte_offset=excluded.byte_offset,
+                line_count=excluded.line_count, len=excluded.len,
+                mtime_ms=excluded.mtime_ms, cursor=excluded.cursor,
+                sessions=excluded.sessions, head=excluded.head",
+            params![
+                c.path,
+                c.source,
+                c.offset as i64,
+                c.line_count as i64,
+                c.len as i64,
+                c.mtime_ms,
+                c.cursor,
+                (!c.sessions.is_empty())
+                    .then(|| serde_json::to_string(&c.sessions).unwrap_or_default()),
+                c.head,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record hashes saved for a unit by [`Db::save_doc_hashes`].
+    pub fn doc_hashes(&self, path: &str) -> anyhow::Result<HashMap<String, Vec<u64>>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut stmt =
+            conn.prepare("SELECT session_id, hashes FROM ingest_docs WHERE path = ?1")?;
+        let rows = stmt.query_map(params![path], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (sid, blob) = row?;
+            let hashes = blob
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().expect("8-byte chunk")))
+                .collect();
+            out.insert(sid, hashes);
+        }
+        Ok(out)
+    }
+
+    /// The most records any unit other than `path` holds for `session_id`.
+    pub fn doc_len_elsewhere(&self, path: &str, session_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let bytes: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(length(hashes)), 0) FROM ingest_docs
+             WHERE session_id = ?1 AND path <> ?2",
+            params![session_id, path],
+            |r| r.get(0),
+        )?;
+        Ok(bytes as usize / 8)
+    }
+
+    /// Save the record hashes of the sessions that changed in a unit, and
+    /// drop those of sessions that disappeared from it.
+    pub fn save_doc_hashes(
+        &self,
+        path: &str,
+        changed: &[(&str, &[u64])],
+        removed: &[&str],
+    ) -> anyhow::Result<()> {
+        if changed.is_empty() && removed.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().expect("db poisoned");
+        let tx = conn.transaction()?;
+        for (sid, hashes) in changed {
+            let blob: Vec<u8> = hashes.iter().flat_map(|h| h.to_le_bytes()).collect();
+            tx.execute(
+                "INSERT INTO ingest_docs (path, session_id, hashes) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path, session_id) DO UPDATE SET hashes = excluded.hashes",
+                params![path, sid, blob],
+            )?;
+        }
+        for sid in removed {
+            tx.execute(
+                "DELETE FROM ingest_docs WHERE path = ?1 AND session_id = ?2",
+                params![path, sid],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Newest file modification time among saved checkpoints: roughly when
+    /// the tracer last saw activity. Files first seen after a restart and
+    /// modified after this were written while it was not running.
+    pub fn checkpoint_horizon(&self) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        Ok(conn.query_row(
+            "SELECT MAX(mtime_ms) FROM ingest_files WHERE mtime_ms > 0",
+            [],
+            |r| r.get::<_, Option<i64>>(0),
+        )?)
+    }
+
+    /// Per-agent counts of files being tracked, for the agents overview.
+    pub fn tracked_files_by_source(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut stmt = conn.prepare("SELECT source, COUNT(*) FROM ingest_files GROUP BY source")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     /// Read user annotations (bookmark/tags/notes) for a session.
     pub fn get_meta(&self, id: &str) -> anyhow::Result<Value> {
         let conn = self.conn.lock().expect("db poisoned");
@@ -605,7 +956,28 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionStats> {
         bookmarked: r.get::<_, i64>(21)? != 0,
         tags: serde_json::from_str(&tags).unwrap_or_default(),
         source: r.get(24)?,
+        first_prompt: r.get(25)?,
     })
+}
+
+/// The JSON stored in `events.event_json`: the full event minus the
+/// canonical message, which [`TraceEvent::hydrate`] re-derives on read.
+fn stored_event_json(ev: &TraceEvent) -> anyhow::Result<String> {
+    let mut v = serde_json::to_value(ev)?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("message");
+        obj.remove("replayed");
+        obj.remove("removed");
+    }
+    Ok(serde_json::to_string(&v)?)
+}
+
+/// Parse a stored event row and re-derive its canonical message, returning
+/// the API-facing JSON.
+fn hydrated_value(stored: &str) -> Option<Value> {
+    let mut ev: TraceEvent = serde_json::from_str(stored).ok()?;
+    ev.hydrate();
+    serde_json::to_value(ev).ok()
 }
 
 /// Resolve the default on-disk database path in the platform data directory,
@@ -672,6 +1044,26 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen);
 CREATE INDEX IF NOT EXISTS idx_sessions_cwd       ON sessions(cwd);
 
+CREATE TABLE IF NOT EXISTS ingest_files (
+    path        TEXT PRIMARY KEY,
+    source      TEXT    NOT NULL,
+    byte_offset INTEGER NOT NULL DEFAULT 0,
+    line_count  INTEGER NOT NULL DEFAULT 0,
+    len         INTEGER NOT NULL DEFAULT 0,
+    mtime_ms    INTEGER NOT NULL DEFAULT 0,
+    cursor      TEXT
+);
+
+-- Record hashes per session from the last parse of a document, store or
+-- database, so a restart diffs against what was actually seen: history that
+-- was deliberately skipped stays skipped, and only real changes are emitted.
+CREATE TABLE IF NOT EXISTS ingest_docs (
+    path       TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    hashes     BLOB NOT NULL,
+    PRIMARY KEY (path, session_id)
+);
+
 CREATE TABLE IF NOT EXISTS session_meta (
     id         TEXT PRIMARY KEY,
     bookmarked INTEGER NOT NULL DEFAULT 0,
@@ -731,6 +1123,66 @@ mod tests {
         .unwrap();
         let hits = db.search_events("refactor", 10, None).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn cost_since_filters_by_timestamp() {
+        let db = Db::open_in_memory().unwrap();
+        let usage = |ts: &str, line, cost: f64| {
+            ev(
+                "a",
+                line,
+                "assistant",
+                json!({ "timestamp": ts, "costUSD": cost, "message": { "content": "x" } }),
+            )
+        };
+        let rows = [
+            ("2026-09-28T23:59:00Z", 1.0),     // before midnight
+            ("2026-09-29T08:00:00.123Z", 2.0), // after
+            // Offsets are compared as instants, not text:
+            ("2026-09-29T01:00:00+02:00", 4.0), // 23:00Z the day before
+            ("2026-09-28T20:00:00.5-07:00", 8.0), // 03:00Z today
+        ];
+        for (i, (ts, cost)) in rows.iter().enumerate() {
+            db.insert_event(&usage(ts, i, *cost)).unwrap();
+        }
+        let today = db.cost_since("2026-09-29T00:00:00Z").unwrap();
+        assert!((today - 10.0).abs() < 1e-9, "{today}");
+    }
+
+    #[test]
+    fn upsert_replaces_changed_records_and_keeps_usage_owner() {
+        let db = Db::open_in_memory().unwrap();
+        let mut e = ev("a", 0, "user", json!({ "content": "draft" }));
+        e.usage_key = Some("k1".into());
+        assert!(matches!(db.upsert_event(&e).unwrap(), Upsert::Inserted));
+        assert!(matches!(db.upsert_event(&e).unwrap(), Upsert::Unchanged));
+        let mut changed = ev("a", 0, "user", json!({ "content": "final" }));
+        changed.usage_key = Some("k1".into());
+        assert!(matches!(
+            db.upsert_event(&changed).unwrap(),
+            Upsert::Updated(_)
+        ));
+        assert_eq!(db.usage_owner("k1").unwrap(), Some(("a".to_owned(), 0)));
+        let page = db.session_events("a", None, None, 10, 0).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.events[0]["entry"]["content"], json!("final"));
+    }
+
+    #[test]
+    fn doc_hashes_roundtrip_and_delete() {
+        let db = Db::open_in_memory().unwrap();
+        db.save_doc_hashes("/x", &[("s1", &[1, u64::MAX]), ("s2", &[7])], &[])
+            .unwrap();
+        let h = db.doc_hashes("/x").unwrap();
+        assert_eq!(h["s1"], vec![1, u64::MAX]);
+        db.save_doc_hashes("/y", &[("s2", &[7, 8, 9])], &[])
+            .unwrap();
+        assert_eq!(db.doc_len_elsewhere("/x", "s2").unwrap(), 3);
+        assert_eq!(db.doc_len_elsewhere("/y", "s2").unwrap(), 1);
+        assert_eq!(db.doc_len_elsewhere("/y", "none").unwrap(), 0);
+        db.save_doc_hashes("/x", &[], &["s1"]).unwrap();
+        assert_eq!(db.doc_hashes("/x").unwrap().len(), 1);
     }
 
     #[test]

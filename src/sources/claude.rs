@@ -11,23 +11,67 @@
 //! and double as the generic fallback for `AgentSource::Unknown`, so a trace
 //! from an unrecognised agent still renders as best it can.
 
+use std::path::{Path, PathBuf};
+
 use serde_json::Value;
 
 use crate::event::TokenUsage;
-use crate::sources::{estimate_cost, truncate, Enrichment};
+use crate::message::{Message, Role};
+use crate::sources::{env_path, estimate_cost, truncate, Enrichment};
+
+/// `$CLAUDE_CONFIG_DIR` (comma-separated, each with `projects/`), else
+/// `~/.claude/projects` and the XDG location `~/.config/claude/projects`.
+pub fn default_dirs(home: &Path) -> Vec<PathBuf> {
+    if let Ok(v) = std::env::var("CLAUDE_CONFIG_DIR") {
+        let dirs: Vec<PathBuf> = v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| PathBuf::from(s).join("projects"))
+            .collect();
+        if !dirs.is_empty() {
+            return dirs;
+        }
+    }
+    let _ = env_path;
+    vec![
+        home.join(".claude/projects"),
+        home.join(".config/claude/projects"),
+    ]
+}
 
 /// Normalise one Claude Code JSONL record.
 pub fn enrich(raw: &Value) -> Enrichment {
     let event_type = raw
         .get("type")
         .and_then(|v| v.as_str())
+        .or_else(|| {
+            // Role-only records (generic fallback for unknown agents).
+            raw.get("role").and_then(|v| v.as_str()).map(|r| match r {
+                "user" | "tool" => "user",
+                "system" | "developer" => "system",
+                _ => "assistant",
+            })
+        })
         .unwrap_or("unknown")
         .to_owned();
 
-    let session_id = raw
+    let base_session = raw
         .get("sessionId")
+        .or_else(|| raw.get("session_id"))
         .and_then(|v| v.as_str())
         .map(str::to_owned);
+    // Sub-agent transcripts (`isSidechain`, `agentId`) reuse the parent's
+    // sessionId; give them their own session so their records cannot collide
+    // with the parent's on the (session, line) key.
+    let session_id = match (
+        base_session,
+        raw.get("isSidechain").and_then(|v| v.as_bool()),
+        raw.get("agentId").and_then(|v| v.as_str()),
+    ) {
+        (Some(sid), Some(true), Some(agent)) => Some(format!("{sid}:agent-{agent}")),
+        (sid, _, _) => sid,
+    };
 
     let timestamp = raw
         .get("timestamp")
@@ -39,6 +83,7 @@ pub fn enrich(raw: &Value) -> Enrichment {
     let git_branch = raw
         .get("gitBranch")
         .and_then(|v| v.as_str())
+        .filter(|b| !b.is_empty())
         .map(str::to_owned);
 
     let version = raw
@@ -50,12 +95,14 @@ pub fn enrich(raw: &Value) -> Enrichment {
         .pointer("/message/model")
         .and_then(|v| v.as_str())
         .or_else(|| raw.get("model").and_then(|v| v.as_str()))
+        .filter(|m| *m != "<synthetic>")
         .map(str::to_owned);
 
     let (tool_uses, tool_results) = extract_content_kinds(raw);
     let usage = extract_usage(raw);
 
     let cost_usd = raw.get("costUSD").and_then(|v| v.as_f64());
+    let cost_explicit = cost_usd.is_some();
 
     let summary = summarise(raw, &tool_uses);
 
@@ -66,6 +113,30 @@ pub fn enrich(raw: &Value) -> Enrichment {
         (None, Some(u)) => Some(estimate_cost(model.as_deref(), u)),
         (None, None) => None,
     };
+
+    let message = canonical_message(raw, &event_type);
+    let title = match event_type.as_str() {
+        "ai-title" => raw.get("aiTitle").and_then(|v| v.as_str()),
+        // Short titles only: anything long or multi-line is not a label.
+        "summary" => raw
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .filter(|t| t.len() <= 200 && !t.contains('\n')),
+        "custom-title" => raw.get("customTitle").and_then(|v| v.as_str()),
+        _ => None,
+    }
+    .map(str::to_owned);
+    let turn_end = event_type == "assistant"
+        && raw.pointer("/message/stop_reason").and_then(|v| v.as_str()) == Some("end_turn")
+        && raw.get("isSidechain").and_then(|v| v.as_bool()) != Some(true);
+    // Claude Code writes one line per content block and repeats the
+    // response's usage on each; sidechain replays copy it again. The API
+    // message id identifies the response.
+    let usage_key = usage.as_ref().and_then(|_| {
+        raw.pointer("/message/id")
+            .and_then(|v| v.as_str())
+            .map(|id| format!("anthropic-msg:{id}"))
+    });
 
     Enrichment {
         event_type,
@@ -79,8 +150,41 @@ pub fn enrich(raw: &Value) -> Enrichment {
         tool_results,
         usage,
         cost_usd,
+        cost_explicit,
         summary,
+        message,
+        title,
+        turn_end,
+        usage_key,
     }
+}
+
+/// The record's dialogue content as a canonical message.
+fn canonical_message(raw: &Value, event_type: &str) -> Option<Message> {
+    let role_str = raw
+        .pointer("/message/role")
+        .and_then(|v| v.as_str())
+        .unwrap_or(event_type);
+    let content = raw
+        .pointer("/message/content")
+        .or_else(|| raw.get("content"));
+    match (event_type, role_str) {
+        ("user" | "assistant", _) | (_, "user" | "assistant" | "tool" | "developer") => {}
+        _ => return None,
+    }
+    // Plain OpenAI-shaped records (generic fallback).
+    if raw.get("type").is_none() && raw.get("role").is_some() {
+        return Message::from_openai(raw);
+    }
+    let content = content?;
+    let is_meta = raw.get("isMeta").and_then(|v| v.as_bool()) == Some(true);
+    let role = match role_str {
+        "assistant" => Role::Assistant,
+        "system" | "developer" => Role::System,
+        _ if is_meta => Role::System,
+        _ => Role::User,
+    };
+    Message::from_anthropic(role, content)
 }
 
 /// Walk an entry's content blocks (top-level `content`, or `message.content`)

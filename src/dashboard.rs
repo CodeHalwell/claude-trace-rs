@@ -8,12 +8,17 @@ pub fn dashboard_html(port: u16) -> String {
     DASHBOARD_HTML.replace("__PORT__", &port.to_string())
 }
 
+/// The app's diamond mark, served as the page icon.
+pub const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3b82f6"/><stop offset="1" stop-color="#bc8cff"/></linearGradient></defs><rect width="64" height="64" rx="14" fill="url(#g)"/><path d="M32 12 L50 32 L32 52 L14 32 Z" fill="#fff"/></svg>"##;
+
 const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Agent Trace</title>
+<meta name="color-scheme" content="dark light">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
   :root[data-theme="dark"]{
     --bg:#0b0e14; --surface:#11151c; --surface-2:#161b24; --surface-3:#1d2430;
@@ -98,9 +103,20 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   .field{position:relative}
   .field input,.field select{
     width:100%;padding:7px 10px;border-radius:8px;border:1px solid var(--border);
-    background:var(--surface-2);color:var(--text);font-size:12.5px;outline:none;
+    background-color:var(--surface-2);color:var(--text);font-size:12.5px;outline:none;
   }
   .field input:focus,.field select:focus{border-color:var(--accent)}
+  .controls select{padding:7px 10px;border-radius:8px;border:1px solid var(--border);background-color:var(--surface-2);color:var(--text);font-size:12.5px;outline:none}
+  /* Draw selects and checkboxes ourselves: native ones follow the OS theme
+     (light GTK widgets inside the dark desktop window). */
+  select{-webkit-appearance:none;appearance:none;padding-right:26px!important;background-repeat:no-repeat;background-position:right 9px center;background-size:10px 6px;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%238b949e' stroke-width='1.5'/%3E%3C/svg%3E")}
+  select option{background:var(--surface);color:var(--text)}
+  input[type=checkbox]{-webkit-appearance:none;appearance:none;width:15px;height:15px;margin:0;flex:none;border:1px solid var(--border);border-radius:4px;
+    background:var(--surface-2);display:inline-grid;place-content:center;cursor:pointer}
+  input[type=checkbox]:checked{background:var(--accent-strong);border-color:var(--accent-strong)}
+  input[type=checkbox]:checked::after{content:"";width:9px;height:9px;background:#fff;
+    clip-path:polygon(14% 44%,0 65%,50% 100%,100% 16%,80% 0,43% 62%)}
   .row{display:flex;gap:8px;align-items:center}
   .toggle{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer;user-select:none}
   .toggle input{accent-color:var(--accent-strong)}
@@ -117,22 +133,50 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   .session .title{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
   .session .star{color:var(--dim);font-size:13px}
   .session .star.on{color:var(--amber)}
-  .session .line2{display:flex;align-items:center;gap:8px;margin-top:3px;font-size:11px;color:var(--muted)}
-  .session .pill{padding:1px 6px;border-radius:6px;background:var(--surface-3);color:var(--muted);font-size:10.5px}
+  .session .line2{display:flex;align-items:center;gap:8px;margin-top:3px;font-size:11px;color:var(--muted);min-width:0}
+  .session .line2>*{white-space:nowrap;flex:none}
+  .session .pill{padding:1px 6px;border-radius:6px;background:var(--surface-3);color:var(--muted);font-size:10.5px;
+    flex:0 1 auto!important;min-width:0;overflow:hidden;text-overflow:ellipsis}
   .session .meta-right{margin-left:auto;display:flex;align-items:center;gap:6px}
   .empty{padding:30px 16px;text-align:center;color:var(--dim);font-size:12.5px}
   /* ---------- Agent source badges ---------- */
   .src{display:inline-flex;align-items:center;gap:4px;padding:1px 7px;border-radius:10px;
     font-size:10px;font-weight:700;letter-spacing:.2px;border:1px solid transparent;white-space:nowrap}
   .src::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
-  .src-claude-code{background:var(--accent-soft);color:var(--accent)}
-  .src-codex{background:var(--green-soft);color:var(--green)}
-  .src-copilot{background:var(--surface-3);color:var(--purple)}
-  .src-kimi{background:var(--amber-soft);color:var(--amber)}
-  .src-cline{background:var(--surface-3);color:var(--pink)}
-  .src-cursor{background:var(--surface-3);color:var(--cyan)}
-  .src-unknown{background:var(--surface-3);color:var(--dim)}
+  .src{background:var(--surface-3);color:var(--muted)}
+  @supports (background:color-mix(in srgb, red 10%, transparent)){
+    .src{background:color-mix(in srgb, currentColor 14%, transparent)}
+  }
   .src-chips{display:flex;flex-wrap:wrap;gap:5px}
+
+  /* ---------- Agents overview ---------- */
+  .agents-summary{display:flex;align-items:center;gap:12px;margin-bottom:14px;color:var(--muted);font-size:12.5px}
+  .agents{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+  .agent{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:13px 14px}
+  .agent.off{opacity:.62}
+  .agent .top{display:flex;align-items:center;gap:8px}
+  .agent .name{font-weight:700;font-size:13.5px}
+  .agent .state{margin-left:auto;font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:6px}
+  .state.watching{background:var(--green-soft);color:var(--green)}
+  .state.found{background:var(--amber-soft);color:var(--amber)}
+  .state.missing{background:var(--surface-3);color:var(--dim)}
+  .agent .fmt{font-size:11px;color:var(--dim);margin-top:3px}
+  .agent .nums{display:flex;gap:14px;margin-top:9px;font-size:12px}
+  .agent .nums b{font-size:14px}
+  .agent .dirs{margin-top:9px;font-size:11px;color:var(--muted);word-break:break-all}
+  .agent .dirs div{display:flex;gap:6px;padding:1px 0}
+  .agent .dirs .ok{color:var(--green)}
+  .agent .dirs .no{color:var(--dim)}
+
+  /* ---------- System messages & settings ---------- */
+  details.sysmsg{margin:0 0 10px;max-width:920px;border:1px dashed var(--border);border-radius:10px;padding:6px 10px;color:var(--muted);font-size:12px}
+  details.sysmsg pre{white-space:pre-wrap;word-break:break-word;max-height:320px;overflow:auto;font-size:11.5px}
+  .set-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--border-soft);font-size:12.5px}
+  .set-row:last-child{border-bottom:0}
+  .set-row .d{color:var(--dim);font-size:11px;margin-top:2px}
+  .set-row input[type=number],.set-row input[type=text]{width:120px;padding:5px 8px;border-radius:7px;border:1px solid var(--border);background:var(--surface-2);color:var(--text);font-size:12px}
+  .desktop-only{display:none}
+  body.desktop .desktop-only{display:initial}
 
   /* ---------- Main ---------- */
   .main{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg)}
@@ -157,8 +201,8 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
   .panel{flex:1;overflow-y:auto;min-height:0;padding:14px 16px}
   .panel-toolbar{display:flex;align-items:center;gap:9px;margin-bottom:12px;flex-wrap:wrap}
-  .panel-toolbar select,.panel-toolbar input{
-    padding:6px 9px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px;outline:none}
+  .panel-toolbar select,.panel-toolbar input:not([type=checkbox]){
+    padding:6px 9px;border-radius:8px;border:1px solid var(--border);background-color:var(--surface);color:var(--text);font-size:12px;outline:none}
   .panel-toolbar .grow{flex:1;min-width:120px}
 
   /* ---------- Event feed ---------- */
@@ -175,6 +219,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   .t-assistant{background:var(--green-soft);color:var(--green)}
   .t-tool_use,.t-tool_result{background:var(--amber-soft);color:var(--amber)}
   .t-system,.t-summary{background:var(--surface-3);color:var(--muted)}
+  .t-error{background:var(--surface-3);color:var(--red)}
   .event .summary{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .event .nums{font-size:11px;color:var(--dim);text-align:right;white-space:nowrap}
   .sess-ref{font-size:10.5px;color:var(--accent);background:var(--accent-soft);padding:1px 6px;border-radius:6px}
@@ -270,6 +315,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <div class="spacer"></div>
     <div class="status"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></div>
     <button class="btn" id="exportBtn">⤓ Export</button>
+    <button class="icon-btn desktop-only" id="settingsBtn" title="Settings">⚙</button>
     <button class="icon-btn" id="themeBtn" title="Toggle theme">◐</button>
     <button class="icon-btn" id="helpBtn" title="Keyboard shortcuts (?)">?</button>
   </div>
@@ -300,6 +346,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <div class="tab active" data-tab="live">Live feed</div>
         <div class="tab" data-tab="conversation">Conversation</div>
         <div class="tab" data-tab="analytics">Analytics</div>
+        <div class="tab" data-tab="agents">Agents<span class="badge" id="agentsBadge"></span></div>
       </div>
 
       <!-- Live -->
@@ -312,6 +359,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <option value="tool_use">Tool use</option>
             <option value="tool_result">Tool result</option>
             <option value="system">System</option>
+            <option value="error">Errors</option>
           </select>
           <input id="liveSearch" class="grow" placeholder="Filter feed text…">
           <button class="btn" id="pauseBtn">⏸ Pause</button>
@@ -328,7 +376,9 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <option value="all">Whole transcript</option>
             <option value="user">User only</option>
             <option value="assistant">Assistant only</option>
+            <option value="tool_result">Tool results</option>
           </select>
+          <label class="toggle"><input type="checkbox" id="convSystem">Show context &amp; system</label>
           <input id="convSearch" class="grow" placeholder="Search within session…">
           <span class="hint" id="convCount"></span>
         </div>
@@ -338,6 +388,11 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       <!-- Analytics -->
       <section class="panel" id="panel-analytics" style="display:none">
         <div id="analytics"><div class="empty">Loading analytics…</div></div>
+      </section>
+
+      <!-- Agents -->
+      <section class="panel" id="panel-agents" style="display:none">
+        <div id="agentsPanel"><div class="empty">Loading agents…</div></div>
       </section>
     </main>
   </div>
@@ -375,7 +430,20 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   </div>
   <div class="mf">
     <button class="btn" id="exportCancel">Cancel</button>
-    <button class="btn primary" id="exportGo">⤓ Download</button>
+    <button class="btn primary" id="exportGo">⤓ Export</button>
+  </div>
+</div>
+
+<!-- Settings modal (desktop app) -->
+<div class="modal" id="settingsModal">
+  <div class="mh">Settings <span class="hint" id="setMode" style="font-weight:400;margin-left:8px"></span></div>
+  <div class="mb" id="settingsBody" style="max-height:62vh;overflow:auto"></div>
+  <div class="mf">
+    <button class="btn" id="setTestNotify">Test notification</button>
+    <button class="btn" id="setOpenData">Open data folder</button>
+    <span style="flex:1"></span>
+    <button class="btn" id="setCancel">Cancel</button>
+    <button class="btn primary" id="setSave">Save</button>
   </div>
 </div>
 
@@ -388,7 +456,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <span></span><span></span>
   </div>
   <div class="mb" style="margin-top:-12px;display:grid;grid-template-columns:90px 1fr;gap:8px 12px;font-size:12.5px">
-    <span class="kbd">1 / 2 / 3</span><span>Live / Conversation / Analytics</span>
+    <span class="kbd">1 / 2 / 3 / 4</span><span>Live / Conversation / Analytics / Agents</span>
     <span class="kbd">Ctrl/⌘ B</span><span>Toggle sidebar</span>
     <span class="kbd">Space</span><span>Pause / resume the live feed</span>
     <span class="kbd">e</span><span>Open export</span>
@@ -419,11 +487,29 @@ const state = {
   conv: {events:[], total:0, offset:0, loading:false},
   sources: [],             // [{source, sessions, events, cost_usd}]
   sourceFilter: '',        // '' = all sources
+  agents: {},              // id -> {name, color, resume, ...} from /api/agents
 };
-const SOURCE_LABELS = {'claude-code':'Claude','codex':'Codex','copilot':'Copilot','kimi':'Kimi','cline':'Cline','cursor':'Cursor','unknown':'Unknown'};
-function srcLabel(s){ return SOURCE_LABELS[s] || (s?s.charAt(0).toUpperCase()+s.slice(1):'Unknown'); }
-function srcBadge(s){ const k=escHtml(s||'unknown'); return `<span class="src src-${k}">${escHtml(srcLabel(s))}</span>`; }
+// Fallback labels/colours until /api/agents answers (kept in sync with
+// sources::AgentSource::spec).
+const AGENT_FALLBACK = {
+  'claude-code':['Claude Code','#d97757'], 'codex':['Codex','#10a37f'], 'gemini':['Gemini CLI','#4285f4'],
+  'qwen':['Qwen Code','#7c5cff'], 'copilot':['Copilot CLI','#8957e5'], 'cursor':['Cursor','#64748b'],
+  'cline':['Cline','#0ea5e9'], 'roo-code':['Roo Code','#f59e0b'], 'kilo-code':['Kilo Code','#e11d48'],
+  'opencode':['OpenCode','#f97316'], 'crush':['Crush','#ec4899'], 'goose':['Goose','#22c55e'],
+  'aider':['Aider','#14b8a6'], 'continue':['Continue','#6366f1'], 'kimi':['Kimi Code','#2563eb'],
+  'amp':['Amp','#f43f5e'], 'droid':['Factory Droid','#fb923c'], 'unknown':['Unknown','#9ca3af'],
+};
+function agentInfo(s){ const a=state.agents[s]; if(a) return a; const f=AGENT_FALLBACK[s]; return f?{name:f[0],color:f[1]}:{name:s?s.charAt(0).toUpperCase()+s.slice(1):'Unknown',color:'#9ca3af'}; }
+function srcLabel(s){ return agentInfo(s).name; }
+function srcBadge(s){ const a=agentInfo(s||'unknown'); return `<span class="src" style="color:${escHtml(a.color)}">${escHtml(a.name)}</span>`; }
 const FEED_CAP = 600;
+
+// ---------- Desktop app bridge ----------
+// Inside the Agent Trace desktop app the page can call native commands
+// (save dialogs, notifications, settings). In a browser this is null.
+const desktop = window.__TAURI_INTERNALS__ ? {
+  invoke: (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args || {}),
+} : null;
 
 // ---------- Helpers ----------
 const fmtNum = n => (n||0).toLocaleString();
@@ -432,6 +518,7 @@ function fmtTokens(n){ n=n||0; if(n>=1e6) return (n/1e6).toFixed(2)+'M'; if(n>=1
 function escHtml(s){ return String(s??'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function shortId(id){ return id ? id.slice(0,8) : '—'; }
 function projectName(cwd){ if(!cwd) return 'No project'; const p=cwd.replace(/\/+$/,'').split('/'); return p[p.length-1]||cwd; }
+function sessionName(s){ return s.title || s.first_prompt || shortId(s.id); }
 function relTime(iso){
   if(!iso) return '';
   const d=Date.parse(iso); if(isNaN(d)) return '';
@@ -466,10 +553,30 @@ function updateConn(){
 let refreshDebounce;
 function ingest(ev, live){
   const key = ev.session_id+':'+ev.line_index;
-  if(state.feedSeen.has(key)) return;
+  if(ev.removed){
+    // Deleted at its source (a rewind, a truncated log): drop the row.
+    state.feedSeen.delete(key);
+    state.feed=state.feed.filter(e=> (e.session_id+':'+e.line_index)!==key);
+    const row=document.querySelector(`#feed .event[data-key="${CSS.escape(key)}"]`);
+    if(row) row.remove();
+    if(live && state.tab==='conversation' && ev.session_id===state.selected) scheduleConvRefresh();
+    clearTimeout(refreshDebounce);
+    refreshDebounce=setTimeout(()=>{ loadSessions(); if(state.tab==='analytics') loadAnalytics(); }, 1200);
+    return;
+  }
+  if(state.feedSeen.has(key)){
+    // Documents and databases update records in place: replace the row.
+    const i=state.feed.findIndex(e=> (e.session_id+':'+e.line_index)===key);
+    if(i>=0) state.feed[i]=ev;
+    const row=document.querySelector(`#feed .event[data-key="${CSS.escape(key)}"]`);
+    if(row && live && !state.paused){ row.outerHTML=eventRow(ev); const n=document.querySelector(`#feed .event[data-key="${CSS.escape(key)}"]`); if(n) bindRow(n); }
+    if(live && state.tab==='conversation' && ev.session_id===state.selected) scheduleConvRefresh();
+    return;
+  }
   state.feedSeen.add(key);
   state.feed.push(ev);
   if(state.feed.length>FEED_CAP){ const drop=state.feed.shift(); state.feedSeen.delete(drop.session_id+':'+drop.line_index); }
+  if(live && state.tab==='conversation' && ev.session_id===state.selected) scheduleConvRefresh();
   if(live && !state.paused){
     appendFeedRow(ev);
     // Refresh sidebar/analytics lazily as new data lands.
@@ -515,7 +622,7 @@ function renderSourceChips(){
 }
 function renderSessions(){
   const list=$('#sessionList');
-  if(!state.sessions.length){ list.innerHTML='<div class="empty">No sessions yet.<br>Start a coding-agent session and it will appear here.</div>'; return; }
+  if(!state.sessions.length){ list.innerHTML='<div class="empty">No sessions yet.<br>Start a coding-agent session and it will appear here.<br><br><a href="#" id="seeAgents">See which agents were found →</a></div>'; const a=$('#seeAgents'); if(a) a.addEventListener('click',(e)=>{e.preventDefault(); setTab('agents');}); return; }
   // Group by project.
   const groups=new Map();
   for(const s of state.sessions){ const p=s.cwd||''; if(!groups.has(p)) groups.set(p,[]); groups.get(p).push(s); }
@@ -524,7 +631,7 @@ function renderSessions(){
     html+=`<div class="group-label">${escHtml(projectName(cwd))}<span class="count">${arr.length}</span></div>`;
     for(const s of arr){
       const live=isLive(s.last_seen);
-      const name=s.title || shortId(s.id);
+      const name=sessionName(s);
       html+=`<div class="session ${s.id===state.selected?'active':''}" data-id="${escHtml(s.id)}">
         <div class="line1">
           ${live?'<span class="dot on" style="width:7px;height:7px"></span>':''}
@@ -575,7 +682,9 @@ function renderHead(){
   head.innerHTML=`
     <div class="h1">
       <span class="star ${state.selectedMeta.bookmarked?'on':''}" id="headStar" style="cursor:pointer;font-size:16px;color:${state.selectedMeta.bookmarked?'var(--amber)':'var(--dim)'}">${state.selectedMeta.bookmarked?'★':'☆'}</span>
-      <h2>${escHtml(s.title||shortId(s.id))}</h2>
+      <h2 title="${escHtml(sessionName(s))}">${escHtml(sessionName(s))}</h2>
+      ${resumeCmd(s)?'<button class="btn" id="resumeBtn" title="Copy a command that resumes this session">⧉ Resume</button>':''}
+      ${desktop&&s.cwd?'<button class="btn" id="revealBtn" title="Open the project folder">📂 Folder</button>':''}
       <button class="btn" id="exportThis">⤓ Export</button>
     </div>
     <div class="sub">
@@ -601,10 +710,24 @@ function renderHead(){
   `;
   $('#headStar').addEventListener('click', ()=> toggleBookmark(s.id));
   $('#exportThis').addEventListener('click', ()=> openExport('session'));
+  const rb=$('#resumeBtn'); if(rb) rb.addEventListener('click', ()=> copyText(resumeCmd(s), 'Resume command copied'));
+  const fb=$('#revealBtn'); if(fb) fb.addEventListener('click', ()=> desktop.invoke('reveal_path',{path:s.cwd}).catch(e=>toast(String(e))));
   $('#tagInput').addEventListener('keydown', (e)=>{ if(e.key==='Enter'&&e.target.value.trim()){ addTag(e.target.value.trim()); e.target.value=''; }});
   $$('[data-rmtag]').forEach(el=> el.addEventListener('click', ()=> removeTag(el.dataset.rmtag)));
   let nt; $('#notesArea').addEventListener('input', (e)=>{ clearTimeout(nt); nt=setTimeout(()=>saveNotes(e.target.value), 600); });
 }
+function resumeCmd(s){
+  const t=agentInfo(s.source).resume; if(!t) return '';
+  const uuid=(s.id.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)||[s.id])[0];
+  const cmd=t.replace('{id}', s.id.split(':')[0]).replace('{uuid}', uuid);
+  return s.cwd ? `cd ${JSON.stringify(s.cwd)} && ${cmd}` : cmd;
+}
+function copyText(t, msg){
+  const done=()=>toast(msg||'Copied');
+  if(navigator.clipboard && window.isSecureContext){ navigator.clipboard.writeText(t).then(done, ()=>fallbackCopy(t,done)); }
+  else fallbackCopy(t, done);
+}
+function fallbackCopy(t, done){ const ta=document.createElement('textarea'); ta.value=t; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy');}catch(_){} ta.remove(); done(); }
 async function saveMeta(){ await api('/api/db/sessions/'+encodeURIComponent(state.selected)+'/meta', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(state.selectedMeta)}); }
 async function addTag(t){ if(!state.selectedMeta.tags.includes(t)){ state.selectedMeta.tags.push(t); await saveMeta(); renderHead(); } }
 async function removeTag(t){ state.selectedMeta.tags=state.selectedMeta.tags.filter(x=>x!==t); await saveMeta(); renderHead(); }
@@ -648,11 +771,11 @@ function bindFeed(feed){ $$('.event',feed).forEach(bindRow); }
 function bindRow(el){ el.addEventListener('click', ()=>{ const ev=state.feed.find(e=> (e.session_id+':'+e.line_index)===el.dataset.key); if(ev) openDrawer(ev); }); }
 
 // ---------- Conversation (from DB) ----------
-async function loadConversation(reset){
+async function loadConversation(reset, quiet){
   if(!state.selected){ $('#conversation').innerHTML='<div class="empty">Select a session to view its conversation.</div>'; return; }
-  if(reset){ state.conv={events:[],total:0,offset:0,loading:false}; $('#conversation').innerHTML='<div class="empty">Loading…</div>'; }
+  if(reset){ const wasBottom = quiet && isNearBottom(); state.conv={events:[],total:0,offset:0,loading:false,stick:wasBottom}; if(!quiet) $('#conversation').innerHTML='<div class="empty">Loading…</div>'; }
   if(state.conv.loading) return; state.conv.loading=true;
-  const params=new URLSearchParams({limit:'150', offset:String(state.conv.offset)});
+  const params=new URLSearchParams({limit:'300', offset:String(state.conv.offset)});
   const t=$('#convType').value; if(t!=='all') params.set('type', t);
   const q=$('#convSearch').value.trim(); if(q) params.set('search', q);
   try{
@@ -663,64 +786,53 @@ async function loadConversation(reset){
   }catch(e){ $('#conversation').innerHTML='<div class="empty">Could not load conversation.</div>'; }
   state.conv.loading=false;
 }
+function isNearBottom(){ const p=$('#panel-conversation'); return p.scrollHeight - p.scrollTop - p.clientHeight < 80; }
 function latencyMap(evs){
   const m={}; let lastUser=null;
   for(const e of evs){
     const t=Date.parse(e.timestamp||e.observed_at);
-    if(e.event_type==='user') lastUser=t;
-    else if(e.event_type==='assistant' && lastUser && !isNaN(t)) m[e.session_id+':'+e.line_index]=t-lastUser;
+    if(e.message && e.message.role==='user' && e.event_type==='user') lastUser=t;
+    else if(e.event_type==='assistant' && lastUser && !isNaN(t)){ m[e.session_id+':'+e.line_index]=t-lastUser; lastUser=null; }
   }
   return m;
 }
-function renderContent(content){
-  if(typeof content==='string') return `<pre>${escHtml(content)}</pre>`;
-  if(!Array.isArray(content)) return '';
+function renderBlocks(blocks){
   let html='';
-  for(const b of content){
+  for(const b of (blocks||[])){
     if(b.type==='text') html+=`<pre>${escHtml(b.text||'')}</pre>`;
-    else if(b.type==='thinking') html+=`<div class="think">${escHtml(b.thinking||'')}</div>`;
-    else if(b.type==='tool_use') html+=`<div class="toolcard"><div class="h">🔧 ${escHtml(b.name||'tool')}</div><pre>${escHtml(JSON.stringify(b.input||{},null,2))}</pre></div>`;
-    else if(b.type==='tool_result'){ let c=b.content; if(Array.isArray(c)) c=c.map(x=>x.text||JSON.stringify(x)).join('\n'); else if(typeof c!=='string') c=JSON.stringify(c,null,2); html+=`<div class="toolcard"><div class="h">📦 Tool result</div><pre>${escHtml(c||'')}</pre></div>`; }
+    else if(b.type==='thinking') html+=`<div class="think">💭 ${escHtml(b.thinking||'')}</div>`;
+    else if(b.type==='tool_use') html+=`<div class="toolcard"><div class="h">🔧 ${escHtml(b.name||'tool')}</div><pre>${escHtml(typeof b.input==='string'?b.input:JSON.stringify(b.input??{},null,2))}</pre></div>`;
+    else if(b.type==='tool_result'){ let c=b.content; if(Array.isArray(c)) c=c.map(x=>x.text||JSON.stringify(x)).join('\n'); else if(typeof c!=='string') c=JSON.stringify(c,null,2); html+=`<div class="toolcard"><div class="h" style="${b.is_error?'color:var(--red)':''}">${b.is_error?'⛔ Tool error':'📦 Tool result'}</div><pre>${escHtml(c||'')}</pre></div>`; }
+    else if(b.type==='image') html+=`<div class="hint">[image]</div>`;
   }
   return html;
 }
 function convMessage(ev, lat){
-  const e=ev.entry||{};
-  let content = e.message?.content ?? e.content ?? '';
-  let body=renderContent(content);
-  // Non-Claude shapes: derive a body from the record itself.
-  if(!body){
-    // Codex response_item message: payload.content [{type:*_text, text}]
-    if(e.payload?.type==='message' && Array.isArray(e.payload.content)){
-      body=renderContent(e.payload.content.map(b=>({type:'text',text:b.text||''})));
-    }
-    // Codex function_call → tool card
-    else if(e.payload?.type==='function_call'){
-      body=`<div class="toolcard"><div class="h">🔧 ${escHtml(e.payload.name||'tool')}</div><pre>${escHtml(e.payload.arguments||'')}</pre></div>`;
-    }
-    // Codex function_call_output → tool result card
-    else if(e.payload?.type==='function_call_output'){
-      body=`<div class="toolcard"><div class="h">📦 Tool result</div><pre>${escHtml(typeof e.payload.output==='string'?e.payload.output:JSON.stringify(e.payload.output,null,2))}</pre></div>`;
-    }
-    // Cline ui_messages: say/ask with text
-    else if((e.say||e.ask) && e.text){
-      body=`<pre>${escHtml(e.text)}</pre>`;
-    }
-    // Cline api history plain text content
-    else if(typeof e.content==='string'){
-      body=`<pre>${escHtml(e.content)}</pre>`;
-    }
+  const m=ev.message;
+  if(!m){
+    if(!$('#convSystem').checked) return '';
+    return `<details class="sysmsg"><summary>${srcBadge(ev.source)} ${escHtml(ev.summary||ev.event_type)} <span style="color:var(--dim)">${timeOf(ev)}</span></summary><pre>${escHtml(JSON.stringify(ev.entry,null,2))}</pre></details>`;
   }
+  if(m.role==='system'){
+    if(!$('#convSystem').checked) return '';
+    const t=(m.content||[]).map(b=>b.text||b.thinking||'').join('\n');
+    return `<details class="sysmsg"><summary>⚙️ Context / instructions · ${escHtml((t.split('\n')[0]||'').slice(0,120))}</summary><pre>${escHtml(t)}</pre></details>`;
+  }
+  const body=renderBlocks(m.content);
   if(!body) return '';
-  const role=ev.event_type;
-  const roleColor = role==='user'?'var(--accent)':role==='assistant'?'var(--green)':'var(--muted)';
+  const onlyResults=(m.content||[]).every(b=>b.type==='tool_result');
+  const role = onlyResults ? 'tool' : m.role;
+  const roleColor = role==='user'?'var(--accent)':role==='assistant'?'var(--green)':'var(--amber)';
   const latTxt = lat ? `<span class="lat">⚡ ${(lat/1000).toFixed(1)}s</span>` : '';
+  const model = (role==='assistant' && ev.model) ? `<span style="color:var(--dim);font-weight:400">${escHtml(ev.model)}</span>` : '';
   return `<div class="msg ${role}">
-    <div class="who"><span class="role" style="background:var(--surface-3);color:${roleColor}">${escHtml(role)}</span>${srcBadge(ev.source)}
+    <div class="who"><span class="role" style="background:var(--surface-3);color:${roleColor}">${escHtml(role)}</span>${srcBadge(ev.source)}${model}
       <span style="color:var(--dim);font-weight:400">${timeOf(ev)}</span>${latTxt}</div>
     <div class="bubble">${body}</div>
   </div>`;
 }
+let convRefreshTimer;
+function scheduleConvRefresh(){ clearTimeout(convRefreshTimer); convRefreshTimer=setTimeout(()=>{ if(state.tab==='conversation' && state.conv.offset>=state.conv.total) loadConversation(true, true); }, 900); }
 function renderConversation(){
   const wrap=$('#conversation');
   const lats=latencyMap(state.conv.events);
@@ -730,6 +842,7 @@ function renderConversation(){
   wrap.innerHTML=html;
   $('#convCount').textContent = state.conv.total ? state.conv.total+' events' : '';
   const lm=$('#loadMore'); if(lm) lm.addEventListener('click', ()=> loadConversation(false));
+  if(state.conv.stick){ const p=$('#panel-conversation'); p.scrollTop=p.scrollHeight; }
 }
 
 // ---------- Analytics (from DB) ----------
@@ -775,6 +888,87 @@ function renderAnalytics(d){
     </div>`;
 }
 
+// ---------- Agents ----------
+async function loadAgents(){
+  try{
+    const d=await api('/api/agents');
+    for(const a of d.agents) state.agents[a.id]=a;
+    renderAgents(d);
+  }catch(e){ $('#agentsPanel').innerHTML='<div class="empty">Could not load agents.</div>'; }
+}
+function renderAgents(d){
+  const agents=d.agents||[];
+  const found=agents.filter(a=>a.detected).length;
+  $('#agentsBadge').textContent = found ? String(found) : '';
+  const order=a=> a.watched&&a.sessions>0?0 : a.watched?1 : a.detected?2 : 3;
+  const sorted=[...agents].sort((a,b)=> order(a)-order(b) || (b.sessions-a.sessions));
+  const card=a=>{
+    const st = a.watched ? ['watching','Watching'] : a.detected ? ['found','Found'] : ['missing','Not found'];
+    const dirs=(a.dirs||[]).map(x=>`<div><span class="${x.exists?'ok':'no'}">${x.exists?'●':'○'}</span><span class="mono">${escHtml(x.display||x.path)}</span></div>`).join('')
+      || '<div><span class="no">○</span><span>No fixed location — add its folder with <span class="mono">--watch-root</span>.</span></div>';
+    return `<div class="agent ${a.detected?'':'off'}">
+      <div class="top"><span class="dot" style="background:${escHtml(a.color)}"></span><span class="name">${escHtml(a.name)}</span><span class="state ${st[0]}">${st[1]}</span></div>
+      <div class="fmt">${escHtml(a.format)}${a.homepage?` · <a href="${escHtml(a.homepage)}" target="_blank" rel="noopener">site</a>`:''}</div>
+      <div class="nums"><span><b>${fmtNum(a.sessions)}</b> sessions</span><span><b>${fmtNum(a.events)}</b> events</span><span><b>${fmtCost(a.cost_usd)}</b></span></div>
+      <div class="dirs">${dirs}</div>
+    </div>`;
+  };
+  $('#agentsPanel').innerHTML=`
+    <div class="agents-summary"><span><b>${found}</b> of ${agents.length} supported agents found on this machine.</span>
+      <span class="hint">New agent folders are picked up automatically${desktop?'':' when the dashboard runs with default roots'}.</span></div>
+    <div class="agents">${sorted.map(card).join('')}</div>
+    <p class="hint" style="margin-top:14px">Watching: ${(d.watch_roots||[]).map(r=>`<span class="mono">${escHtml(r)}</span>`).join(', ')||'nothing yet'}</p>`;
+}
+
+// ---------- Settings (desktop app) ----------
+let settingsDraft=null;
+async function openSettings(){
+  if(!desktop) return;
+  try{
+    const [info, st, auto] = await Promise.all([desktop.invoke('desktop_info'), desktop.invoke('get_settings'), desktop.invoke('get_autostart')]);
+    settingsDraft=st;
+    $('#setMode').textContent = info.mode==='attached' ? `attached to server on port ${info.port}` : `embedded tracer · port ${info.port}`;
+    const row=(label,desc,control)=>`<div class="set-row"><div><div>${label}</div>${desc?`<div class="d">${desc}</div>`:''}</div><div>${control}</div></div>`;
+    const chk=(id,v)=>`<input type="checkbox" id="${id}" ${v?'checked':''}>`;
+    $('#settingsBody').innerHTML=`
+      <span class="lbl">Notifications</span>
+      ${row('Agent finished its turn','Notify when an agent is done and waiting on you.',chk('s_turn',st.notify_turn_end))}
+      ${row('New session started','',chk('s_new',st.notify_new_session))}
+      ${row('Only when the window is in the background','',chk('s_away',st.notify_only_when_away))}
+      ${row('Idle threshold (seconds)','For agents that do not mark the end of a turn.',`<input type="number" min="10" max="3600" id="s_idle" value="${st.idle_seconds}">`)}
+      ${row('Daily budget (USD)','Alert once when today\'s estimated spend crosses it. Empty = off.',`<input type="number" min="0" step="0.5" id="s_budget" value="${st.daily_budget_usd??''}">`)}
+      <span class="lbl" style="margin-top:14px">Window</span>
+      ${row('Close to tray','Keep tracing in the background when the window is closed.',chk('s_tray',st.close_to_tray))}
+      ${row('Start hidden','Launch into the tray.',chk('s_hidden',st.start_hidden))}
+      ${row('Launch at login','',chk('s_auto',auto))}
+      <span class="lbl" style="margin-top:14px">Tracing <span class="hint">(applies after restart)</span></span>
+      ${row('Dashboard port','',`<input type="number" min="1" max="65535" id="s_port" value="${st.port}">`)}
+      ${row('Only these agents','Comma-separated ids, e.g. claude-code,codex. Empty = all found.',`<input type="text" id="s_only" value="${escHtml((st.only||[]).join(','))}">`)}
+      ${row('Extra folders','Comma-separated; append =agent-id to force one.',`<input type="text" id="s_roots" value="${escHtml((st.extra_roots||[]).join(','))}">`)}
+      <p class="hint">Database: <span class="mono">${escHtml(info.db_path||'')}</span></p>`;
+    $('#scrim').classList.add('open'); $('#settingsModal').classList.add('open');
+  }catch(e){ toast('Settings unavailable: '+e); }
+}
+function closeSettings(){ $('#settingsModal').classList.remove('open'); $('#scrim').classList.remove('open'); }
+async function saveSettings(){
+  const v=id=>$('#'+id);
+  const list=s=>s.split(',').map(x=>x.trim()).filter(Boolean);
+  const next=Object.assign({}, settingsDraft, {
+    notify_turn_end:v('s_turn').checked, notify_new_session:v('s_new').checked,
+    notify_only_when_away:v('s_away').checked, idle_seconds:Math.max(10, parseInt(v('s_idle').value)||45),
+    daily_budget_usd: v('s_budget').value==='' ? null : parseFloat(v('s_budget').value),
+    close_to_tray:v('s_tray').checked, start_hidden:v('s_hidden').checked,
+    port:parseInt(v('s_port').value)||7779, only:list(v('s_only').value), extra_roots:list(v('s_roots').value),
+  });
+  try{
+    await desktop.invoke('set_autostart', {enabled: v('s_auto').checked});
+    const r=await desktop.invoke('save_settings', {settings: next});
+    closeSettings();
+    if(r && r.restart_required){ if(confirm('Some changes apply after a restart. Restart Agent Trace now?')) desktop.invoke('restart_app'); }
+    else toast('Settings saved');
+  }catch(e){ toast('Could not save: '+e); }
+}
+
 // ---------- Tabs ----------
 function setTab(tab){
   state.tab=tab;
@@ -782,8 +976,10 @@ function setTab(tab){
   $('#panel-live').style.display = tab==='live'?'block':'none';
   $('#panel-conversation').style.display = tab==='conversation'?'block':'none';
   $('#panel-analytics').style.display = tab==='analytics'?'block':'none';
+  $('#panel-agents').style.display = tab==='agents'?'block':'none';
   if(tab==='conversation') loadConversation(true);
   if(tab==='analytics') loadAnalytics();
+  if(tab==='agents') loadAgents();
   if(tab==='live') renderFeed();
 }
 
@@ -793,6 +989,7 @@ function openDrawer(ev){
   drawerEvent=ev;
   $('#drawerTitle').textContent = (ev.event_type||'event')+' · line '+ev.line_index;
   $('#drawerBody').textContent = JSON.stringify(ev.entry??ev, null, 2);
+  $('#drawerTitle').textContent += ' · ' + srcLabel(ev.source);
   $('#scrim').classList.add('open'); $('#drawer').classList.add('open');
 }
 function closeDrawer(){ $('#scrim').classList.remove('open'); $('#drawer').classList.remove('open'); }
@@ -808,17 +1005,27 @@ function openExport(scope){
   $('#scrim').classList.add('open'); $('#exportModal').classList.add('open');
 }
 function updateExportHint(){
-  const sess = exportScope==='session' ? (state.sessions.find(s=>s.id===state.selected)?.title||shortId(state.selected)) : null;
+  const found = state.sessions.find(s=>s.id===state.selected);
+  const sess = exportScope==='session' ? (found?sessionName(found):shortId(state.selected)) : null;
   $('#exportHint').textContent = exportScope==='session'
     ? `Exporting session “${sess}” as ${exportFmt}.`
-    : `Exporting all sessions as ${exportFmt}.` + (exportFmt==='huggingface'?' (downloads a dataset card + JSONL)':'');
+    : `Exporting all sessions as ${exportFmt}.` + (exportFmt==='huggingface'?(desktop?' (writes train.jsonl, dataset_info.json and a README card into a folder)':' (downloads the train.jsonl; use the CLI or desktop app for the full dataset folder)'):'');
 }
-function doExport(){
-  let url;
-  if(exportScope==='session' && state.selected) url='/api/sessions/'+encodeURIComponent(state.selected)+'/export?format='+exportFmt;
-  else url='/api/export?format='+exportFmt;
-  window.location.href=url;
-  closeExport(); toast('Export started');
+async function doExport(){
+  let url, base;
+  if(exportScope==='session' && state.selected){ url='/api/sessions/'+encodeURIComponent(state.selected)+'/export?format='+exportFmt; base=state.selected.replace(/[^\w.-]+/g,'-'); }
+  else { url='/api/export?format='+exportFmt; base='agent-trace-'+new Date().toISOString().slice(0,10); }
+  closeExport();
+  if(!desktop){ window.location.href=url; toast('Export started'); return; }
+  // Desktop: fetch here, then save through a native dialog.
+  try{
+    toast('Preparing export…');
+    const r=await fetch(url); if(!r.ok) throw new Error(r.status+' '+(await r.text()));
+    const content=await r.text();
+    const ext = exportFmt==='markdown' ? 'md' : 'jsonl';
+    const saved=await desktop.invoke('save_export', {format:exportFmt, filename: exportFmt==='huggingface'? base : base+'.'+ext, content});
+    if(saved) toast('Saved to '+saved);
+  }catch(e){ toast('Export failed: '+e); }
 }
 function closeExport(){ $('#exportModal').classList.remove('open'); if(!$('#drawer').classList.contains('open')) $('#scrim').classList.remove('open'); }
 
@@ -869,8 +1076,8 @@ function init(){
 
   // drawer
   $('#drawerClose').addEventListener('click', closeDrawer);
-  $('#scrim').addEventListener('click', ()=>{ closeDrawer(); closeExport(); $('#helpModal').classList.remove('open'); });
-  $('#copyJson').addEventListener('click', ()=>{ navigator.clipboard?.writeText($('#drawerBody').textContent); toast('Copied JSON'); });
+  $('#scrim').addEventListener('click', ()=>{ closeDrawer(); closeExport(); closeSettings(); $('#helpModal').classList.remove('open'); });
+  $('#copyJson').addEventListener('click', ()=> copyText($('#drawerBody').textContent, 'Copied JSON'));
 
   // export
   $('#exportBtn').addEventListener('click', ()=> openExport('all'));
@@ -878,6 +1085,19 @@ function init(){
   $('#exportGo').addEventListener('click', doExport);
   $$('#exportScope button').forEach(b=> b.addEventListener('click', ()=>{ exportScope=b.dataset.scope; openExport(); }));
   $$('#exportFmt button').forEach(b=> b.addEventListener('click', ()=>{ exportFmt=b.dataset.fmt; $$('#exportFmt button').forEach(x=>x.classList.toggle('sel',x===b)); updateExportHint(); }));
+
+  // conversation: context toggle
+  $('#convSystem').addEventListener('change', renderConversation);
+
+  // settings (desktop)
+  if(desktop){
+    document.body.classList.add('desktop');
+    $('#settingsBtn').addEventListener('click', openSettings);
+    $('#setCancel').addEventListener('click', closeSettings);
+    $('#setSave').addEventListener('click', saveSettings);
+    $('#setTestNotify').addEventListener('click', ()=> desktop.invoke('test_notification').catch(e=>toast(String(e))));
+    $('#setOpenData').addEventListener('click', ()=> desktop.invoke('open_data_dir').catch(e=>toast(String(e))));
+  }
 
   // global search
   $('#globalSearch').addEventListener('input', (e)=>{ clearTimeout(searchTimer); searchTimer=setTimeout(()=>runSearch(e.target.value),250); });
@@ -887,6 +1107,7 @@ function init(){
   document.addEventListener('keydown', onKey);
 
   connect();
+  loadAgents();
   loadSources();
   loadSessions();
   setInterval(loadSessions, 5000);
@@ -900,11 +1121,12 @@ function onKey(e){
   else if(e.key==='1') setTab('live');
   else if(e.key==='2') setTab('conversation');
   else if(e.key==='3') setTab('analytics');
+  else if(e.key==='4') setTab('agents');
   else if(e.key==='e') openExport(state.selected?'session':'all');
   else if(e.key==='t') toggleTheme();
   else if(e.key===' '){ e.preventDefault(); togglePause(); }
   else if((e.key==='b')&&(e.ctrlKey||e.metaKey)){ e.preventDefault(); $('#body').classList.toggle('collapsed'); }
-  else if(e.key==='Escape'){ closeDrawer(); closeExport(); $('#helpModal').classList.remove('open'); $('#searchPop').classList.remove('open'); }
+  else if(e.key==='Escape'){ closeDrawer(); closeExport(); closeSettings(); $('#helpModal').classList.remove('open'); $('#searchPop').classList.remove('open'); }
 }
 init();
 </script>

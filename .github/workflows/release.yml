@@ -48,7 +48,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             # Read version directly from Cargo.toml
             VERSION="$(cargo metadata --no-deps --format-version 1 \
-              | python3 -c 'import sys,json;print(json.load(sys.stdin)["packages"][0]["version"])')"
+              | python3 -c 'import sys,json;print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="claude-trace-rs"))')"
             TAG="v${VERSION}"
           else
             # Triggered by tag push — use the pushed tag
@@ -120,7 +120,7 @@ jobs:
         run: |
           VERSION="${{ needs.resolve-tag.outputs.version }}"
           CRATE="$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c 'import sys,json;print(json.load(sys.stdin)["packages"][0]["version"])')"
+            | python3 -c 'import sys,json;print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="claude-trace-rs"))')"
           if [ "$VERSION" != "$CRATE" ]; then
             echo "::error::Tag version $VERSION does not match Cargo.toml version $CRATE"
             exit 1
@@ -174,11 +174,82 @@ jobs:
             dist/*.sha256
             dist/*.deb
 
+  desktop:
+    name: Desktop app ${{ matrix.target }}
+    needs: resolve-tag
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 keeps the .deb/AppImage compatible with older glibc.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install webview and tray libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libssl-dev patchelf libfuse2
+
+      - name: Build bundles
+        working-directory: desktop
+        shell: bash
+        run: npx --yes @tauri-apps/cli@2 build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: Collect bundles
+        shell: bash
+        run: |
+          VERSION="${{ needs.resolve-tag.outputs.version }}"
+          BUNDLE="target/${{ matrix.target }}/release/bundle"
+          mkdir -p dist
+          find "$BUNDLE" -maxdepth 2 -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \
+            -o -name '*.dmg' -o -name '*.msi' -o -name '*-setup.exe' \) -exec cp {} dist/ \;
+          # The .app is a directory; ship it zipped alongside the .dmg.
+          if [ -d "$BUNDLE/macos/Agent Trace.app" ]; then
+            (cd "$BUNDLE/macos" && zip -qry "$OLDPWD/dist/Agent-Trace_${VERSION}_${{ matrix.target }}.app.zip" "Agent Trace.app")
+          fi
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: dist/*
+
   release:
     name: Publish release
     needs:
       - resolve-tag
       - build
+      - desktop
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -187,7 +258,10 @@ jobs:
       - name: Flatten
         run: |
           mkdir -p release
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' -o -name '*.deb' \) -exec cp {} release/ \;
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' -o -name '*.deb' \
+            -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) -exec cp {} release/ \;
+          (cd release && for f in *.deb *.rpm *.AppImage *.dmg *.msi *.exe *.app.zip; do
+            [ -f "$f" ] && sha256sum "$f" > "$f.sha256"; done; true)
           ls -la release
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

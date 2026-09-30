@@ -1,34 +1,42 @@
 # Roadmap & improvement ideas
 
-This release added three big things: a **built-in SQLite trace database**, a
-**redesigned dashboard**, and **cross-platform installers**. Below is a
-prioritised list of where `claude-trace-rs` can go next. Nothing here is
-committed — it's a menu of ideas, roughly grouped by theme.
+This release made the tracer agent-neutral across seventeen coding agents and
+added the **Agent Trace desktop app**. Below is a prioritised list of where
+`claude-trace-rs` can go next. Nothing here is committed — it's a menu of
+ideas, roughly grouped by theme.
 
 ## Just shipped ✅
-- Persistent, embedded SQLite store for every event (survives restarts).
-- Full-history retrieval, pagination, and search backed by the database.
-- Cross-session analytics computed in SQL (cost-by-model, top tools, timeline).
-- Server-side bookmarks / tags / notes (no longer trapped in `localStorage`).
-- Clean, decluttered UI: global search, project-grouped navigator, 3 focused tabs.
-- One-line installers for macOS/Linux/Windows, `.deb`, and a tagged-release CI.
-- **Harmonised multi-agent tracing** — Claude Code, Codex CLI, Copilot CLI,
-  Kimi Code, Cline, and Cursor Agent adapters feeding one dashboard/database/
-  exporter, with per-agent badges, filters, and cost analytics.
+- **Seventeen agents** from verified on-disk formats: Claude Code, Codex,
+  Gemini CLI, Qwen Code, Copilot CLI, Cursor, Cline, Roo Code, Kilo Code,
+  OpenCode, Crush, Goose, Aider, Continue, Kimi Code, Amp and Factory Droid,
+  with real captured logs as test fixtures.
+- **Canonical message model** so transcripts, costs and every export format
+  are the same shape whichever agent produced them.
+- **Ingestion engine** that tails JSONL, re-parses documents rewritten in
+  place, re-queries SQLite stores, upserts changed records, and resumes from
+  saved checkpoints after a restart (including files written while stopped).
+- **Agent Trace desktop app** (Tauri 2): native window, tray, notifications
+  when an agent finishes, daily budget alert, launch at login, native export
+  dialogs, attach-to-service mode, and installers built by the release workflow.
+- **Pricing table with user overrides** (`pricing.json`), current Claude, GPT,
+  Gemini and open-model prices.
+- **Agents tab / `agents` command** showing where each agent's logs live and
+  what was found; new agents are picked up while running.
+- Earlier: persistent SQLite store, full-history search, SQL analytics,
+  server-side bookmarks/tags/notes, cross-platform installers.
 
 ## Near-term, high-impact
 1. **SQLite FTS5 full-text search.** Swap the `LIKE` search for an FTS5 virtual
    table for ranked, much faster search over large histories (with snippets and
    highlight). Bundled SQLite already supports it.
-2. **Native desktop app (Tauri).** Wrap the existing UI in a real application
-   window with an icon, system tray, and "launch at login," so it stops being
-   "a server you open in a browser." Keeps the same Rust backend.
+2. **Code-signed desktop builds** (Apple notarisation, Windows Authenticode)
+   and an in-app updater, so installs need no security prompts.
 3. **MSI / `.pkg` / Homebrew tap / winget** packaging via `cargo-dist` for
    true double-click installers and `brew install` / `winget install`.
 4. **Date-range & advanced filters** in the sidebar and analytics (today / 7d /
    30d / custom), plus filter-by-model and filter-by-tool.
-5. **Cost budgets & alerts.** Set a daily/weekly spend or token budget and get a
-   visual warning (and optional desktop notification) when a project crosses it.
+5. **Per-project budgets.** The desktop app alerts on a daily total; extend it
+   to weekly and per-project limits, shown in the dashboard as well.
 
 ## Data & retention
 6. **Retention / compaction policy.** Configurable pruning (e.g. keep raw events
@@ -37,8 +45,8 @@ committed — it's a menu of ideas, roughly grouped by theme.
    from the JSONL files once, with a progress bar.
 8. **Diff / replay.** Step through a session like a debugger; diff two sessions
    or two runs of the same prompt.
-9. **Authoritative pricing.** Ship a versioned pricing table (and let users
-   override it) so cost is accurate as model prices change.
+9. **Fetched pricing.** Optionally refresh the price table from a published
+   source instead of waiting for a release (overrides already work).
 
 ## Insight & analysis
 10. **Per-session summaries** generated from the transcript (first user prompt,
@@ -61,6 +69,9 @@ committed — it's a menu of ideas, roughly grouped by theme.
     stay smooth.
 18. **Accessibility pass** (keyboard nav for all controls, ARIA roles, reduced-
     motion support).
-19. **Settings panel** in the UI (theme, default tab, feed cap, polling cadence)
-    persisted to the database.
-20. **End-to-end UI tests** with a headless browser in CI.
+19. **Browser settings panel.** The desktop app has one; give the browser
+    dashboard the same (theme, default tab, feed cap) persisted to the database.
+20. **End-to-end UI tests** with a headless browser in CI (currently run by hand
+    with Playwright and, for the desktop app, under Xvfb).
+21. **More agents** as they appear: e.g. Windsurf/Cascade and JetBrains Junie
+    once their local history formats are stable and documented.

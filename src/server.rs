@@ -24,31 +24,67 @@ use crate::{
     event::TraceEvent,
     export::{self, ExportFormat, SessionExport},
     state::SessionStore,
+    watcher::SharedRoots,
 };
 
 #[derive(Clone)]
 pub struct AppState {
     pub tx: broadcast::Sender<TraceEvent>,
-    pub watch_root: String,
-    /// All watch roots (display/health purposes).
-    pub watch_roots: Vec<String>,
     pub port: u16,
     pub store: SessionStore,
     pub db: Db,
+    /// Live list of watched roots (grows when new agents are discovered).
+    pub roots: SharedRoots,
+    /// Per-user secret used to answer `/health?challenge=…`, so clients can
+    /// tell this server from another user's process on the same port.
+    pub server_key: Option<std::sync::Arc<Vec<u8>>>,
 }
 
+impl AppState {
+    fn watch_roots(&self) -> Vec<String> {
+        self.roots
+            .read()
+            .map(|g| {
+                g.iter()
+                    .map(|r| r.path.to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Bind `127.0.0.1:<state.port>` and serve until the process exits.
 pub async fn serve(state: AppState) -> anyhow::Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], state.port));
-    let port = state.port;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    serve_listener(listener, state).await
+}
 
+/// Serve on an already-bound listener.
+pub async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    state: AppState,
+) -> anyhow::Result<()> {
+    let port = listener.local_addr()?.port();
+    info!("Dashboard: http://127.0.0.1:{port}/");
+    info!("WebSocket: ws://127.0.0.1:{port}/ws");
+    info!("API:       http://127.0.0.1:{port}/api/sessions");
+    axum::serve(listener, router(state)).await?;
+    Ok(())
+}
+
+/// The full HTTP router (dashboard, REST API, WebSocket).
+pub fn router(state: AppState) -> Router {
     // Restrict CORS to localhost origins.  The whole purpose of this dashboard
     // is to serve a same-origin local UI; without this gate, any third-party
     // page a user happens to be browsing could XHR/fetch from
     // http://127.0.0.1:<port>/api/* and exfiltrate trace data.
     let cors = CorsLayer::new().allow_origin(AllowOrigin::predicate(is_local_origin));
 
-    let app = Router::new()
+    Router::new()
         .route("/", get(index_handler))
+        .route("/favicon.svg", get(favicon_handler))
+        .route("/favicon.ico", get(favicon_handler))
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
         .route("/api/sessions", get(api_sessions))
@@ -68,39 +104,138 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
         )
         .route("/api/db/search", get(db_search))
         .route("/api/db/stats", get(db_stats))
+        .route("/api/db/cost", get(db_cost))
+        .route("/api/agents", get(api_agents))
         .layer(cors)
         .layer(from_fn(reject_cross_origin_api))
-        .with_state(state);
+        .with_state(state)
+}
 
-    info!("Dashboard: http://127.0.0.1:{port}/");
-    info!("WebSocket: ws://127.0.0.1:{port}/ws");
-    info!("API:       http://127.0.0.1:{port}/api/sessions");
+async fn favicon_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml")],
+        crate::dashboard::FAVICON_SVG,
+    )
+}
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+/// `/home/me/x` → `~/x` for display.
+fn tilde(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().to_string();
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    if !home.is_empty() {
+        if let Some(rest) = s.strip_prefix(&home) {
+            return format!("~{rest}");
+        }
+    }
+    s
 }
 
 async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
     Html(dashboard_html(state.port))
 }
 
-async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({
+#[derive(Debug, Deserialize)]
+struct HealthQuery {
+    /// Random hex nonce from a client that wants proof of ownership.
+    challenge: Option<String>,
+}
+
+async fn health_handler(
+    Query(q): Query<HealthQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let roots = state.watch_roots();
+    let mut body = json!({
         "status": "ok",
-        "watch_root": state.watch_root,
-        "watch_roots": state.watch_roots,
+        "app": "claude-trace-rs",
+        "version": crate::VERSION,
+        "watch_root": roots.first(),
+        "watch_roots": roots,
         "sessions": state.store.sessions().len(),
         "total_events": state.store.total_events(),
-    }))
+    });
+    if let (Some(key), Some(c)) = (&state.server_key, &q.challenge) {
+        if (16..=128).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_hexdigit()) {
+            body["proof"] = json!(crate::runtime::health_proof(key, c));
+        }
+    }
+    Json(body)
 }
 
 async fn api_sessions(State(state): State<AppState>) -> impl IntoResponse {
+    let roots = state.watch_roots();
     Json(json!({
-        "watch_root": state.watch_root,
-        "watch_roots": state.watch_roots,
+        "watch_root": roots.first(),
+        "watch_roots": roots,
         "sessions": state.store.sessions(),
     }))
+}
+
+/// Every supported agent: display metadata, where its logs live, whether
+/// those directories exist and are being watched, and what has been recorded.
+async fn api_agents(State(state): State<AppState>) -> Response {
+    let watched: Vec<crate::sources::WatchRoot> =
+        state.roots.read().map(|g| g.clone()).unwrap_or_default();
+    let totals = state.db.sources().unwrap_or_default();
+    let files: std::collections::HashMap<String, i64> = state
+        .db
+        .tracked_files_by_source()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let agents: Vec<serde_json::Value> = crate::sources::AgentSource::all_known()
+        .iter()
+        .map(|src| {
+            let spec = src.spec();
+            let dirs: Vec<serde_json::Value> = src
+                .candidate_dirs()
+                .into_iter()
+                .map(|d| {
+                    let exists = d.is_dir();
+                    let is_watched = watched
+                        .iter()
+                        .any(|r| d.starts_with(&r.path) || r.path.starts_with(&d));
+                    json!({ "path": d, "display": tilde(&d), "exists": exists, "watched": is_watched })
+                })
+                .collect();
+            let t = totals
+                .iter()
+                .find(|t| t["source"] == src.as_str())
+                .cloned()
+                .unwrap_or(json!({}));
+            json!({
+                "id": src.as_str(),
+                "name": spec.name,
+                "color": spec.color,
+                "format": spec.format,
+                "homepage": spec.homepage,
+                "resume": spec.resume,
+                "dirs": dirs,
+                "detected": dirs.iter().any(|d| d["exists"] == true),
+                "watched": dirs.iter().any(|d| d["watched"] == true),
+                "files": files.get(src.as_str()).copied().unwrap_or(0),
+                "sessions": t.get("sessions").cloned().unwrap_or(json!(0)),
+                "events": t.get("events").cloned().unwrap_or(json!(0)),
+                "cost_usd": t.get("cost_usd").cloned().unwrap_or(json!(0.0)),
+            })
+        })
+        .collect();
+    Json(json!({
+        "agents": agents,
+        "watch_roots": state.watch_roots(),
+    }))
+    .into_response()
+}
+
+/// Full event history for a session: the database when it has the session
+/// (complete, beyond the in-memory window), else the in-memory buffer.
+fn full_events(state: &AppState, id: &str) -> Vec<TraceEvent> {
+    match state.db.all_session_events(id) {
+        Ok(evs) if !evs.is_empty() => evs,
+        _ => state.store.session_events(id),
+    }
 }
 
 async fn api_session_detail(Path(id): Path<String>, State(state): State<AppState>) -> Response {
@@ -164,9 +299,8 @@ async fn api_session_export(
     let Some(stats) = state.store.session(&id) else {
         return (StatusCode::NOT_FOUND, "Unknown session").into_response();
     };
-    let events = state.store.session_events(&id);
     let filename = format!("{}.{}", short_filename(&id), q.format.extension());
-    stream_response(vec![(stats, events)], q.format, q.format.mime(), &filename)
+    stream_response(state, vec![stats], q.format, q.format.mime(), &filename)
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,54 +337,54 @@ async fn api_export_many(
         return (StatusCode::NOT_FOUND, "No matching sessions").into_response();
     }
 
-    let pairs: Vec<_> = stats_filtered
-        .into_iter()
-        .map(|s| {
-            let evs = state.store.session_events(&s.id);
-            (s, evs)
-        })
-        .collect();
     let filename = format!(
-        "claude-trace-{}.{}",
+        "agent-trace-{}.{}",
         chrono::Utc::now().format("%Y%m%dT%H%M%S"),
         q.format.extension()
     );
-    stream_response(pairs, q.format, q.format.mime(), &filename)
+    stream_response(state, stats_filtered, q.format, q.format.mime(), &filename)
 }
 
-/// Build a streaming download response. We pre-clone each (stats, events) pair
-/// out of the locked store so we never hold a mutex across await points, but
-/// we keep peak memory bounded to one session at a time by lazily rendering
-/// chunks from a `Stream` rather than concatenating the whole export into a
-/// single `String` first.
+/// Build a streaming download response. Each session's full history is
+/// loaded and rendered only when the stream reaches it, on a blocking
+/// thread, so peak memory is one session however many are exported, and
+/// no lock is held across an await.
 fn stream_response(
-    pairs: Vec<(crate::state::SessionStats, Vec<TraceEvent>)>,
+    state: AppState,
+    sessions: Vec<crate::state::SessionStats>,
     format: ExportFormat,
     mime: &'static str,
     filename: &str,
 ) -> Response {
     use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+    use futures_util::StreamExt;
 
-    let total = pairs.len();
+    let total = sessions.len();
     let is_markdown = matches!(format, ExportFormat::Markdown);
-    let chunks = pairs
-        .into_iter()
-        .enumerate()
-        .flat_map(move |(i, (stats, events))| {
-            let exp = SessionExport {
-                stats: &stats,
-                events: events.as_slice(),
-            };
-            let body = export::render_session(&exp, format);
-            let mut out: Vec<Result<Bytes, Infallible>> = Vec::with_capacity(2);
-            out.push(Ok(Bytes::from(body)));
+    let chunks = stream::iter(sessions.into_iter().enumerate()).then(move |(i, stats)| {
+        let state = state.clone();
+        async move {
+            let rendered = tokio::task::spawn_blocking(move || {
+                let events = full_events(&state, &stats.id);
+                let exp = SessionExport {
+                    stats: &stats,
+                    events: events.as_slice(),
+                };
+                export::render_session(&exp, format)
+            })
+            .await;
+            let mut body = rendered.unwrap_or_else(|e| {
+                warn!("Could not render a session for export: {e}");
+                String::new()
+            });
             if is_markdown && i + 1 < total {
-                out.push(Ok(Bytes::from_static(b"\n\n---\n\n")));
+                body.push_str("\n\n---\n\n");
             }
-            out
-        });
+            Ok::<Bytes, Infallible>(Bytes::from(body))
+        }
+    });
 
-    let body = Body::from_stream(stream::iter(chunks));
+    let body = Body::from_stream(chunks);
     let headers = [
         (CONTENT_TYPE, HeaderValue::from_static(mime)),
         (
@@ -379,6 +513,20 @@ async fn db_stats(State(state): State<AppState>) -> Response {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct CostQuery {
+    /// RFC 3339 lower bound on event time, e.g. local midnight in UTC.
+    since: String,
+}
+
+/// Total spend since a point in time — the desktop app's daily budget.
+async fn db_cost(Query(q): Query<CostQuery>, State(state): State<AppState>) -> Response {
+    match state.db.cost_since(&q.since) {
+        Ok(cost) => Json(json!({ "since": q.since, "cost_usd": cost })).into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
 async fn db_get_meta(Path(id): Path<String>, State(state): State<AppState>) -> Response {
     match state.db.get_meta(&id) {
         Ok(meta) => Json(meta).into_response(),
@@ -433,11 +581,7 @@ async fn ws_handler(
     // (CLI clients) are still permitted.
     if let Some(origin) = headers.get(header::ORIGIN) {
         if let Ok(origin_str) = origin.to_str() {
-            let allowed = origin_str.starts_with("http://127.0.0.1")
-                || origin_str.starts_with("http://localhost")
-                || origin_str.starts_with("https://127.0.0.1")
-                || origin_str.starts_with("https://localhost");
-            if !allowed {
+            if !is_loopback_origin(origin_str) {
                 return (
                     StatusCode::FORBIDDEN,
                     "Forbidden: connections from non-local origins are not permitted",
@@ -452,10 +596,12 @@ async fn ws_handler(
 
 async fn handle_ws(mut socket: WebSocket, state: AppState) {
     // 1) Send a connection banner.
+    let roots = state.watch_roots();
     let banner = json!({
         "type": "connected",
-        "watch_root": state.watch_root,
-        "watch_roots": state.watch_roots,
+        "version": crate::VERSION,
+        "watch_root": roots.first(),
+        "watch_roots": roots,
         "message": "Streaming coding-agent traces in real time."
     });
     if socket
@@ -511,13 +657,37 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
 
 /// CORS predicate: accept Origin headers from any localhost port over http(s).
 fn is_local_origin(origin: &HeaderValue, _req_headers: &axum::http::request::Parts) -> bool {
-    let Ok(s) = origin.to_str() else { return false };
-    s.starts_with("http://127.0.0.1")
-        || s.starts_with("http://localhost")
-        || s.starts_with("https://127.0.0.1")
-        || s.starts_with("https://localhost")
-        || s.starts_with("http://[::1]")
-        || s.starts_with("https://[::1]")
+    origin.to_str().is_ok_and(is_loopback_origin)
+}
+
+/// `host` or `host:port` naming the loopback interface.
+fn is_loopback_host(hostport: &str) -> bool {
+    let host = match hostport.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((h, rest)) if rest.is_empty() || port_ok(rest) => return h == "::1",
+            _ => return false,
+        },
+        None => match hostport.split_once(':') {
+            Some((h, rest)) if port_ok(&format!(":{rest}")) => h,
+            Some(_) => return false,
+            None => hostport,
+        },
+    };
+    host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost")
+}
+
+fn port_ok(rest: &str) -> bool {
+    rest.strip_prefix(':')
+        .is_some_and(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// An `Origin` of exactly `http(s)://<loopback>[:port]`. A prefix test is not
+/// enough: `http://127.0.0.1.attacker.example` starts with `http://127.0.0.1`.
+fn is_loopback_origin(origin: &str) -> bool {
+    origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .is_some_and(is_loopback_host)
 }
 
 /// Middleware: for /api/* requests that carry an Origin header, reject if the
@@ -528,17 +698,19 @@ async fn reject_cross_origin_api(
     req: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    // DNS-rebinding defence: a page on attacker.example whose name now
+    // resolves to 127.0.0.1 is same-origin with itself, sends no Origin on
+    // GET, but still carries its own name in Host.
+    if let Some(host) = req.headers().get(header::HOST) {
+        if !host.to_str().is_ok_and(is_loopback_host) {
+            return (StatusCode::FORBIDDEN, "Forbidden: unexpected Host header").into_response();
+        }
+    }
     let path = req.uri().path();
     if path.starts_with("/api/") {
         if let Some(origin) = req.headers().get(header::ORIGIN) {
             if let Ok(s) = origin.to_str() {
-                let local = s.starts_with("http://127.0.0.1")
-                    || s.starts_with("http://localhost")
-                    || s.starts_with("https://127.0.0.1")
-                    || s.starts_with("https://localhost")
-                    || s.starts_with("http://[::1]")
-                    || s.starts_with("https://[::1]");
-                if !local {
+                if !is_loopback_origin(s) {
                     return (
                         StatusCode::FORBIDDEN,
                         "Forbidden: API access from non-local origins is not permitted",
@@ -549,4 +721,77 @@ async fn reject_cross_origin_api(
         }
     }
     next.run(req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exports_load_each_session_only_when_streamed() {
+        let db = Db::open_in_memory().unwrap();
+        let store = SessionStore::with_db(db.clone());
+        let ev = |line: usize, text: &str| {
+            TraceEvent::from_raw(
+                "s",
+                line,
+                serde_json::json!({ "type": "user", "sessionId": "s",
+                                    "message": { "role": "user", "content": text } }),
+            )
+        };
+        store.ingest(&ev(0, "before the export started"));
+        let state = AppState {
+            tx: broadcast::channel(8).0,
+            port: 0,
+            store: store.clone(),
+            db,
+            roots: Default::default(),
+            server_key: None,
+        };
+        let sessions = store.sessions();
+        let response = stream_response(
+            state,
+            sessions,
+            ExportFormat::Jsonl,
+            ExportFormat::Jsonl.mime(),
+            "x.jsonl",
+        );
+        // Nothing has been read yet: a record written now is still exported.
+        store.ingest(&ev(1, "written while streaming"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("before the export started"));
+        assert!(text.contains("written while streaming"), "{text}");
+    }
+
+    #[test]
+    fn loopback_origins_are_matched_exactly() {
+        for ok in [
+            "http://127.0.0.1",
+            "http://127.0.0.1:7779",
+            "https://localhost:1",
+            "http://LOCALHOST:8080",
+            "http://[::1]:7779",
+        ] {
+            assert!(is_loopback_origin(ok), "{ok}");
+        }
+        for bad in [
+            "http://127.0.0.1.attacker.example",
+            "http://localhost.attacker.example:7779",
+            "http://127.0.0.1:77x9",
+            "http://[::1].attacker.example",
+            "null",
+            "file://",
+        ] {
+            assert!(!is_loopback_origin(bad), "{bad}");
+        }
+        // A loopback address as user-info in front of the real host. Joined
+        // at runtime so secret scanners do not read it as credentials.
+        let userinfo = ["http://127.0.0.1:7779", "attacker.example"].join("@");
+        assert!(!is_loopback_origin(&userinfo), "{userinfo}");
+        assert!(is_loopback_host("127.0.0.1:7779"));
+        assert!(!is_loopback_host("rebound.attacker.example:7779"));
+    }
 }

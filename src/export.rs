@@ -1,4 +1,7 @@
-//! Training-dataset friendly export of Claude Code session events.
+//! Training-dataset friendly export of coding-agent sessions.
+//!
+//! Every exporter reads the canonical [`Message`] on each event, so all
+//! supported agents export identically regardless of their on-disk format.
 //!
 //! Six output shapes are supported:
 //!
@@ -9,20 +12,24 @@
 //!   translated from Claude's tool_use / tool_result blocks.
 //! - `sharegpt` — `{conversations: [{from, value}]}` (HF / Axolotl / Unsloth
 //!   standard).
-//! - `jsonl` — Raw Claude Code JSONL passthrough. Full fidelity; one line per
-//!   original entry.
+//! - `jsonl` — Raw passthrough of each agent's original records (tagged with
+//!   `source`). Full fidelity; one line per original entry.
 //! - `markdown` — Human-readable transcript (`# User` / `# Assistant` / fenced
 //!   `tool_use` blocks). For review, not training.
 //! - `huggingface` — A directory containing `train.jsonl`, `dataset_info.json`
 //!   and a `README.md` so the result is directly usable with
 //!   `datasets.load_dataset("json", data_dir=...)`.
 
-use std::{collections::HashMap, fmt::Write, path::Path};
+use std::{fmt::Write, path::Path};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::{event::TraceEvent, state::SessionStats};
+use crate::{
+    event::{TokenUsage, TraceEvent},
+    message::{result_text, Block, Message, Role},
+    state::SessionStats,
+};
 
 /// Pick the on-the-wire format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -35,7 +42,7 @@ pub enum ExportFormat {
     Openai,
     /// ShareGPT — `{conversations: [{from, value}]}`.
     Sharegpt,
-    /// Raw Claude Code JSONL passthrough (one line per entry).
+    /// Raw agent records passthrough (one line per entry).
     Jsonl,
     /// Human-readable markdown transcript.
     Markdown,
@@ -102,40 +109,120 @@ pub fn render_many(sessions: &[SessionExport<'_>], format: ExportFormat) -> Stri
     }
 }
 
+// -- Transcript assembly -------------------------------------------------------
+
+/// One transcript turn after merging consecutive same-role records.
+///
+/// Agents split a single API turn across several log records — Claude Code
+/// writes one line per content block, Codex writes reasoning, each tool call
+/// and the reply as separate items. Training formats expect one message per
+/// turn with alternating roles, so consecutive records of the same role are
+/// folded together.
+struct Turn<'a> {
+    role: Role,
+    content: Vec<Block>,
+    first: &'a TraceEvent,
+    model: Option<&'a str>,
+    usage: Option<TokenUsage>,
+}
+
+fn transcript<'a>(events: &'a [TraceEvent]) -> (Vec<String>, Vec<Turn<'a>>) {
+    let mut system: Vec<String> = Vec::new();
+    let mut turns: Vec<Turn<'a>> = Vec::new();
+    for ev in events {
+        let Some(msg) = &ev.message else { continue };
+        if msg.role == Role::System {
+            let t = msg.plain_text();
+            if !t.trim().is_empty() {
+                system.push(t);
+            }
+            continue;
+        }
+        // Some agents (Gemini CLI, OpenCode) store a tool's result on the
+        // same record as the call. Every training format expects results on
+        // the following user turn, so split the record into alternating
+        // turns, keeping the blocks in order (call, result, the reply after).
+        let mut segments: Vec<(Role, Vec<Block>)> = Vec::new();
+        for b in &msg.content {
+            let role = if msg.role == Role::Assistant && matches!(b, Block::ToolResult { .. }) {
+                Role::User
+            } else {
+                msg.role
+            };
+            match segments.last_mut() {
+                Some((r, blocks)) if *r == role => blocks.push(b.clone()),
+                _ => segments.push((role, vec![b.clone()])),
+            }
+        }
+        let mut usage = ev.usage.clone();
+        for (role, blocks) in segments {
+            let u = if role == Role::Assistant {
+                usage.take()
+            } else {
+                None
+            };
+            push_turn(&mut turns, role, blocks, ev, u);
+        }
+    }
+    (system, turns)
+}
+
+fn push_turn<'a>(
+    turns: &mut Vec<Turn<'a>>,
+    role: Role,
+    blocks: Vec<Block>,
+    ev: &'a TraceEvent,
+    usage: Option<TokenUsage>,
+) {
+    match turns.last_mut() {
+        Some(last) if last.role == role => {
+            last.content.extend(blocks);
+            if role == Role::Assistant && ev.model.is_some() {
+                last.model = ev.model.as_deref();
+            }
+            if let Some(u) = usage {
+                let acc = last.usage.get_or_insert_with(TokenUsage::default);
+                acc.input += u.input;
+                acc.output += u.output;
+                acc.cache_read += u.cache_read;
+                acc.cache_creation += u.cache_creation;
+            }
+        }
+        _ => turns.push(Turn {
+            role,
+            content: blocks,
+            first: ev,
+            model: ev.model.as_deref(),
+            usage,
+        }),
+    }
+}
+
+fn system_value(system: &[String]) -> Value {
+    if system.is_empty() {
+        Value::Null
+    } else {
+        Value::String(system.join("\n\n"))
+    }
+}
+
 // -- Anthropic Messages --------------------------------------------------------
 
 fn render_messages_line(sess: &SessionExport<'_>) -> String {
-    let messages: Vec<Value> = sess
-        .events
+    let (system, turns) = transcript(sess.events);
+    let messages: Vec<Value> = turns
         .iter()
-        .filter_map(|ev| match ev.event_type.as_str() {
-            "user" => Some(json!({
-                "role": "user",
-                "content": extract_message_content(&ev.entry),
-                "timestamp": ev.timestamp,
-            })),
-            "assistant" => Some(json!({
-                "role": "assistant",
-                "content": extract_message_content(&ev.entry),
-                "model": ev.model,
-                "timestamp": ev.timestamp,
-                "usage": ev.usage,
-            })),
-            // Agents that emit tool calls as standalone records (Codex) rather
-            // than as blocks inside a turn. Anthropic's convention puts a
-            // tool_use on the assistant side and its result on the user side.
-            "tool_use" => Some(json!({
-                "role": "assistant",
-                "content": extract_message_content(&ev.entry),
-                "model": ev.model,
-                "timestamp": ev.timestamp,
-            })),
-            "tool_result" => Some(json!({
-                "role": "user",
-                "content": extract_message_content(&ev.entry),
-                "timestamp": ev.timestamp,
-            })),
-            _ => None,
+        .map(|t| {
+            let mut m = json!({
+                "role": t.role.as_str(),
+                "content": t.content,
+                "timestamp": t.first.timestamp,
+            });
+            if t.role == Role::Assistant {
+                m["model"] = json!(t.model);
+                m["usage"] = json!(t.usage);
+            }
+            m
         })
         .collect();
 
@@ -147,6 +234,7 @@ fn render_messages_line(sess: &SessionExport<'_>) -> String {
         "git_branch": sess.stats.git_branch,
         "version": sess.stats.version,
         "title": sess.stats.title,
+        "system": system_value(&system),
         "messages": messages,
         "metadata": metadata_object(sess.stats),
     });
@@ -159,17 +247,16 @@ fn render_messages_line(sess: &SessionExport<'_>) -> String {
 // -- OpenAI Chat / Tools -------------------------------------------------------
 
 fn render_openai_line(sess: &SessionExport<'_>) -> String {
+    let (system, turns) = transcript(sess.events);
     let mut messages: Vec<Value> = Vec::new();
-    for ev in sess.events {
-        match ev.event_type.as_str() {
-            "user" => push_openai_user(&mut messages, &ev.entry),
-            "assistant" => push_openai_assistant(&mut messages, ev),
-            // Codex records a tool call as its own rollout item rather than as
-            // a content block inside an assistant turn; route it through the
-            // same writers so those turns survive the export.
-            "tool_use" => push_openai_assistant(&mut messages, ev),
-            "tool_result" => push_openai_user(&mut messages, &ev.entry),
-            _ => {}
+    if !system.is_empty() {
+        messages.push(json!({ "role": "system", "content": system.join("\n\n") }));
+    }
+    for t in &turns {
+        match t.role {
+            Role::User => push_openai_user(&mut messages, &t.content),
+            Role::Assistant => push_openai_assistant(&mut messages, t),
+            Role::System => {}
         }
     }
 
@@ -186,97 +273,99 @@ fn render_openai_line(sess: &SessionExport<'_>) -> String {
     s
 }
 
-fn push_openai_user(messages: &mut Vec<Value>, entry: &Value) {
-    let Some(content) = canonical_content(entry) else {
-        return;
-    };
-    let content = &content;
-
-    // Plain-string user message.
-    if let Some(s) = content.as_str() {
-        messages.push(json!({ "role": "user", "content": s }));
-        return;
+/// Tool results become `tool` messages (they must directly follow the
+/// assistant's `tool_calls`); remaining text becomes one user message.
+fn push_openai_user(messages: &mut Vec<Value>, content: &[Block]) {
+    let mut text_parts: Vec<&str> = Vec::new();
+    let mut images: Vec<&Value> = Vec::new();
+    for b in content {
+        match b {
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tool_use_id,
+                "content": result_text(content),
+            })),
+            Block::Text { text } => text_parts.push(text),
+            Block::Image { source } => images.push(source),
+            _ => {}
+        }
     }
-    // Array of content blocks: text → user message, tool_result → tool messages.
-    if let Some(arr) = content.as_array() {
-        let mut text_parts: Vec<String> = Vec::new();
-        for b in arr {
-            let kind = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            match kind {
-                "text" => {
-                    if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
-                        text_parts.push(t.to_owned());
-                    }
-                }
-                "tool_result" => {
-                    let id = b.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let body = match b.get("content") {
-                        Some(Value::String(s)) => s.clone(),
-                        Some(other) => other.to_string(),
-                        None => String::new(),
-                    };
-                    messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": id,
-                        "content": body,
-                    }));
-                }
-                _ => {}
-            }
-        }
+    let image_parts: Vec<Value> = images
+        .iter()
+        .filter_map(|src| image_url(src))
+        .map(|url| json!({ "type": "image_url", "image_url": { "url": url } }))
+        .collect();
+    if !image_parts.is_empty() {
+        // Multimodal: OpenAI content parts, text first.
+        let mut parts: Vec<Value> = Vec::new();
         if !text_parts.is_empty() {
-            messages.push(json!({ "role": "user", "content": text_parts.join("\n") }));
+            parts.push(json!({ "type": "text", "text": text_parts.join("\n") }));
         }
+        parts.extend(image_parts);
+        messages.push(json!({ "role": "user", "content": parts }));
+    } else if !text_parts.is_empty() {
+        messages.push(json!({ "role": "user", "content": text_parts.join("\n") }));
+    } else if !images.is_empty() {
+        // Images whose data the agent did not log.
+        messages.push(json!({ "role": "user", "content": "[image]" }));
     }
 }
 
-fn push_openai_assistant(messages: &mut Vec<Value>, ev: &TraceEvent) {
-    let Some(content) = canonical_content(&ev.entry) else {
-        return;
-    };
-    let content = &content;
+/// An image block's source as a URL OpenAI accepts: an http(s) or data URL.
+/// Sources come in the shapes the agents log them: Anthropic
+/// `{type: base64, media_type, data}` / `{type: url, url}`, OpenAI
+/// `{url}` or a bare string, Gemini `{mimeType, data}`.
+fn image_url(source: &Value) -> Option<String> {
+    if let Some(s) = source.as_str() {
+        return (!s.is_empty()).then(|| s.to_owned());
+    }
+    if let Some(url) = source.get("url").and_then(Value::as_str) {
+        return (!url.is_empty()).then(|| url.to_owned());
+    }
+    let data = source.get("data").and_then(Value::as_str)?;
+    if data.is_empty() {
+        return None;
+    }
+    let media = ["media_type", "mimeType", "mime_type"]
+        .iter()
+        .find_map(|k| source.get(*k).and_then(Value::as_str))
+        .unwrap_or("image/png");
+    Some(format!("data:{media};base64,{data}"))
+}
 
-    let mut text_parts: Vec<String> = Vec::new();
+fn push_openai_assistant(messages: &mut Vec<Value>, t: &Turn<'_>) {
+    let mut text_parts: Vec<&str> = Vec::new();
+    let mut reasoning: Vec<&str> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
-
-    if let Some(s) = content.as_str() {
-        text_parts.push(s.to_owned());
-    } else if let Some(arr) = content.as_array() {
-        for b in arr {
-            let kind = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            match kind {
-                "text" => {
-                    if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
-                        text_parts.push(t.to_owned());
-                    }
-                }
-                "tool_use" => {
-                    let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let args = b.get("input").cloned().unwrap_or(json!({}));
-                    tool_calls.push(json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": args.to_string(),
-                        }
-                    }));
-                }
-                _ => {}
-            }
+    for b in &t.content {
+        match b {
+            Block::Text { text } => text_parts.push(text),
+            Block::Thinking { thinking } => reasoning.push(thinking),
+            Block::ToolUse { id, name, input } => tool_calls.push(json!({
+                "id": id,
+                "type": "function",
+                "function": { "name": name, "arguments": input.to_string() },
+            })),
+            _ => {}
         }
     }
-
     let mut msg = json!({
         "role": "assistant",
         "content": if text_parts.is_empty() { Value::Null } else { Value::String(text_parts.join("\n")) },
     });
+    if !reasoning.is_empty() {
+        // The `reasoning_content` convention (DeepSeek, Qwen, Kimi, vLLM).
+        msg["reasoning_content"] = Value::String(reasoning.join("\n"));
+    }
     if !tool_calls.is_empty() {
         msg["tool_calls"] = Value::Array(tool_calls);
     }
-    if let Some(m) = &ev.model {
-        msg["model"] = Value::String(m.clone());
+    if let Some(m) = t.model {
+        msg["model"] = Value::String(m.to_owned());
     }
     messages.push(msg);
 }
@@ -284,49 +373,47 @@ fn push_openai_assistant(messages: &mut Vec<Value>, ev: &TraceEvent) {
 // -- ShareGPT ------------------------------------------------------------------
 
 fn render_sharegpt_line(sess: &SessionExport<'_>) -> String {
+    let (system, turns) = transcript(sess.events);
     let mut conversations: Vec<Value> = Vec::new();
-    for ev in sess.events {
-        match ev.event_type.as_str() {
-            "user" => {
-                if let Some(text) = extract_plain_text(&ev.entry) {
-                    if !text.is_empty() {
-                        conversations.push(json!({ "from": "human", "value": text }));
-                    }
+    for t in &turns {
+        let text = Message::new(t.role, t.content.clone()).plain_text();
+        match t.role {
+            Role::User => {
+                let results: Vec<String> = t
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::ToolResult { content, .. } => Some(result_text(content)),
+                        _ => None,
+                    })
+                    .collect();
+                if !results.is_empty() {
+                    conversations.push(json!({ "from": "tool", "value": results.join("\n") }));
                 }
-                if let Some(tr) = extract_tool_results_text(&ev.entry) {
-                    if !tr.is_empty() {
-                        conversations.push(json!({ "from": "tool", "value": tr }));
-                    }
-                }
-            }
-            "assistant" => {
-                if let Some(text) = extract_plain_text(&ev.entry) {
-                    if !text.is_empty() {
-                        conversations.push(json!({ "from": "gpt", "value": text }));
-                    }
-                }
-                if let Some(tool_uses) = extract_tool_uses_text(&ev.entry) {
-                    if !tool_uses.is_empty() {
-                        conversations.push(json!({ "from": "function_call", "value": tool_uses }));
-                    }
+                if !text.is_empty() {
+                    conversations.push(json!({ "from": "human", "value": text }));
                 }
             }
-            // Standalone tool records (Codex).
-            "tool_use" => {
-                if let Some(tool_uses) = extract_tool_uses_text(&ev.entry) {
-                    if !tool_uses.is_empty() {
-                        conversations.push(json!({ "from": "function_call", "value": tool_uses }));
-                    }
+            Role::Assistant => {
+                if !text.is_empty() {
+                    conversations.push(json!({ "from": "gpt", "value": text }));
+                }
+                let calls: Vec<String> = t
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::ToolUse { name, input, .. } => {
+                            Some(json!({ "name": name, "arguments": input }).to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !calls.is_empty() {
+                    conversations
+                        .push(json!({ "from": "function_call", "value": calls.join("\n") }));
                 }
             }
-            "tool_result" => {
-                if let Some(tr) = extract_tool_results_text(&ev.entry) {
-                    if !tr.is_empty() {
-                        conversations.push(json!({ "from": "tool", "value": tr }));
-                    }
-                }
-            }
-            _ => {}
+            Role::System => {}
         }
     }
     let record = json!({
@@ -334,6 +421,7 @@ fn render_sharegpt_line(sess: &SessionExport<'_>) -> String {
         "source": sess.stats.source,
         "title": sess.stats.title,
         "model": sess.stats.model,
+        "system": system_value(&system),
         "conversations": conversations,
         "metadata": metadata_object(sess.stats),
     });
@@ -349,7 +437,7 @@ fn render_raw_jsonl(sess: &SessionExport<'_>) -> String {
     for ev in sess.events {
         // Attach the source so mixed-agent datasets stay attributable even
         // when the raw record itself has no agent-identifying field. Prefer
-        // the session's attributed source; fall back to the event's own.
+        // the event's own attribution; fall back to the session's.
         let mut entry = ev.entry.clone();
         let src = if ev.source.is_empty() || ev.source == "unknown" {
             sess.stats.source.as_str()
@@ -376,10 +464,18 @@ fn render_markdown(sess: &SessionExport<'_>) -> String {
         .stats
         .title
         .clone()
+        .or_else(|| sess.stats.first_prompt.clone())
         .unwrap_or_else(|| format!("Session {}", sess.stats.id));
     let _ = writeln!(out, "# {}", title);
     let _ = writeln!(out);
     let _ = writeln!(out, "- **ID:** `{}`", sess.stats.id);
+    let _ = writeln!(
+        out,
+        "- **Agent:** {}",
+        crate::sources::AgentSource::parse(&sess.stats.source)
+            .map(|s| s.display_name())
+            .unwrap_or(&sess.stats.source)
+    );
     if let Some(m) = &sess.stats.model {
         let _ = writeln!(out, "- **Model:** {}", m);
     }
@@ -396,222 +492,84 @@ fn render_markdown(sess: &SessionExport<'_>) -> String {
     );
     let _ = writeln!(out);
 
-    for ev in sess.events {
-        match ev.event_type.as_str() {
-            "user" => {
-                let _ = writeln!(out, "## 👤 User");
-                let _ = writeln!(out);
-                write_content_md(&mut out, canonical_content(&ev.entry).as_ref());
-                let _ = writeln!(out);
+    let (system, turns) = transcript(sess.events);
+    if !system.is_empty() {
+        let _ = writeln!(
+            out,
+            "<details><summary>⚙️ System / instructions</summary>\n\n```\n{}\n```\n\n</details>\n",
+            system.join("\n\n")
+        );
+    }
+    for t in &turns {
+        let only_results = t
+            .content
+            .iter()
+            .all(|b| matches!(b, Block::ToolResult { .. }));
+        match t.role {
+            Role::User if only_results => {}
+            Role::User => {
+                let _ = writeln!(out, "## 👤 User\n");
             }
-            "assistant" => {
+            _ => {
                 let _ = writeln!(out, "## 🤖 Assistant");
-                if let Some(t) = &ev.timestamp {
-                    let _ = writeln!(out, "*{}*", t);
+                if let Some(ts) = &t.first.timestamp {
+                    let _ = writeln!(out, "*{}*", ts);
                 }
                 let _ = writeln!(out);
-                write_content_md(&mut out, canonical_content(&ev.entry).as_ref());
-                let _ = writeln!(out);
             }
-            // Standalone tool records (Codex).
-            "tool_use" | "tool_result" => {
-                write_content_md(&mut out, canonical_content(&ev.entry).as_ref());
-                let _ = writeln!(out);
-            }
-            "summary" => {
-                if let Some(s) = ev.entry.get("summary").and_then(|v| v.as_str()) {
-                    let _ = writeln!(out, "> **Summary:** {}", s);
-                    let _ = writeln!(out);
-                }
-            }
-            _ => {}
         }
+        write_blocks_md(&mut out, &t.content);
     }
     out
 }
 
-fn write_content_md(out: &mut String, content: Option<&Value>) {
-    let Some(content) = content else { return };
-    if let Some(s) = content.as_str() {
-        out.push_str(s);
-        out.push('\n');
-        return;
-    }
-    if let Some(arr) = content.as_array() {
-        for b in arr {
-            let kind = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            match kind {
-                "text" => {
-                    if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
-                        out.push_str(t);
-                        out.push_str("\n\n");
-                    }
-                }
-                "thinking" => {
-                    let t = b
-                        .get("thinking")
-                        .or_else(|| b.get("text"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let _ = writeln!(
-                        out,
-                        "<details><summary>💭 Thinking</summary>\n\n```\n{}\n```\n\n</details>",
-                        t
-                    );
-                }
-                "tool_use" => {
-                    let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                    let input =
-                        serde_json::to_string_pretty(b.get("input").unwrap_or(&Value::Null))
-                            .unwrap_or_default();
-                    let _ = writeln!(out, "**🔧 Tool: `{}`**\n\n```json\n{}\n```\n", name, input);
-                }
-                "tool_result" => {
-                    let id = b.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let body = match b.get("content") {
-                        Some(Value::String(s)) => s.clone(),
-                        Some(other) => serde_json::to_string_pretty(other).unwrap_or_default(),
-                        None => String::new(),
-                    };
-                    let _ = writeln!(out, "**📦 Tool result** (`{}`)\n\n```\n{}\n```\n", id, body);
-                }
-                _ => {}
+fn write_blocks_md(out: &mut String, blocks: &[Block]) {
+    for b in blocks {
+        match b {
+            Block::Text { text } => {
+                out.push_str(text);
+                out.push_str("\n\n");
+            }
+            Block::Thinking { thinking } => {
+                let _ = writeln!(
+                    out,
+                    "<details><summary>💭 Thinking</summary>\n\n```\n{}\n```\n\n</details>\n",
+                    thinking
+                );
+            }
+            Block::ToolUse { name, input, .. } => {
+                let input = serde_json::to_string_pretty(input).unwrap_or_default();
+                let _ = writeln!(out, "**🔧 Tool: `{}`**\n\n```json\n{}\n```\n", name, input);
+            }
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                let label = if *is_error {
+                    "⛔ Tool error"
+                } else {
+                    "📦 Tool result"
+                };
+                let _ = writeln!(
+                    out,
+                    "**{}** (`{}`)\n\n```\n{}\n```\n",
+                    label,
+                    tool_use_id,
+                    result_text(content)
+                );
+            }
+            Block::Image { .. } => {
+                out.push_str("*[image]*\n\n");
             }
         }
     }
-}
-
-// -- Helpers -------------------------------------------------------------------
-
-/// Canonical Anthropic-shaped content blocks for an entry, normalised across
-/// agent formats so every exporter below sees one vocabulary.
-///
-/// Claude Code, Cline and Kimi already write the Anthropic shape, under
-/// `/message/content` or a top-level `content`. Codex rollout records instead
-/// nest a Responses-API item under `/payload`, using different block types
-/// (`input_text` / `output_text`) and expressing tool calls as standalone
-/// `function_call` / `function_call_output` items rather than content blocks.
-/// Without this translation the exporters find nothing at the paths they know
-/// and Codex sessions export as `content: null` or are dropped entirely.
-fn canonical_content(entry: &Value) -> Option<Value> {
-    if let Some(c) = entry.pointer("/message/content") {
-        return Some(c.clone());
-    }
-    if let Some(c) = entry.get("content") {
-        return Some(c.clone());
-    }
-
-    // Codex: {"type":"response_item","payload":{…}}
-    let payload = entry.get("payload")?;
-    match payload.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-        "message" => {
-            let arr = payload.get("content")?.as_array()?;
-            let blocks: Vec<Value> = arr
-                .iter()
-                .filter_map(|b| {
-                    let kind = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    match kind {
-                        "input_text" | "output_text" | "text" => {
-                            let t = b.get("text").and_then(|v| v.as_str())?;
-                            Some(json!({ "type": "text", "text": t }))
-                        }
-                        _ => None,
-                    }
-                })
-                .collect();
-            Some(Value::Array(blocks))
-        }
-        "function_call" | "custom_tool_call" => {
-            let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let id = payload
-                .get("call_id")
-                .or_else(|| payload.get("id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            // Codex serialises call arguments as a JSON string; re-parse so the
-            // exported `input` is structured like every other agent's.
-            let input = match payload.get("arguments") {
-                Some(Value::String(s)) => {
-                    serde_json::from_str::<Value>(s).unwrap_or_else(|_| Value::String(s.clone()))
-                }
-                Some(other) => other.clone(),
-                None => json!({}),
-            };
-            Some(json!([{ "type": "tool_use", "id": id, "name": name, "input": input }]))
-        }
-        "function_call_output" | "custom_tool_call_output" => {
-            let id = payload
-                .get("call_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let body = match payload.get("output") {
-                Some(Value::String(s)) => Value::String(s.clone()),
-                Some(other) => Value::String(other.to_string()),
-                None => Value::String(String::new()),
-            };
-            Some(json!([{ "type": "tool_result", "tool_use_id": id, "content": body }]))
-        }
-        _ => None,
-    }
-}
-
-fn extract_message_content(entry: &Value) -> Value {
-    canonical_content(entry).unwrap_or(Value::Null)
-}
-
-fn extract_plain_text(entry: &Value) -> Option<String> {
-    let c = canonical_content(entry)?;
-    if let Some(s) = c.as_str() {
-        return Some(s.to_owned());
-    }
-    if let Some(arr) = c.as_array() {
-        let mut parts = Vec::new();
-        for b in arr {
-            if b.get("type").and_then(|v| v.as_str()) == Some("text") {
-                if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
-                    parts.push(t.to_owned());
-                }
-            }
-        }
-        return Some(parts.join("\n"));
-    }
-    None
-}
-
-fn extract_tool_uses_text(entry: &Value) -> Option<String> {
-    let c = canonical_content(entry)?;
-    let arr = c.as_array()?;
-    let mut out = Vec::new();
-    for b in arr {
-        if b.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-            let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let input = b.get("input").cloned().unwrap_or(Value::Null);
-            out.push(json!({ "name": name, "arguments": input }).to_string());
-        }
-    }
-    Some(out.join("\n"))
-}
-
-fn extract_tool_results_text(entry: &Value) -> Option<String> {
-    let c = canonical_content(entry)?;
-    let arr = c.as_array()?;
-    let mut parts = Vec::new();
-    for b in arr {
-        if b.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-            let body = match b.get("content") {
-                Some(Value::String(s)) => s.clone(),
-                Some(other) => other.to_string(),
-                None => String::new(),
-            };
-            parts.push(body);
-        }
-    }
-    Some(parts.join("\n"))
 }
 
 fn metadata_object(s: &SessionStats) -> Value {
     json!({
         "source": s.source,
+        "first_prompt": s.first_prompt,
         "input_tokens": s.input_tokens,
         "output_tokens": s.output_tokens,
         "cache_read_tokens": s.cache_read_tokens,
@@ -636,21 +594,50 @@ pub fn write_huggingface_dir(
     out_dir: &Path,
     sessions: &[SessionExport<'_>],
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(out_dir)?;
-    let train_path = out_dir.join("train.jsonl");
     let body = render_many(sessions, ExportFormat::Messages);
-    std::fs::write(&train_path, body)?;
+    let totals = sessions.iter().fold(HfTotals::default(), |mut t, s| {
+        t.sessions += 1;
+        t.events += s.stats.event_count as u64;
+        t.cost_usd += s.stats.cost_usd;
+        t.input_tokens += s.stats.input_tokens;
+        t.output_tokens += s.stats.output_tokens;
+        t
+    });
+    write_hf_files(out_dir, &body, &totals)
+}
 
-    let totals = sessions
-        .iter()
-        .fold(HashMap::<&'static str, f64>::new(), |mut acc, s| {
-            *acc.entry("sessions").or_insert(0.0) += 1.0;
-            *acc.entry("events").or_insert(0.0) += s.stats.event_count as f64;
-            *acc.entry("cost_usd").or_insert(0.0) += s.stats.cost_usd;
-            *acc.entry("input_tokens").or_insert(0.0) += s.stats.input_tokens as f64;
-            *acc.entry("output_tokens").or_insert(0.0) += s.stats.output_tokens as f64;
-            acc
-        });
+/// Same as [`write_huggingface_dir`], but from an already-rendered
+/// `messages` JSONL body (what the HTTP export endpoints return). Totals for
+/// the dataset card are read back from each record's `metadata`.
+pub fn write_huggingface_from_jsonl(out_dir: &Path, body: &str) -> std::io::Result<()> {
+    let mut t = HfTotals::default();
+    for line in body.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let m = &v["metadata"];
+        let n = |k: &str| m.get(k).and_then(Value::as_u64).unwrap_or(0);
+        t.sessions += 1;
+        t.events += n("event_count");
+        t.input_tokens += n("input_tokens");
+        t.output_tokens += n("output_tokens");
+        t.cost_usd += m.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
+    }
+    write_hf_files(out_dir, body, &t)
+}
+
+#[derive(Default)]
+struct HfTotals {
+    sessions: u64,
+    events: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
+}
+
+fn write_hf_files(out_dir: &Path, body: &str, t: &HfTotals) -> std::io::Result<()> {
+    std::fs::create_dir_all(out_dir)?;
+    std::fs::write(out_dir.join("train.jsonl"), body)?;
 
     // We deliberately omit a `features` block: each record's `content` field
     // can be either a string OR a heterogeneous array of `text` / `thinking` /
@@ -660,16 +647,17 @@ pub fn write_huggingface_dir(
     // would lie about the data; letting `datasets` infer types from the JSONL
     // is both accurate and what `load_dataset("json", ...)` does by default.
     let info = json!({
-        "description": "Claude Code session traces exported by claude-trace-rs. \
-            Each record is one session; `messages` is an Anthropic-shape list \
-            whose `content` may be a string or an array of content blocks \
-            (text / thinking / tool_use / tool_result / image). Additional \
-            top-level fields: cwd, git_branch, version, title, metadata.",
+        "description": "Coding-agent session traces exported by claude-trace-rs. \
+            Each record is one session from one agent (see `source`); \
+            `messages` is an Anthropic-shape list whose `content` is an array \
+            of content blocks (text / thinking / tool_use / tool_result / \
+            image). Additional top-level fields: source, cwd, git_branch, \
+            version, title, system, metadata.",
         "citation": "",
         "homepage": "https://github.com/CodeHalwell/claude-trace-rs",
         "license": "user-defined",
         "splits": {
-            "train": { "name": "train", "num_examples": totals.get("sessions").copied().unwrap_or(0.0) as u64 }
+            "train": { "name": "train", "num_examples": t.sessions }
         }
     });
     std::fs::write(
@@ -678,12 +666,12 @@ pub fn write_huggingface_dir(
     )?;
 
     let card = format!(
-        "---\nlicense: other\ntask_categories:\n  - conversational\n  - text-generation\nlanguage:\n  - en\nsize_categories:\n  - n<1K\npretty_name: \"Claude Code Sessions\"\n---\n\n# Claude Code session dataset\n\nGenerated by [`claude-trace-rs`](https://github.com/CodeHalwell/claude-trace-rs).\n\n- Sessions: **{sessions}**\n- Total events: **{events}**\n- Aggregate input tokens: **{tin}**\n- Aggregate output tokens: **{tout}**\n- Estimated cost: **${cost:.2}**\n\n## Schema\n\nEach line of `train.jsonl` is one Claude Code session. Top-level fields:\n\n| Field         | Type   | Notes |\n| ------------- | ------ | ----- |\n| `session_id`  | string | Stable Claude Code session UUID |\n| `model`       | string\\|null | e.g. `claude-opus-4-7` |\n| `cwd`         | string\\|null | Working directory the run started in |\n| `git_branch`  | string\\|null | Git branch when known |\n| `version`     | string\\|null | Claude Code CLI version |\n| `title`       | string\\|null | AI-assigned title if present |\n| `messages`    | array  | Anthropic-shape messages — see below |\n| `metadata`    | object | Aggregates: `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cost_usd`, `first_seen`, `last_seen`, `event_count`, `tool_counts` |\n\n`messages[*].content` is either a string (plain user text) **or** a heterogeneous\narray of content blocks. Each block has a `type` field; possible values:\n\n- `text` — `text: string`\n- `thinking` — `thinking: string` (extended-thinking output)\n- `tool_use` — `id`, `name`, `input`\n- `tool_result` — `tool_use_id`, `content` (string or array)\n- `image` — `source`\n\nExample:\n\n```json\n{{\n  \"session_id\": \"…\",\n  \"model\": \"claude-opus-4-7\",\n  \"messages\": [\n    {{\"role\": \"user\", \"content\": \"…\"}},\n    {{\"role\": \"assistant\", \"content\": [\n      {{\"type\":\"text\",\"text\":\"…\"}},\n      {{\"type\":\"tool_use\",\"id\":\"toolu_…\",\"name\":\"Read\",\"input\":{{}}}}\n    ]}},\n    {{\"role\": \"user\", \"content\": [\n      {{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_…\",\"content\":\"…\"}}\n    ]}}\n  ],\n  \"metadata\": {{ \"cost_usd\": 0.42, \"input_tokens\": 1234, \"output_tokens\": 567 }}\n}}\n```\n\n## Load\n\n```python\nimport os\nfrom datasets import load_dataset\nds = load_dataset(\"json\", data_files={{\n    \"train\": os.path.expanduser(\"train.jsonl\")\n}})\nprint(ds[\"train\"][0][\"messages\"][:3])\n```\n",
-        sessions = totals.get("sessions").copied().unwrap_or(0.0) as u64,
-        events = totals.get("events").copied().unwrap_or(0.0) as u64,
-        tin = totals.get("input_tokens").copied().unwrap_or(0.0) as u64,
-        tout = totals.get("output_tokens").copied().unwrap_or(0.0) as u64,
-        cost = totals.get("cost_usd").copied().unwrap_or(0.0),
+        "---\nlicense: other\ntask_categories:\n  - conversational\n  - text-generation\nlanguage:\n  - en\nsize_categories:\n  - n<1K\npretty_name: \"Coding Agent Sessions\"\n---\n\n# Coding-agent session dataset\n\nGenerated by [`claude-trace-rs`](https://github.com/CodeHalwell/claude-trace-rs).\n\n- Sessions: **{sessions}**\n- Total events: **{events}**\n- Aggregate input tokens: **{tin}**\n- Aggregate output tokens: **{tout}**\n- Estimated cost: **${cost:.2}**\n\n## Schema\n\nEach line of `train.jsonl` is one coding-agent session (Claude Code, Codex, Gemini CLI, …). Top-level fields:\n\n| Field         | Type   | Notes |\n| ------------- | ------ | ----- |\n| `session_id`  | string | Stable session identifier from the agent |\n| `source`      | string | Agent that produced the session (`claude-code`, `codex`, `gemini`, …) |\n| `model`       | string\\|null | e.g. `claude-opus-4-7` |\n| `cwd`         | string\\|null | Working directory the run started in |\n| `git_branch`  | string\\|null | Git branch when known |\n| `version`     | string\\|null | Agent CLI version |\n| `system`      | string\\|null | System / developer instructions recorded in the session |\n| `title`       | string\\|null | AI-assigned title if present |\n| `messages`    | array  | Anthropic-shape messages — see below |\n| `metadata`    | object | Aggregates: `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cost_usd`, `first_seen`, `last_seen`, `event_count`, `tool_counts` |\n\n`messages[*].content` is an array of content blocks. Each block has a `type` field; possible values:\n\n- `text` — `text: string`\n- `thinking` — `thinking: string` (extended-thinking output)\n- `tool_use` — `id`, `name`, `input`\n- `tool_result` — `tool_use_id`, `content` (string or array)\n- `image` — `source`\n\nExample:\n\n```json\n{{\n  \"session_id\": \"…\",\n  \"model\": \"claude-opus-4-7\",\n  \"messages\": [\n    {{\"role\": \"user\", \"content\": [{{\"type\":\"text\",\"text\":\"…\"}}]}},\n    {{\"role\": \"assistant\", \"content\": [\n      {{\"type\":\"text\",\"text\":\"…\"}},\n      {{\"type\":\"tool_use\",\"id\":\"toolu_…\",\"name\":\"Read\",\"input\":{{}}}}\n    ]}},\n    {{\"role\": \"user\", \"content\": [\n      {{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_…\",\"content\":\"…\"}}\n    ]}}\n  ],\n  \"metadata\": {{ \"cost_usd\": 0.42, \"input_tokens\": 1234, \"output_tokens\": 567 }}\n}}\n```\n\n## Load\n\n```python\nimport os\nfrom datasets import load_dataset\nds = load_dataset(\"json\", data_files={{\n    \"train\": os.path.expanduser(\"train.jsonl\")\n}})\nprint(ds[\"train\"][0][\"messages\"][:3])\n```\n",
+        sessions = t.sessions,
+        events = t.events,
+        tin = t.input_tokens,
+        tout = t.output_tokens,
+        cost = t.cost_usd,
     );
     std::fs::write(out_dir.join("README.md"), card)?;
 
@@ -761,6 +749,63 @@ mod tests {
         assert_eq!(msgs[2]["role"], "user");
         let user_content = msgs[2]["content"].as_array().unwrap();
         assert_eq!(user_content[0]["type"], "tool_result");
+    }
+
+    #[test]
+    fn embedded_tool_results_keep_their_place_in_the_conversation() {
+        let s = stats();
+        let events = vec![
+            ev("user", json!({ "content": "hello" })),
+            ev(
+                "assistant",
+                json!({
+                    "content": [
+                        { "type": "tool_use", "id": "t1", "name": "Read", "input": {} },
+                        { "type": "tool_result", "tool_use_id": "t1", "content": "one" },
+                        { "type": "tool_use", "id": "t2", "name": "Read", "input": {} },
+                        { "type": "tool_result", "tool_use_id": "t2", "content": "two" },
+                        { "type": "text", "text": "done" }
+                    ]
+                }),
+            ),
+        ];
+        let out = render_session(
+            &SessionExport {
+                stats: &s,
+                events: &events,
+            },
+            ExportFormat::Messages,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let shape: Vec<(String, String)> = parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                let types: Vec<&str> = m["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|b| b["type"].as_str().unwrap())
+                    .collect();
+                (m["role"].as_str().unwrap().to_owned(), types.join(","))
+            })
+            .collect();
+        let expect = [
+            ("user", "text"),
+            ("assistant", "tool_use"),
+            ("user", "tool_result"),
+            ("assistant", "tool_use"),
+            ("user", "tool_result"),
+            ("assistant", "text"),
+        ];
+        assert_eq!(
+            shape,
+            expect
+                .iter()
+                .map(|(r, t)| (r.to_string(), t.to_string()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1024,5 +1069,67 @@ mod tests {
         );
         assert!(md.contains("list the files"), "markdown missing user text");
         assert!(md.contains("There is one file."), "markdown missing reply");
+    }
+
+    #[test]
+    fn huggingface_dir_from_rendered_jsonl() {
+        let s = stats();
+        let events = vec![ev("user", json!({ "content": "hello" }))];
+        let body = render_many(
+            &[SessionExport {
+                stats: &s,
+                events: &events,
+            }],
+            ExportFormat::Huggingface,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        write_huggingface_from_jsonl(dir.path(), &body).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("train.jsonl")).unwrap(),
+            body
+        );
+        let info: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("dataset_info.json")).unwrap())
+                .unwrap();
+        assert_eq!(info["splits"]["train"]["num_examples"], 1);
+        let card = std::fs::read_to_string(dir.path().join("README.md")).unwrap();
+        assert!(card.contains("Sessions: **1**"), "{card}");
+        assert!(card.contains("input tokens: **100**"), "{card}");
+    }
+
+    #[test]
+    fn openai_export_keeps_images_as_content_parts() {
+        let s = stats();
+        let events = vec![ev(
+            "user",
+            json!({ "content": [
+                { "type": "text", "text": "what is this?" },
+                { "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": "QUJD" } },
+                { "type": "image", "source": { "type": "url", "url": "https://example.com/a.png" } }
+            ] }),
+        )];
+        let out = render_session(
+            &SessionExport {
+                stats: &s,
+                events: &events,
+            },
+            ExportFormat::Openai,
+        );
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let user = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "user")
+            .unwrap();
+        let parts = user["content"].as_array().expect("content parts");
+        assert_eq!(parts[0], json!({ "type": "text", "text": "what is this?" }));
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/jpeg;base64,QUJD");
+        assert_eq!(parts[2]["image_url"]["url"], "https://example.com/a.png");
+        assert_eq!(
+            image_url(&json!({ "mimeType": "image/webp", "data": "eA==" })).as_deref(),
+            Some("data:image/webp;base64,eA==")
+        );
+        assert_eq!(image_url(&json!(null)), None);
     }
 }

@@ -24,7 +24,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format check
         run: cargo fmt --all -- --check
+      # The CLI/library crate; the desktop app has its own job because it
+      # needs the platform webview libraries.
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy -p claude-trace-rs --all-targets -- -D warnings
       - name: Test
-        run: cargo test --all
+        run: cargo test -p claude-trace-rs
+
+  desktop:
+    name: Desktop app (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop
+      - name: Install webview and tray libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libssl-dev
+      - name: Clippy
+        run: cargo clippy -p agent-trace-desktop --all-targets -- -D warnings
+      - name: Test
+        run: cargo test -p agent-trace-desktop
