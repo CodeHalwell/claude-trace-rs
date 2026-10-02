@@ -427,7 +427,7 @@ async fn db_sessions(Query(q): Query<DbSessionsQuery>, State(state): State<AppSt
         // set and spike memory.
         limit: Some(q.limit.unwrap_or(2000).min(5000)),
     };
-    match state.db.query_sessions(&filter) {
+    match on_db(&state.db, move |db| db.query_sessions(&filter)).await {
         Ok(sessions) => Json(json!({ "sessions": sessions })).into_response(),
         Err(e) => db_error(e),
     }
@@ -465,13 +465,18 @@ async fn db_session_events(
 ) -> Response {
     let limit = q.limit.unwrap_or(200).min(2000);
     let offset = q.offset.unwrap_or(0);
-    match state.db.session_events(
-        &id,
-        q.type_filter.as_deref(),
-        q.search.as_deref(),
-        limit,
-        offset,
-    ) {
+    let sid = id.clone();
+    let page = on_db(&state.db, move |db| {
+        db.session_events(
+            &sid,
+            q.type_filter.as_deref(),
+            q.search.as_deref(),
+            limit,
+            offset,
+        )
+    })
+    .await;
+    match page {
         Ok(page) => Json(json!({
             "session_id": id,
             "events": page.events,
@@ -497,17 +502,19 @@ async fn db_search(Query(q): Query<SearchQuery>, State(state): State<AppState>) 
     if q.q.trim().is_empty() {
         return Json(json!({ "events": [] })).into_response();
     }
-    match state
-        .db
-        .search_events(q.q.trim(), limit, q.source.as_deref())
-    {
-        Ok(events) => Json(json!({ "query": q.q, "events": events })).into_response(),
+    let query = q.q.clone();
+    let found = on_db(&state.db, move |db| {
+        db.search_events(q.q.trim(), limit, q.source.as_deref())
+    })
+    .await;
+    match found {
+        Ok(events) => Json(json!({ "query": query, "events": events })).into_response(),
         Err(e) => db_error(e),
     }
 }
 
 async fn db_stats(State(state): State<AppState>) -> Response {
-    match state.db.global_stats() {
+    match on_db(&state.db, |db| db.global_stats()).await {
         Ok(stats) => Json(stats).into_response(),
         Err(e) => db_error(e),
     }
@@ -521,7 +528,8 @@ struct CostQuery {
 
 /// Total spend since a point in time — the desktop app's daily budget.
 async fn db_cost(Query(q): Query<CostQuery>, State(state): State<AppState>) -> Response {
-    match state.db.cost_since(&q.since) {
+    let since = q.since.clone();
+    match on_db(&state.db, move |db| db.cost_since(&since)).await {
         Ok(cost) => Json(json!({ "since": q.since, "cost_usd": cost })).into_response(),
         Err(e) => db_error(e),
     }
@@ -561,6 +569,16 @@ async fn db_set_meta(
         }
         Err(e) => db_error(e),
     }
+}
+
+/// Run a database read on the blocking pool: on a large database a query can
+/// take seconds, and it must not hold up the async workers serving others.
+async fn on_db<T: Send + 'static>(
+    db: &Db,
+    read: impl FnOnce(&Db) -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || read(&db)).await?
 }
 
 fn db_error(e: anyhow::Error) -> Response {

@@ -15,16 +15,25 @@
 //! A third table, `session_meta`, persists user annotations (bookmarks, tags,
 //! notes) server-side so they survive browser/localStorage resets and follow
 //! the data rather than the device.
+//!
+//! `usage_rollup` keeps per-day usage totals current through triggers on
+//! `events`, so analytics never scan the (multi-gigabyte) event table.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
+    ops::Deref,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
+use tracing::{info, warn};
 
 use crate::{event::TraceEvent, state::SessionStats};
 
@@ -91,8 +100,69 @@ pub struct EventPage {
 /// Thread-safe handle to the on-disk trace database. Cheap to clone.
 #[derive(Clone)]
 pub struct Db {
+    /// The one writer. Ingest reads go through it too, so they see its
+    /// writes in order.
     conn: Arc<Mutex<Connection>>,
+    /// Read-only connections for dashboard queries, so a slow scan never
+    /// queues behind ingest or another page load. `None` in memory (tests),
+    /// where reads share the writer.
+    readers: Option<Arc<Readers>>,
+    /// Set once `usage_rollup` holds every event; until then analytics
+    /// compute the same totals from `events`.
+    rollup_ready: Arc<AtomicBool>,
     path: PathBuf,
+}
+
+/// Idle read-only connections, opened on demand.
+struct Readers {
+    path: PathBuf,
+    idle: Mutex<Vec<Connection>>,
+}
+
+/// Idle readers kept open; more are opened under load and closed after.
+const MAX_IDLE_READERS: usize = 4;
+
+impl Readers {
+    fn open(&self) -> anyhow::Result<Connection> {
+        let conn = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening database {} for reading", self.path.display()))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(conn)
+    }
+}
+
+/// A connection for one read: pooled when the database is on disk, the
+/// writer otherwise.
+enum ReadConn<'a> {
+    Pooled(Option<Connection>, &'a Readers),
+    Writer(MutexGuard<'a, Connection>),
+}
+
+impl Deref for ReadConn<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Pooled(conn, _) => conn.as_ref().expect("reader taken"),
+            Self::Writer(conn) => conn,
+        }
+    }
+}
+
+impl Drop for ReadConn<'_> {
+    fn drop(&mut self) {
+        if let Self::Pooled(conn, readers) = self {
+            if let Some(conn) = conn.take() {
+                let mut idle = readers.idle.lock().expect("readers poisoned");
+                if idle.len() < MAX_IDLE_READERS {
+                    idle.push(conn);
+                }
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Db {
@@ -123,9 +193,15 @@ impl Db {
         )?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
+            readers: Some(Arc::new(Readers {
+                path: path.to_path_buf(),
+                idle: Mutex::new(Vec::new()),
+            })),
+            rollup_ready: Arc::new(AtomicBool::new(false)),
             path: path.to_path_buf(),
         };
         db.migrate()?;
+        db.prepare_usage()?;
         Ok(db)
     }
 
@@ -135,14 +211,109 @@ impl Db {
         let conn = Connection::open_in_memory()?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
+            readers: None,
+            rollup_ready: Arc::new(AtomicBool::new(false)),
             path: PathBuf::from(":memory:"),
         };
         db.migrate()?;
+        db.prepare_usage()?;
         Ok(db)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// A connection for a dashboard read.
+    fn reader(&self) -> anyhow::Result<ReadConn<'_>> {
+        let Some(readers) = self.readers.as_deref() else {
+            return Ok(ReadConn::Writer(self.conn.lock().expect("db poisoned")));
+        };
+        let idle = readers.idle.lock().expect("readers poisoned").pop();
+        let conn = match idle {
+            Some(conn) => conn,
+            None => readers.open()?,
+        };
+        Ok(ReadConn::Pooled(Some(conn), readers))
+    }
+
+    /// Note whether the usage rollup is built, and build it (with the spend
+    /// index) right away when that is free: a new, empty database.
+    fn prepare_usage(&self) -> anyhow::Result<()> {
+        let (rollup, index, empty) = {
+            let conn = self.conn.lock().expect("db poisoned");
+            let (rollup, index) = usage_state(&conn)?;
+            let empty = !conn.query_row("SELECT EXISTS (SELECT 1 FROM events)", [], |r| {
+                r.get::<_, bool>(0)
+            })?;
+            (rollup, index, empty)
+        };
+        if rollup {
+            self.rollup_ready.store(true, Ordering::Release);
+        }
+        if !(rollup && index) && (empty || self.readers.is_none()) {
+            self.build_usage()?;
+        }
+        Ok(())
+    }
+
+    /// Build the usage rollup and spend index for a database that predates
+    /// them. On a large one that takes a minute or so, so it runs in the
+    /// background; analytics scan `events` until it is done. Call it from
+    /// the process that keeps the database open, not from short-lived opens.
+    pub fn build_usage_in_background(&self) {
+        let built = {
+            let conn = self.conn.lock().expect("db poisoned");
+            matches!(usage_state(&conn), Ok((true, true)))
+        };
+        if built {
+            return;
+        }
+        info!(
+            "Building usage summary for {} (one-time; analytics are slower until it finishes)",
+            self.path.display()
+        );
+        let db = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("usage-rollup".into())
+            .spawn(move || {
+                let started = Instant::now();
+                // Another process may be writing (or building this) right
+                // now; wait for it rather than give up.
+                for attempt in 1.. {
+                    match db.build_usage() {
+                        Ok(()) => {
+                            info!("Usage summary built in {:.0?}", started.elapsed());
+                            return;
+                        }
+                        Err(e) if is_busy(&e) && attempt < 60 => {
+                            std::thread::sleep(Duration::from_secs(10))
+                        }
+                        Err(e) => {
+                            warn!("Could not build the usage summary: {e}");
+                            return;
+                        }
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            warn!("Could not start the usage summary build: {e}");
+        }
+    }
+
+    /// Fill `usage_rollup` from `events` and install the triggers that keep
+    /// it current — in one transaction, so no event is missed or counted
+    /// twice — then index event time for [`Db::cost_since`].
+    fn build_usage(&self) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock().expect("db poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !usage_state(&tx)?.0 {
+            tx.execute_batch(USAGE_ROLLUP_BUILD)?;
+        }
+        tx.commit()?;
+        self.rollup_ready.store(true, Ordering::Release);
+        conn.execute_batch(SPEND_INDEX)?;
+        Ok(())
     }
 
     fn migrate(&self) -> anyhow::Result<()> {
@@ -389,7 +560,7 @@ impl Db {
 
     /// Query sessions with optional filtering/sorting for the dashboard sidebar.
     pub fn query_sessions(&self, f: &SessionFilter) -> anyhow::Result<Vec<SessionStats>> {
-        let conn = self.conn.lock().expect("db poisoned");
+        let conn = self.reader()?;
         let order = match f.sort.as_deref() {
             Some("first_seen") => "first_seen DESC",
             Some("events") => "event_count DESC",
@@ -445,7 +616,7 @@ impl Db {
 
     /// Per-agent-source rollup: session count, event count, total cost.
     pub fn sources(&self) -> anyhow::Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db poisoned");
+        let conn = self.reader()?;
         let mut stmt = conn.prepare(
             "SELECT s.source, COUNT(*) AS n_sessions,
                     COALESCE(SUM(s.event_count),0), COALESCE(SUM(s.cost_usd),0.0)
@@ -464,7 +635,7 @@ impl Db {
 
     /// Distinct project directories, most-recently-active first, with counts.
     pub fn projects(&self) -> anyhow::Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db poisoned");
+        let conn = self.reader()?;
         let mut stmt = conn.prepare(
             "SELECT COALESCE(cwd,''), COUNT(*), MAX(last_seen)
              FROM sessions GROUP BY cwd ORDER BY MAX(last_seen) DESC",
@@ -488,7 +659,7 @@ impl Db {
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<EventPage> {
-        let conn = self.conn.lock().expect("db poisoned");
+        let conn = self.reader()?;
         let mut where_sql = String::from("session_id = ?1");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(session_id.to_string())];
         if let Some(t) = type_filter.filter(|t| !t.is_empty() && *t != "all") {
@@ -536,7 +707,7 @@ impl Db {
         limit: usize,
         source: Option<&str>,
     ) -> anyhow::Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db poisoned");
+        let conn = self.reader()?;
         let pattern = format!("%{}%", query.to_lowercase());
         let mut out = Vec::new();
         match source.filter(|s| !s.is_empty()) {
@@ -573,52 +744,62 @@ impl Db {
 
     /// Cross-session analytics rollups for the dashboard's Analytics tab.
     pub fn global_stats(&self) -> anyhow::Result<Value> {
-        let conn = self.conn.lock().expect("db poisoned");
+        let conn = self.reader()?;
+        let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
 
-        let (sessions, events): (i64, i64) = conn.query_row(
-            "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM events)",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-
-        let (input, output, cache_read, cache_creation, cost): (i64, i64, i64, i64, f64) = conn
-            .query_row(
-                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                        COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
-                        COALESCE(SUM(cost_usd),0) FROM events",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )?;
-
-        let by_type = map_rows(
-            &conn,
-            "SELECT event_type, COUNT(*) FROM events GROUP BY event_type ORDER BY 2 DESC",
-        )?;
-        let by_model = map_rows(&conn,
-            "SELECT COALESCE(model,'(none)'), COUNT(*) FROM events WHERE model IS NOT NULL GROUP BY model ORDER BY 2 DESC")?;
-        let by_source = map_rows(
-            &conn,
-            "SELECT source, COUNT(*) FROM events GROUP BY source ORDER BY 2 DESC",
-        )?;
-        let cost_by_source = {
-            let mut stmt = conn.prepare(
-                "SELECT source, SUM(cost_usd) FROM events GROUP BY source ORDER BY 2 DESC",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok(json!({ "source": r.get::<_,String>(0)?, "cost_usd": r.get::<_,f64>(1)? }))
-            })?;
-            rows.filter_map(Result::ok).collect::<Vec<_>>()
+        // One row per (day, source, model, event type): the rollup once it is
+        // built, otherwise the same rows from a single scan of `events`.
+        // Another handle (or process) may have finished the build.
+        let ready = self.rollup_ready.load(Ordering::Acquire) || {
+            let built = usage_state(&conn)?.0;
+            if built {
+                self.rollup_ready.store(true, Ordering::Release);
+            }
+            built
         };
-        let cost_by_model = {
-            let mut stmt = conn.prepare(
-                "SELECT COALESCE(model,'(none)'), SUM(cost_usd) FROM events
-                 WHERE model IS NOT NULL GROUP BY model ORDER BY 2 DESC",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok(json!({ "model": r.get::<_,String>(0)?, "cost_usd": r.get::<_,f64>(1)? }))
-            })?;
-            rows.filter_map(Result::ok).collect::<Vec<_>>()
+        let cube = if ready {
+            USAGE_CUBE_FROM_ROLLUP
+        } else {
+            USAGE_CUBE_FROM_EVENTS
         };
+        let mut events = 0i64;
+        let (mut input, mut output, mut cache_read, mut cache_creation) = (0i64, 0i64, 0i64, 0i64);
+        let mut cost = 0f64;
+        let mut by_type: HashMap<String, i64> = HashMap::new();
+        let mut by_model: HashMap<String, i64> = HashMap::new();
+        let mut by_source: HashMap<String, i64> = HashMap::new();
+        let mut cost_by_model: HashMap<String, f64> = HashMap::new();
+        let mut cost_by_source: HashMap<String, f64> = HashMap::new();
+        let mut days: BTreeMap<String, (i64, f64)> = BTreeMap::new();
+        {
+            let mut stmt = conn.prepare(cube)?;
+            let mut rows = stmt.query([])?;
+            while let Some(r) = rows.next()? {
+                let day: String = r.get(0)?;
+                let source: String = r.get(1)?;
+                let model: String = r.get(2)?;
+                let event_type: String = r.get(3)?;
+                let n: i64 = r.get(4)?;
+                let c: f64 = r.get(5)?;
+                events += n;
+                cost += c;
+                input += r.get::<_, i64>(6)?;
+                output += r.get::<_, i64>(7)?;
+                cache_read += r.get::<_, i64>(8)?;
+                cache_creation += r.get::<_, i64>(9)?;
+                *by_type.entry(event_type).or_default() += n;
+                *by_source.entry(source.clone()).or_default() += n;
+                *cost_by_source.entry(source).or_default() += c;
+                // '' stands for "no model" in the rollup's key.
+                if !model.is_empty() {
+                    *by_model.entry(model.clone()).or_default() += n;
+                    *cost_by_model.entry(model).or_default() += c;
+                }
+                let d = days.entry(day).or_default();
+                d.0 += n;
+                d.1 += c;
+            }
+        }
 
         // Tool leaderboard from the per-session tool_counts JSON blobs.
         let mut tool_totals: std::collections::HashMap<String, i64> =
@@ -643,25 +824,15 @@ impl Db {
         tools.sort_by(|a, b| b["count"].as_i64().cmp(&a["count"].as_i64()));
         tools.truncate(20);
 
-        // Daily activity timeline (last 30 days) keyed on the entry timestamp.
-        let timeline = {
-            let mut stmt = conn.prepare(
-                "SELECT substr(COALESCE(timestamp, observed_at),1,10) AS day, COUNT(*), COALESCE(SUM(cost_usd),0.0)
-                 FROM events GROUP BY day ORDER BY day DESC LIMIT 30")?;
-            let rows = stmt.query_map([], |r| {
-                Ok(json!({
-                    "day": r.get::<_,String>(0)?,
-                    "events": r.get::<_,i64>(1)?,
-                    "cost_usd": r.get::<_,f64>(2)?,
-                }))
-            })?;
-            let mut v = Vec::new();
-            for r in rows {
-                v.push(r?);
-            }
-            v.reverse();
-            v
-        };
+        // Daily activity timeline: the last 30 days with activity, keyed on
+        // the entry timestamp.
+        let mut timeline: Vec<Value> = days
+            .into_iter()
+            .rev()
+            .take(30)
+            .map(|(day, (n, c))| json!({ "day": day, "events": n, "cost_usd": c }))
+            .collect();
+        timeline.reverse();
 
         Ok(json!({
             "sessions": sessions,
@@ -671,11 +842,11 @@ impl Db {
                 "cache_read": cache_read, "cache_creation": cache_creation,
             },
             "cost_usd": cost,
-            "by_type": by_type,
-            "by_model": by_model,
-            "by_source": by_source,
-            "cost_by_model": cost_by_model,
-            "cost_by_source": cost_by_source,
+            "by_type": ranked_counts(by_type),
+            "by_model": ranked_counts(by_model),
+            "by_source": ranked_counts(by_source),
+            "cost_by_model": ranked_costs(cost_by_model, "model"),
+            "cost_by_source": ranked_costs(cost_by_source, "source"),
             "top_tools": tools,
             "timeline": timeline,
         }))
@@ -684,7 +855,7 @@ impl Db {
     /// Total cost of events stamped at or after `since` (an RFC 3339 UTC
     /// timestamp). Used to seed the desktop app's daily budget.
     pub fn cost_since(&self, since: &str) -> anyhow::Result<f64> {
-        let conn = self.conn.lock().expect("db poisoned");
+        let conn = self.reader()?;
         Ok(conn.query_row(
             // Compare instants, not strings: records carry assorted UTC
             // offsets, and `01:00+02:00` sorts after `00:00Z` as text.
@@ -698,7 +869,7 @@ impl Db {
     /// Every stored event for one session in order, hydrated — used to export
     /// full histories that no longer fit the in-memory ring buffers.
     pub fn all_session_events(&self, session_id: &str) -> anyhow::Result<Vec<TraceEvent>> {
-        let conn = self.conn.lock().expect("db poisoned");
+        let conn = self.reader()?;
         let mut stmt = conn.prepare(
             "SELECT event_json FROM events WHERE session_id = ?1 ORDER BY line_index ASC",
         )?;
@@ -874,7 +1045,7 @@ impl Db {
 
     /// Per-agent counts of files being tracked, for the agents overview.
     pub fn tracked_files_by_source(&self) -> anyhow::Result<Vec<(String, i64)>> {
-        let conn = self.conn.lock().expect("db poisoned");
+        let conn = self.reader()?;
         let mut stmt = conn.prepare("SELECT source, COUNT(*) FROM ingest_files GROUP BY source")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.filter_map(Result::ok).collect())
@@ -882,7 +1053,7 @@ impl Db {
 
     /// Read user annotations (bookmark/tags/notes) for a session.
     pub fn get_meta(&self, id: &str) -> anyhow::Result<Value> {
-        let conn = self.conn.lock().expect("db poisoned");
+        let conn = self.reader()?;
         let row = conn
             .query_row(
                 "SELECT bookmarked, tags, notes FROM session_meta WHERE id = ?1",
@@ -920,12 +1091,51 @@ impl Db {
     }
 }
 
-fn map_rows(conn: &Connection, sql: &str) -> anyhow::Result<Vec<Value>> {
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map([], |r| {
-        Ok(json!({ "key": r.get::<_, String>(0)?, "count": r.get::<_, i64>(1)? }))
-    })?;
-    Ok(rows.filter_map(Result::ok).collect())
+/// `{key, count}` rows, largest count first.
+fn ranked_counts(counts: HashMap<String, i64>) -> Vec<Value> {
+    let mut rows: Vec<_> = counts.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows.into_iter()
+        .map(|(key, count)| json!({ "key": key, "count": count }))
+        .collect()
+}
+
+/// `{<label>, cost_usd}` rows, most expensive first.
+fn ranked_costs(costs: HashMap<String, f64>, label: &str) -> Vec<Value> {
+    let mut rows: Vec<_> = costs.into_iter().collect();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows.into_iter()
+        .map(|(key, cost)| {
+            let mut row = serde_json::Map::new();
+            row.insert(label.to_string(), key.into());
+            row.insert("cost_usd".to_string(), cost.into());
+            Value::Object(row)
+        })
+        .collect()
+}
+
+/// Whether an error is SQLite reporting the database busy or locked.
+fn is_busy(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(f, _))
+            if matches!(f.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Whether the usage rollup (its triggers) and the spend index exist.
+fn usage_state(conn: &Connection) -> anyhow::Result<(bool, bool)> {
+    let exists = |kind: &str, name: &str| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)",
+            params![kind, name],
+            |r| r.get(0),
+        )
+    };
+    Ok((
+        exists("trigger", "usage_rollup_insert")?,
+        exists("index", "idx_events_spend")?,
+    ))
 }
 
 fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionStats> {
@@ -1070,7 +1280,114 @@ CREATE TABLE IF NOT EXISTS session_meta (
     tags       TEXT    NOT NULL DEFAULT '[]',
     notes      TEXT    NOT NULL DEFAULT ''
 );
+
+-- Usage totals per (entry day, source, model, event type), kept current by
+-- the triggers in USAGE_ROLLUP_BUILD. `model` is '' when the event has none.
+CREATE TABLE IF NOT EXISTS usage_rollup (
+    day                   TEXT    NOT NULL,
+    source                TEXT    NOT NULL,
+    model                 TEXT    NOT NULL,
+    event_type            TEXT    NOT NULL,
+    events                INTEGER NOT NULL DEFAULT 0,
+    cost_usd              REAL    NOT NULL DEFAULT 0,
+    input_tokens          INTEGER NOT NULL DEFAULT 0,
+    output_tokens         INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, source, model, event_type)
+) WITHOUT ROWID;
 "#;
+
+/// Rebuild `usage_rollup` from `events` and install its triggers. Runs in
+/// one transaction with the writer held, so nothing lands in between.
+const USAGE_ROLLUP_BUILD: &str = r#"
+DELETE FROM usage_rollup;
+INSERT INTO usage_rollup
+    (day, source, model, event_type, events, cost_usd,
+     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+SELECT substr(COALESCE(timestamp, observed_at), 1, 10), source, COALESCE(model, ''),
+       event_type, COUNT(*), COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0),
+       COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0),
+       COALESCE(SUM(cache_creation_tokens), 0)
+FROM events GROUP BY 1, 2, 3, 4;
+
+CREATE TRIGGER IF NOT EXISTS usage_rollup_insert AFTER INSERT ON events BEGIN
+    INSERT INTO usage_rollup
+        (day, source, model, event_type, events, cost_usd,
+         input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+    VALUES (substr(COALESCE(NEW.timestamp, NEW.observed_at), 1, 10), NEW.source,
+            COALESCE(NEW.model, ''), NEW.event_type, 1, NEW.cost_usd, NEW.input_tokens,
+            NEW.output_tokens, NEW.cache_read_tokens, NEW.cache_creation_tokens)
+    ON CONFLICT (day, source, model, event_type) DO UPDATE SET
+        events                = events + 1,
+        cost_usd              = cost_usd + excluded.cost_usd,
+        input_tokens          = input_tokens + excluded.input_tokens,
+        output_tokens         = output_tokens + excluded.output_tokens,
+        cache_read_tokens     = cache_read_tokens + excluded.cache_read_tokens,
+        cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens;
+END;
+
+CREATE TRIGGER IF NOT EXISTS usage_rollup_delete AFTER DELETE ON events BEGIN
+    UPDATE usage_rollup SET
+        events                = events - 1,
+        cost_usd              = cost_usd - OLD.cost_usd,
+        input_tokens          = input_tokens - OLD.input_tokens,
+        output_tokens         = output_tokens - OLD.output_tokens,
+        cache_read_tokens     = cache_read_tokens - OLD.cache_read_tokens,
+        cache_creation_tokens = cache_creation_tokens - OLD.cache_creation_tokens
+    WHERE day = substr(COALESCE(OLD.timestamp, OLD.observed_at), 1, 10)
+      AND source = OLD.source AND model = COALESCE(OLD.model, '')
+      AND event_type = OLD.event_type;
+END;
+
+CREATE TRIGGER IF NOT EXISTS usage_rollup_update AFTER UPDATE OF
+    timestamp, observed_at, source, model, event_type, cost_usd,
+    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+ON events BEGIN
+    UPDATE usage_rollup SET
+        events                = events - 1,
+        cost_usd              = cost_usd - OLD.cost_usd,
+        input_tokens          = input_tokens - OLD.input_tokens,
+        output_tokens         = output_tokens - OLD.output_tokens,
+        cache_read_tokens     = cache_read_tokens - OLD.cache_read_tokens,
+        cache_creation_tokens = cache_creation_tokens - OLD.cache_creation_tokens
+    WHERE day = substr(COALESCE(OLD.timestamp, OLD.observed_at), 1, 10)
+      AND source = OLD.source AND model = COALESCE(OLD.model, '')
+      AND event_type = OLD.event_type;
+    INSERT INTO usage_rollup
+        (day, source, model, event_type, events, cost_usd,
+         input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+    VALUES (substr(COALESCE(NEW.timestamp, NEW.observed_at), 1, 10), NEW.source,
+            COALESCE(NEW.model, ''), NEW.event_type, 1, NEW.cost_usd, NEW.input_tokens,
+            NEW.output_tokens, NEW.cache_read_tokens, NEW.cache_creation_tokens)
+    ON CONFLICT (day, source, model, event_type) DO UPDATE SET
+        events                = events + 1,
+        cost_usd              = cost_usd + excluded.cost_usd,
+        input_tokens          = input_tokens + excluded.input_tokens,
+        output_tokens         = output_tokens + excluded.output_tokens,
+        cache_read_tokens     = cache_read_tokens + excluded.cache_read_tokens,
+        cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens;
+END;
+"#;
+
+/// Event time as [`Db::cost_since`] compares it, so today's spend is a range
+/// lookup rather than a scan of every event.
+const SPEND_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_events_spend
+    ON events(julianday(COALESCE(timestamp, observed_at)), cost_usd)";
+
+/// The analytics cube from the rollup.
+const USAGE_CUBE_FROM_ROLLUP: &str = "
+SELECT day, source, model, event_type, events, cost_usd,
+       input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+FROM usage_rollup WHERE events > 0";
+
+/// The same cube from `events`, while the rollup is still being built.
+const USAGE_CUBE_FROM_EVENTS: &str = "
+SELECT substr(COALESCE(timestamp, observed_at), 1, 10), source, COALESCE(model, ''),
+       event_type, COUNT(*), COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0),
+       COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0),
+       COALESCE(SUM(cache_creation_tokens), 0)
+FROM events GROUP BY 1, 2, 3, 4";
 
 #[cfg(test)]
 mod tests {
@@ -1148,6 +1465,75 @@ mod tests {
         }
         let today = db.cost_since("2026-09-29T00:00:00Z").unwrap();
         assert!((today - 10.0).abs() < 1e-9, "{today}");
+    }
+
+    #[test]
+    fn usage_rollup_matches_a_scan_of_events() {
+        let db = Db::open_in_memory().unwrap();
+        let usage = |line, ts: &str, model: Option<&str>, cost: f64, input: u64| {
+            let mut message = json!({ "content": "x", "usage": { "input_tokens": input } });
+            if let Some(m) = model {
+                message["model"] = json!(m);
+            }
+            ev(
+                "a",
+                line,
+                "assistant",
+                json!({ "timestamp": ts, "costUSD": cost, "message": message }),
+            )
+        };
+        db.insert_event(&usage(0, "2026-09-28T10:00:00Z", Some("opus"), 0.5, 10))
+            .unwrap();
+        db.insert_event(&usage(1, "2026-09-28T11:00:00Z", Some("sonnet"), 0.25, 20))
+            .unwrap();
+        db.insert_event(&usage(2, "2026-09-29T09:00:00Z", Some("opus"), 2.0, 40))
+            .unwrap();
+        db.insert_event(&usage(3, "2026-09-29T09:30:00Z", None, 0.0, 0))
+            .unwrap();
+        db.insert_event(&ev(
+            "a",
+            4,
+            "user",
+            json!({ "timestamp": "2026-09-29T09:31:00Z" }),
+        ))
+        .unwrap();
+        // A record rewritten in place moves its usage; a retracted one drops it.
+        assert!(matches!(
+            db.upsert_event(&usage(1, "2026-09-29T11:00:00Z", Some("sonnet"), 1.0, 80))
+                .unwrap(),
+            Upsert::Updated(_)
+        ));
+        db.delete_event("a", 0).unwrap();
+
+        let rolled = db.global_stats().unwrap();
+        assert_eq!(rolled["events"], json!(4));
+        assert_eq!(rolled["cost_usd"], json!(3.0));
+        assert_eq!(rolled["tokens"]["input"], json!(120));
+        assert_eq!(
+            rolled["by_model"],
+            json!([{ "key": "opus", "count": 1 }, { "key": "sonnet", "count": 1 }])
+        );
+        assert_eq!(
+            rolled["timeline"],
+            json!([{ "day": "2026-09-29", "events": 4, "cost_usd": 3.0 }])
+        );
+
+        // A database from before the rollup: analytics scan `events` and get
+        // the same answer, and building it later matches too.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "DROP TRIGGER usage_rollup_insert; DROP TRIGGER usage_rollup_delete;
+                 DROP TRIGGER usage_rollup_update; DELETE FROM usage_rollup;",
+            )
+            .unwrap();
+        db.rollup_ready.store(false, Ordering::Release);
+        let scanned = db.global_stats().unwrap();
+        assert!(!db.rollup_ready.load(Ordering::Acquire));
+        assert_eq!(scanned, rolled);
+        db.build_usage().unwrap();
+        assert_eq!(db.global_stats().unwrap(), rolled);
     }
 
     #[test]
@@ -1279,9 +1665,12 @@ mod tests {
 
         let db = Db {
             conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
+            readers: None,
+            rollup_ready: Arc::new(AtomicBool::new(false)),
             path: PathBuf::from(":memory:"),
         };
         db.migrate().unwrap();
+        db.prepare_usage().unwrap();
 
         let sessions = db.load_sessions().unwrap();
         assert_eq!(sessions.len(), 1);

@@ -95,6 +95,7 @@ impl Tracer {
         let db_path = cfg.db_path.clone().unwrap_or_else(db::default_db_path);
         let database = Db::open(&db_path)?;
         info!("Trace database: {}", database.path().display());
+        database.build_usage_in_background();
         let store = SessionStore::with_db(database.clone());
         match database.load_sessions() {
             Ok(sessions) => {
