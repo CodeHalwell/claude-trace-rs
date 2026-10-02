@@ -561,7 +561,7 @@ function ingest(ev, live){
     if(row) row.remove();
     if(live && state.tab==='conversation' && ev.session_id===state.selected) scheduleConvRefresh();
     clearTimeout(refreshDebounce);
-    refreshDebounce=setTimeout(()=>{ loadSessions(); if(state.tab==='analytics') loadAnalytics(); }, 1200);
+    refreshDebounce=setTimeout(()=>{ loadSessions(true); if(state.tab==='analytics') loadAnalytics(); }, 1200);
     return;
   }
   if(state.feedSeen.has(key)){
@@ -581,12 +581,15 @@ function ingest(ev, live){
     appendFeedRow(ev);
     // Refresh sidebar/analytics lazily as new data lands.
     clearTimeout(refreshDebounce);
-    refreshDebounce=setTimeout(()=>{ loadSessions(); if(state.tab==='analytics') loadAnalytics(); }, 1200);
+    refreshDebounce=setTimeout(()=>{ loadSessions(true); if(state.tab==='analytics') loadAnalytics(); }, 1200);
   }
 }
 
 // ---------- Sidebar ----------
-async function loadSessions(){
+// Live refreshes re-sort the list; while the pointer is over it they wait,
+// so a row never moves out from under a click.
+let sessHover=false, sessStale=false;
+async function loadSessions(live){
   const params=new URLSearchParams();
   const q=$('#sessSearch').value.trim(); if(q) params.set('search', q);
   params.set('sort', $('#sortSel').value);
@@ -595,6 +598,8 @@ async function loadSessions(){
   try{
     const d=await api('/api/db/sessions?'+params.toString());
     state.sessions=d.sessions||[];
+    // `live` is only ever `true`; event listeners pass an Event here.
+    if(live===true && sessHover){ sessStale=true; if(state.selected) renderHead(); return; }
     renderSessions();
   }catch(e){ /* keep prior */ }
 }
@@ -621,6 +626,7 @@ function renderSourceChips(){
   }));
 }
 function renderSessions(){
+  sessStale=false;
   const list=$('#sessionList');
   if(!state.sessions.length){ list.innerHTML='<div class="empty">No sessions yet.<br>Start a coding-agent session and it will appear here.<br><br><a href="#" id="seeAgents">See which agents were found →</a></div>'; const a=$('#seeAgents'); if(a) a.addEventListener('click',(e)=>{e.preventDefault(); setTab('agents');}); return; }
   // Group by project.
@@ -664,7 +670,8 @@ async function toggleBookmark(id){
 // ---------- Selection & header ----------
 async function selectSession(id){
   state.selected=id;
-  renderSessions();
+  if(sessHover) $$('.session', $('#sessionList')).forEach(el=> el.classList.toggle('active', el.dataset.id===id));
+  else renderSessions();
   try{ state.selectedMeta=await api('/api/db/sessions/'+encodeURIComponent(id)+'/meta'); }catch(e){ state.selectedMeta={bookmarked:false,tags:[],notes:''}; }
   renderHead();
   if(state.tab==='conversation') loadConversation(true);
@@ -846,11 +853,15 @@ function renderConversation(){
 }
 
 // ---------- Analytics (from DB) ----------
+let analyticsBusy=false;
 async function loadAnalytics(){
+  if(analyticsBusy) return;
+  analyticsBusy=true;
   try{
     const d=await api('/api/db/stats');
     renderAnalytics(d);
   }catch(e){ $('#analytics').innerHTML='<div class="empty">Could not load analytics.</div>'; }
+  analyticsBusy=false;
 }
 function barList(items, key, label){
   const max=Math.max(1, ...items.map(x=>x[key]));
@@ -1057,6 +1068,8 @@ function init(){
   $('#sidebarToggle').addEventListener('click', ()=> $('#body').classList.toggle('collapsed'));
 
   // sidebar controls
+  $('#sessionList').addEventListener('pointerenter', ()=>{ sessHover=true; });
+  $('#sessionList').addEventListener('pointerleave', ()=>{ sessHover=false; if(sessStale) renderSessions(); });
   let st; $('#sessSearch').addEventListener('input', ()=>{ clearTimeout(st); st=setTimeout(loadSessions,250); });
   $('#sortSel').addEventListener('change', loadSessions);
   $('#bmOnly').addEventListener('change', loadSessions);
@@ -1110,7 +1123,7 @@ function init(){
   loadAgents();
   loadSources();
   loadSessions();
-  setInterval(loadSessions, 5000);
+  setInterval(()=>loadSessions(true), 5000);
   setInterval(loadSources, 10000);
 }
 function toggleTheme(){ const cur=document.documentElement.dataset.theme==='light'?'dark':'light'; document.documentElement.dataset.theme=cur; localStorage.setItem('ct_theme',cur); }
